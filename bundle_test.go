@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -371,6 +372,527 @@ func TestExportBundle_TarEntryHeaders(t *testing.T) {
 
 		// Drain entry
 		io.Copy(io.Discard, tr)
+	}
+}
+
+// buildTestBundle creates a tar.gz bundle in memory from raw entries.
+// Each entry is a name/content pair. Useful for constructing invalid bundles.
+func buildTestBundle(t *testing.T, entries map[string][]byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	for name, content := range entries {
+		err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			Typeflag: tar.TypeReg,
+		})
+		if err != nil {
+			t.Fatalf("failed to write tar header for %s: %v", name, err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatalf("failed to write tar content for %s: %v", name, err)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildTestBundleOrdered creates a tar.gz bundle preserving entry order.
+func buildTestBundleOrdered(t *testing.T, names []string, contents [][]byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	for i, name := range names {
+		err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(len(contents[i])),
+			Typeflag: tar.TypeReg,
+		})
+		if err != nil {
+			t.Fatalf("failed to write tar header for %s: %v", name, err)
+		}
+		if _, err := tw.Write(contents[i]); err != nil {
+			t.Fatalf("failed to write tar content for %s: %v", name, err)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestImportBundle_IntoEmptyStore(t *testing.T) {
+	// Create source store with 3 tapes, export, then import into empty store.
+	srcStore := NewMemoryStore()
+	tape1 := makeBundleTape("tape-001", "users-api", "GET", "https://api.example.com/users")
+	tape2 := makeBundleTape("tape-002", "users-api", "POST", "https://api.example.com/users")
+	tape3 := makeBundleTape("tape-003", "auth-service", "POST", "https://auth.example.com/token")
+	saveTestTapes(t, srcStore, tape1, tape2, tape3)
+
+	r, err := ExportBundle(context.Background(), srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle() error: %v", err)
+	}
+
+	// Read the bundle fully so we can create a reader for import.
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read bundle: %v", err)
+	}
+
+	dstStore := NewMemoryStore()
+	err = ImportBundle(context.Background(), dstStore, bytes.NewReader(bundleData))
+	if err != nil {
+		t.Fatalf("ImportBundle() error: %v", err)
+	}
+
+	// Verify all 3 tapes are present.
+	tapes, err := dstStore.List(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(tapes) != 3 {
+		t.Fatalf("got %d tapes, want 3", len(tapes))
+	}
+
+	// Verify each tape by loading it.
+	for _, original := range []Tape{tape1, tape2, tape3} {
+		got, err := dstStore.Load(context.Background(), original.ID)
+		if err != nil {
+			t.Errorf("Load(%s) error: %v", original.ID, err)
+			continue
+		}
+		if got.ID != original.ID {
+			t.Errorf("tape %s: ID = %q, want %q", original.ID, got.ID, original.ID)
+		}
+		if got.Request.Method != original.Request.Method {
+			t.Errorf("tape %s: Method = %q, want %q", original.ID, got.Request.Method, original.Request.Method)
+		}
+		if got.Request.URL != original.Request.URL {
+			t.Errorf("tape %s: URL = %q, want %q", original.ID, got.Request.URL, original.Request.URL)
+		}
+		if got.Response.StatusCode != original.Response.StatusCode {
+			t.Errorf("tape %s: StatusCode = %d, want %d", original.ID, got.Response.StatusCode, original.Response.StatusCode)
+		}
+	}
+}
+
+func TestImportBundle_MergeOverwrite(t *testing.T) {
+	ctx := context.Background()
+
+	// Pre-populate destination store with tape A and tape B.
+	dstStore := NewMemoryStore()
+	tapeA := makeBundleTape("tape-A", "api", "GET", "https://api.example.com/a")
+	tapeB := makeBundleTape("tape-B", "api", "GET", "https://api.example.com/b")
+	saveTestTapes(t, dstStore, tapeA, tapeB)
+
+	// Create bundle with modified tape A and new tape C.
+	bundleStore := NewMemoryStore()
+	tapeAModified := makeBundleTape("tape-A", "api", "GET", "https://api.example.com/a")
+	tapeAModified.Response.StatusCode = 404
+	tapeAModified.Response.Body = []byte(`{"error":"not found"}`)
+	tapeC := makeBundleTape("tape-C", "api", "POST", "https://api.example.com/c")
+	saveTestTapes(t, bundleStore, tapeAModified, tapeC)
+
+	r, err := ExportBundle(ctx, bundleStore)
+	if err != nil {
+		t.Fatalf("ExportBundle() error: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read bundle: %v", err)
+	}
+
+	// Import bundle into destination.
+	err = ImportBundle(ctx, dstStore, bytes.NewReader(bundleData))
+	if err != nil {
+		t.Fatalf("ImportBundle() error: %v", err)
+	}
+
+	// Tape A should be overwritten.
+	gotA, err := dstStore.Load(ctx, "tape-A")
+	if err != nil {
+		t.Fatalf("Load(tape-A) error: %v", err)
+	}
+	if gotA.Response.StatusCode != 404 {
+		t.Errorf("tape-A StatusCode = %d, want 404 (overwritten)", gotA.Response.StatusCode)
+	}
+	if !bytes.Equal(gotA.Response.Body, []byte(`{"error":"not found"}`)) {
+		t.Errorf("tape-A Body not overwritten")
+	}
+
+	// Tape B should still exist (untouched).
+	gotB, err := dstStore.Load(ctx, "tape-B")
+	if err != nil {
+		t.Fatalf("Load(tape-B) error: %v", err)
+	}
+	if gotB.Response.StatusCode != 200 {
+		t.Errorf("tape-B StatusCode = %d, want 200 (untouched)", gotB.Response.StatusCode)
+	}
+
+	// Tape C should be new.
+	gotC, err := dstStore.Load(ctx, "tape-C")
+	if err != nil {
+		t.Fatalf("Load(tape-C) error: %v", err)
+	}
+	if gotC.Request.Method != "POST" {
+		t.Errorf("tape-C Method = %q, want POST", gotC.Request.Method)
+	}
+
+	// Total should be 3.
+	all, _ := dstStore.List(ctx, Filter{})
+	if len(all) != 3 {
+		t.Errorf("total tapes = %d, want 3", len(all))
+	}
+}
+
+func TestImportBundle_MalformedGzip(t *testing.T) {
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, strings.NewReader("not gzip"))
+	if err == nil {
+		t.Fatal("expected error for malformed gzip, got nil")
+	}
+	if !strings.Contains(err.Error(), "httptape: import:") {
+		t.Errorf("error missing prefix: %v", err)
+	}
+}
+
+func TestImportBundle_InvalidManifest(t *testing.T) {
+	bundle := buildTestBundle(t, map[string][]byte{
+		"manifest.json": []byte("this is not json{{{"),
+	})
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for invalid manifest JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid manifest") {
+		t.Errorf("error should mention 'invalid manifest': %v", err)
+	}
+}
+
+func TestImportBundle_MissingManifest(t *testing.T) {
+	tape := makeBundleTape("tape-1", "api", "GET", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	bundle := buildTestBundle(t, map[string][]byte{
+		"fixtures/tape-1.json": tapeJSON,
+	})
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for missing manifest, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing manifest.json") {
+		t.Errorf("error should mention 'missing manifest.json': %v", err)
+	}
+}
+
+func TestImportBundle_FixtureCountMismatch(t *testing.T) {
+	tape := makeBundleTape("tape-1", "api", "GET", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 5, // Declares 5 but only 1 fixture present.
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "fixtures/tape-1.json"},
+		[][]byte{manifestJSON, tapeJSON},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for fixture count mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "manifest declares 5 fixtures but bundle contains 1") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestImportBundle_InvalidFixture(t *testing.T) {
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "fixtures/bad.json"},
+		[][]byte{manifestJSON, []byte("not valid json!!!")},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for invalid fixture JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid fixture") {
+		t.Errorf("error should mention 'invalid fixture': %v", err)
+	}
+}
+
+func TestImportBundle_EmptyBundle(t *testing.T) {
+	// Export from empty store, import into another empty store.
+	srcStore := NewMemoryStore()
+	r, err := ExportBundle(context.Background(), srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle() error: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read bundle: %v", err)
+	}
+
+	dstStore := NewMemoryStore()
+	err = ImportBundle(context.Background(), dstStore, bytes.NewReader(bundleData))
+	if err != nil {
+		t.Fatalf("ImportBundle() error: %v", err)
+	}
+
+	tapes, err := dstStore.List(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(tapes) != 0 {
+		t.Errorf("got %d tapes, want 0", len(tapes))
+	}
+}
+
+func TestImportBundle_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+
+	srcStore := NewMemoryStore()
+	origTapes := []Tape{
+		makeBundleTape("rt-001", "users", "GET", "https://api.example.com/users"),
+		makeBundleTape("rt-002", "users", "POST", "https://api.example.com/users"),
+		makeBundleTape("rt-003", "auth", "POST", "https://auth.example.com/token"),
+		makeBundleTape("rt-004", "", "DELETE", "https://api.example.com/users/1"),
+		makeBundleTape("rt-005", "billing", "PUT", "https://billing.example.com/invoice"),
+	}
+	saveTestTapes(t, srcStore, origTapes...)
+
+	// Export
+	r, err := ExportBundle(ctx, srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle() error: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read bundle: %v", err)
+	}
+
+	// Import into fresh store
+	dstStore := NewMemoryStore()
+	err = ImportBundle(ctx, dstStore, bytes.NewReader(bundleData))
+	if err != nil {
+		t.Fatalf("ImportBundle() error: %v", err)
+	}
+
+	// Compare all tapes
+	dstTapes, err := dstStore.List(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(dstTapes) != len(origTapes) {
+		t.Fatalf("got %d tapes, want %d", len(dstTapes), len(origTapes))
+	}
+
+	// Build a map for easy lookup.
+	dstMap := make(map[string]Tape)
+	for _, tape := range dstTapes {
+		dstMap[tape.ID] = tape
+	}
+
+	for _, orig := range origTapes {
+		got, ok := dstMap[orig.ID]
+		if !ok {
+			t.Errorf("tape %s not found in destination store", orig.ID)
+			continue
+		}
+		if got.Route != orig.Route {
+			t.Errorf("tape %s: Route = %q, want %q", orig.ID, got.Route, orig.Route)
+		}
+		if got.Request.Method != orig.Request.Method {
+			t.Errorf("tape %s: Method = %q, want %q", orig.ID, got.Request.Method, orig.Request.Method)
+		}
+		if got.Request.URL != orig.Request.URL {
+			t.Errorf("tape %s: URL = %q, want %q", orig.ID, got.Request.URL, orig.Request.URL)
+		}
+		if got.Response.StatusCode != orig.Response.StatusCode {
+			t.Errorf("tape %s: StatusCode = %d, want %d", orig.ID, got.Response.StatusCode, orig.Response.StatusCode)
+		}
+		if !bytes.Equal(got.Request.Body, orig.Request.Body) {
+			t.Errorf("tape %s: Request.Body mismatch", orig.ID)
+		}
+		if !bytes.Equal(got.Response.Body, orig.Response.Body) {
+			t.Errorf("tape %s: Response.Body mismatch", orig.ID)
+		}
+		if !got.RecordedAt.Equal(orig.RecordedAt) {
+			t.Errorf("tape %s: RecordedAt = %v, want %v", orig.ID, got.RecordedAt, orig.RecordedAt)
+		}
+	}
+}
+
+func TestImportBundle_ContextCancellation(t *testing.T) {
+	// Create a valid bundle first.
+	srcStore := NewMemoryStore()
+	saveTestTapes(t, srcStore, makeBundleTape("tape-1", "api", "GET", "http://test/1"))
+
+	r, err := ExportBundle(context.Background(), srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle() error: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read bundle: %v", err)
+	}
+
+	// Import with an already-cancelled context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dstStore := NewMemoryStore()
+	err = ImportBundle(ctx, dstStore, bytes.NewReader(bundleData))
+	if err == nil {
+		t.Fatal("expected error for cancelled context, got nil")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("error should mention context canceled: %v", err)
+	}
+}
+
+func TestImportBundle_FixtureEmptyID(t *testing.T) {
+	tape := makeBundleTape("", "api", "GET", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "fixtures/bad.json"},
+		[][]byte{manifestJSON, tapeJSON},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for empty fixture ID, got nil")
+	}
+	if !strings.Contains(err.Error(), "fixture has empty ID") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestImportBundle_FixtureEmptyMethod(t *testing.T) {
+	tape := makeBundleTape("tape-1", "api", "", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "fixtures/tape-1.json"},
+		[][]byte{manifestJSON, tapeJSON},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for empty request method, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty request method") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestImportBundle_FixtureEmptyURL(t *testing.T) {
+	tape := makeBundleTape("tape-1", "api", "GET", "")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "fixtures/tape-1.json"},
+		[][]byte{manifestJSON, tapeJSON},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err == nil {
+		t.Fatal("expected error for empty request URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty request URL") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestImportBundle_UnknownEntriesSkipped(t *testing.T) {
+	// Bundle with manifest, a fixture, and an unknown entry — should succeed.
+	tape := makeBundleTape("tape-1", "api", "GET", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	bundle := buildTestBundleOrdered(t,
+		[]string{"manifest.json", "metadata/extra.txt", "fixtures/tape-1.json"},
+		[][]byte{manifestJSON, []byte("some future metadata"), tapeJSON},
+	)
+
+	dstStore := NewMemoryStore()
+	err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+	if err != nil {
+		t.Fatalf("ImportBundle() error: %v", err)
+	}
+
+	got, err := dstStore.Load(context.Background(), "tape-1")
+	if err != nil {
+		t.Fatalf("Load(tape-1) error: %v", err)
+	}
+	if got.Request.Method != "GET" {
+		t.Errorf("tape-1 Method = %q, want GET", got.Request.Method)
 	}
 }
 

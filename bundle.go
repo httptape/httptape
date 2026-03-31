@@ -8,8 +8,13 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 )
+
+// maxEntrySize is the maximum allowed size for a single tar entry during import.
+// This prevents denial-of-service from maliciously large bundles (zip-bomb style).
+const maxEntrySize = 50 << 20 // 50 MB
 
 // Manifest describes the contents and metadata of an exported bundle.
 // It is serialized as the first entry (manifest.json) in the tar.gz archive.
@@ -152,6 +157,106 @@ func writeBundle(ctx context.Context, w io.Writer, tapes []Tape, cfg exportConfi
 		return fmt.Errorf("httptape: export: close gzip: %w", err)
 	}
 
+	return nil
+}
+
+// ImportBundle imports tapes from a tar.gz bundle into the given store.
+// The bundle must have been produced by ExportBundle (see Manifest for the format).
+//
+// Merge strategy: fixtures in the bundle overwrite any existing fixtures with
+// the same ID in the store. Fixtures already in the store whose IDs are not
+// present in the bundle are left untouched.
+//
+// The entire bundle is validated before any fixtures are persisted. If the
+// manifest is missing, malformed, or any fixture fails JSON unmarshalling,
+// ImportBundle returns an error and the store is not modified.
+func ImportBundle(ctx context.Context, s Store, r io.Reader) error {
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("httptape: import: %w", err)
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+
+	var manifest *Manifest
+	var tapes []Tape
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("httptape: import: %w", err)
+		}
+
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("httptape: import: %w", err)
+		}
+
+		lr := io.LimitReader(tr, maxEntrySize)
+
+		switch {
+		case hdr.Name == "manifest.json":
+			var m Manifest
+			if err := json.NewDecoder(lr).Decode(&m); err != nil {
+				return fmt.Errorf("httptape: import: invalid manifest: %w", err)
+			}
+			manifest = &m
+
+		case isFixtureEntry(hdr.Name):
+			var t Tape
+			if err := json.NewDecoder(lr).Decode(&t); err != nil {
+				return fmt.Errorf("httptape: import: invalid fixture %q: %w", hdr.Name, err)
+			}
+			if err := validateFixture(t); err != nil {
+				return err
+			}
+			tapes = append(tapes, t)
+		}
+		// Unknown entries are silently skipped (forward compatibility).
+	}
+
+	// Phase 1 validation
+	if manifest == nil {
+		return fmt.Errorf("httptape: import: missing manifest.json")
+	}
+	if manifest.FixtureCount != len(tapes) {
+		return fmt.Errorf("httptape: import: manifest declares %d fixtures but bundle contains %d",
+			manifest.FixtureCount, len(tapes))
+	}
+
+	// Phase 2 persist
+	for _, t := range tapes {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("httptape: import: %w", err)
+		}
+		if err := s.Save(ctx, t); err != nil {
+			return fmt.Errorf("httptape: import: save tape %s: %w", t.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// isFixtureEntry reports whether the tar entry name matches the fixture pattern.
+func isFixtureEntry(name string) bool {
+	return strings.HasPrefix(name, "fixtures/") && strings.HasSuffix(name, ".json")
+}
+
+// validateFixture checks that a tape has the minimum required fields for
+// matching and replay.
+func validateFixture(t Tape) error {
+	if t.ID == "" {
+		return fmt.Errorf("httptape: import: fixture has empty ID")
+	}
+	if t.Request.Method == "" {
+		return fmt.Errorf("httptape: import: fixture %s has empty request method", t.ID)
+	}
+	if t.Request.URL == "" {
+		return fmt.Errorf("httptape: import: fixture %s has empty request URL", t.ID)
+	}
 	return nil
 }
 
