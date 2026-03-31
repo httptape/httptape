@@ -58,7 +58,7 @@ type Server struct {
 type ServerOption func(*Server)
 
 // WithMatcher sets the Matcher used to find tapes for incoming requests.
-// If not set, ExactMatcher() is used.
+// If not set, DefaultMatcher() is used.
 func WithMatcher(m Matcher) ServerOption {
 	return func(s *Server) { s.matcher = m }
 }
@@ -85,7 +85,7 @@ func WithOnNoMatch(fn func(*http.Request)) ServerOption {
 // NewServer creates a new Server that replays tapes from the given store.
 //
 // By default:
-//   - matcher is ExactMatcher() (matches by method + URL path)
+//   - matcher is DefaultMatcher() (matches by method + URL path with scoring)
 //   - fallback status is 404 Not Found
 //   - fallback body is "httptape: no matching tape found"
 //   - no onNoMatch callback
@@ -95,7 +95,7 @@ func WithOnNoMatch(fn func(*http.Request)) ServerOption {
 func NewServer(store Store, opts ...ServerOption) *Server {
 	s := &Server{
 		store:          store,
-		matcher:        ExactMatcher(),
+		matcher:        DefaultMatcher(),
 		fallbackStatus: http.StatusNotFound,
 		fallbackBody:   []byte("httptape: no matching tape found"),
 	}
