@@ -3,6 +3,7 @@ package httptape
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -815,5 +816,615 @@ func TestRedactBodyPaths_WildcardAtLeaf(t *testing.T) {
 	want := []byte(`{"items":[{"a":1},{"a":2}]}`)
 	if !jsonEqual(t, result.Request.Body, want) {
 		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+// --- FakeFields tests ---
+
+func TestFakeFields_GenericString(t *testing.T) {
+	body := []byte(`{"name":"Alice"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.name")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	name, ok := got["name"].(string)
+	if !ok {
+		t.Fatal("name is not a string")
+	}
+	if !strings.HasPrefix(name, "fake_") {
+		t.Errorf("expected fake_ prefix, got %q", name)
+	}
+	if len(name) != 13 { // "fake_" (5) + 8 hex chars
+		t.Errorf("expected length 13, got %d (%q)", len(name), name)
+	}
+}
+
+func TestFakeFields_Email(t *testing.T) {
+	body := []byte(`{"email":"alice@corp.com"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.email")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	email, ok := got["email"].(string)
+	if !ok {
+		t.Fatal("email is not a string")
+	}
+	if !strings.HasPrefix(email, "user_") {
+		t.Errorf("expected user_ prefix, got %q", email)
+	}
+	if !strings.HasSuffix(email, "@example.com") {
+		t.Errorf("expected @example.com suffix, got %q", email)
+	}
+}
+
+func TestFakeFields_UUID(t *testing.T) {
+	body := []byte(`{"id":"550e8400-e29b-41d4-a716-446655440000"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.id")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	id, ok := got["id"].(string)
+	if !ok {
+		t.Fatal("id is not a string")
+	}
+	if len(id) != 36 {
+		t.Errorf("expected UUID length 36, got %d (%q)", len(id), id)
+	}
+	// Check version nibble is 5.
+	if id[14] != '5' {
+		t.Errorf("expected version 5 at position 14, got %c in %q", id[14], id)
+	}
+	// Check hyphens at correct positions.
+	for _, pos := range []int{8, 13, 18, 23} {
+		if id[pos] != '-' {
+			t.Errorf("expected '-' at position %d, got %c in %q", pos, id[pos], id)
+		}
+	}
+}
+
+func TestFakeFields_NumericID(t *testing.T) {
+	body := []byte(`{"user_id":42}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.user_id")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	uid, ok := got["user_id"].(float64)
+	if !ok {
+		t.Fatal("user_id is not a number")
+	}
+	if uid <= 0 {
+		t.Errorf("expected positive number, got %f", uid)
+	}
+	if uid != float64(int64(uid)) {
+		t.Errorf("expected integer, got %f", uid)
+	}
+	if uid > float64(1<<31-1) {
+		t.Errorf("expected value <= 2^31-1, got %f", uid)
+	}
+}
+
+func TestFakeFields_BoolUnchanged(t *testing.T) {
+	body := []byte(`{"active":true}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.active")
+	result := fn(tape)
+
+	want := []byte(`{"active":true}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_NullUnchanged(t *testing.T) {
+	body := []byte(`{"token":null}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.token")
+	result := fn(tape)
+
+	want := []byte(`{"token":null}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_ObjectUnchanged(t *testing.T) {
+	body := []byte(`{"data":{"nested":"val"}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.data")
+	result := fn(tape)
+
+	want := []byte(`{"data":{"nested":"val"}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_ArrayUnchanged(t *testing.T) {
+	body := []byte(`{"items":[1,2]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.items")
+	result := fn(tape)
+
+	want := []byte(`{"items":[1,2]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_Deterministic(t *testing.T) {
+	body := []byte(`{"name":"Alice","email":"alice@corp.com","id":"550e8400-e29b-41d4-a716-446655440000","score":99}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.name", "$.email", "$.id", "$.score")
+
+	// Run twice and verify identical output.
+	result1 := fn(tape)
+	result2 := fn(tape)
+
+	if string(result1.Request.Body) != string(result2.Request.Body) {
+		t.Errorf("not deterministic:\nfirst:  %s\nsecond: %s", result1.Request.Body, result2.Request.Body)
+	}
+	if string(result1.Response.Body) != string(result2.Response.Body) {
+		t.Errorf("response not deterministic:\nfirst:  %s\nsecond: %s", result1.Response.Body, result2.Response.Body)
+	}
+}
+
+func TestFakeFields_CrossFixtureConsistency(t *testing.T) {
+	// Same value in two different fixtures should produce the same fake.
+	body1 := []byte(`{"email":"shared@corp.com","other":"a"}`)
+	body2 := []byte(`{"email":"shared@corp.com","other":"b"}`)
+	tape1 := makeTapeWithBody(body1, body1)
+	tape2 := makeTapeWithBody(body2, body2)
+
+	fn := FakeFields("test-seed", "$.email")
+
+	result1 := fn(tape1)
+	result2 := fn(tape2)
+
+	var got1, got2 map[string]any
+	if err := json.Unmarshal(result1.Request.Body, &got1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := json.Unmarshal(result2.Request.Body, &got2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if got1["email"] != got2["email"] {
+		t.Errorf("same email should produce same fake across fixtures: %q vs %q", got1["email"], got2["email"])
+	}
+}
+
+func TestFakeFields_DifferentSeedsDifferentOutput(t *testing.T) {
+	body := []byte(`{"name":"Alice"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn1 := FakeFields("seed-a", "$.name")
+	fn2 := FakeFields("seed-b", "$.name")
+
+	result1 := fn1(tape)
+	result2 := fn2(tape)
+
+	if string(result1.Request.Body) == string(result2.Request.Body) {
+		t.Error("different seeds should produce different fakes")
+	}
+}
+
+func TestFakeFields_DifferentInputsDifferentOutput(t *testing.T) {
+	body1 := []byte(`{"name":"Alice"}`)
+	body2 := []byte(`{"name":"Bob"}`)
+	tape1 := makeTapeWithBody(body1, body1)
+	tape2 := makeTapeWithBody(body2, body2)
+
+	fn := FakeFields("test-seed", "$.name")
+
+	result1 := fn(tape1)
+	result2 := fn(tape2)
+
+	if string(result1.Request.Body) == string(result2.Request.Body) {
+		t.Error("different inputs should produce different fakes")
+	}
+}
+
+func TestFakeFields_NestedField(t *testing.T) {
+	body := []byte(`{"user":{"email":"a@b.c"}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.user.email")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	user := got["user"].(map[string]any)
+	email := user["email"].(string)
+	if !strings.HasPrefix(email, "user_") || !strings.HasSuffix(email, "@example.com") {
+		t.Errorf("expected fake email, got %q", email)
+	}
+}
+
+func TestFakeFields_ArrayWildcard(t *testing.T) {
+	body := []byte(`{"users":[{"name":"Alice"},{"name":"Bob"}]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.users[*].name")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	users := got["users"].([]any)
+	for i, u := range users {
+		name := u.(map[string]any)["name"].(string)
+		if !strings.HasPrefix(name, "fake_") {
+			t.Errorf("users[%d].name: expected fake_ prefix, got %q", i, name)
+		}
+	}
+	// Alice and Bob should produce different fakes.
+	name0 := users[0].(map[string]any)["name"].(string)
+	name1 := users[1].(map[string]any)["name"].(string)
+	if name0 == name1 {
+		t.Errorf("different names should produce different fakes: %q == %q", name0, name1)
+	}
+}
+
+func TestFakeFields_MultiplePaths(t *testing.T) {
+	body := []byte(`{"name":"Alice","email":"alice@corp.com"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.name", "$.email")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	name := got["name"].(string)
+	email := got["email"].(string)
+	if !strings.HasPrefix(name, "fake_") {
+		t.Errorf("name: expected fake_ prefix, got %q", name)
+	}
+	if !strings.HasPrefix(email, "user_") {
+		t.Errorf("email: expected user_ prefix, got %q", email)
+	}
+}
+
+func TestFakeFields_MissingPath(t *testing.T) {
+	body := []byte(`{"foo":"bar"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.nonexistent")
+	result := fn(tape)
+
+	want := []byte(`{"foo":"bar"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_NonJSONBody(t *testing.T) {
+	body := []byte("plain text body")
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.field")
+	result := fn(tape)
+
+	if string(result.Request.Body) != "plain text body" {
+		t.Errorf("request body changed: got %q", result.Request.Body)
+	}
+}
+
+func TestFakeFields_NilBody(t *testing.T) {
+	tape := makeTapeWithBody(nil, nil)
+
+	fn := FakeFields("test-seed", "$.field")
+	result := fn(tape)
+
+	if result.Request.Body != nil {
+		t.Errorf("expected nil request body, got %v", result.Request.Body)
+	}
+	if result.Response.Body != nil {
+		t.Errorf("expected nil response body, got %v", result.Response.Body)
+	}
+}
+
+func TestFakeFields_EmptyBody(t *testing.T) {
+	tape := makeTapeWithBody([]byte{}, []byte{})
+
+	fn := FakeFields("test-seed", "$.field")
+	result := fn(tape)
+
+	if len(result.Request.Body) != 0 {
+		t.Errorf("expected empty request body, got %v", result.Request.Body)
+	}
+}
+
+func TestFakeFields_BothRequestAndResponse(t *testing.T) {
+	reqBody := []byte(`{"name":"req-name"}`)
+	respBody := []byte(`{"name":"resp-name"}`)
+	tape := makeTapeWithBody(reqBody, respBody)
+
+	fn := FakeFields("test-seed", "$.name")
+	result := fn(tape)
+
+	var reqGot, respGot map[string]any
+	if err := json.Unmarshal(result.Request.Body, &reqGot); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if err := json.Unmarshal(result.Response.Body, &respGot); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	reqName := reqGot["name"].(string)
+	respName := respGot["name"].(string)
+	if !strings.HasPrefix(reqName, "fake_") {
+		t.Errorf("request name: expected fake_ prefix, got %q", reqName)
+	}
+	if !strings.HasPrefix(respName, "fake_") {
+		t.Errorf("response name: expected fake_ prefix, got %q", respName)
+	}
+	// Different original values should produce different fakes.
+	if reqName == respName {
+		t.Errorf("different original values should produce different fakes: %q == %q", reqName, respName)
+	}
+}
+
+func TestFakeFields_DoesNotMutateOriginal(t *testing.T) {
+	body := []byte(`{"name":"Alice"}`)
+	original := make([]byte, len(body))
+	copy(original, body)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.name")
+	_ = fn(tape)
+
+	if string(tape.Request.Body) != string(original) {
+		t.Errorf("original request body mutated: got %q", tape.Request.Body)
+	}
+	if string(tape.Response.Body) != string(original) {
+		t.Errorf("original response body mutated: got %q", tape.Response.Body)
+	}
+}
+
+func TestFakeFields_BodyHashRecalculated(t *testing.T) {
+	body := []byte(`{"name":"Alice"}`)
+	tape := makeTapeWithBody(body, body)
+	originalHash := tape.Request.BodyHash
+
+	fn := FakeFields("test-seed", "$.name")
+	result := fn(tape)
+
+	if result.Request.BodyHash == originalHash {
+		t.Error("expected BodyHash to change after body faking")
+	}
+	expectedHash := BodyHashFromBytes(result.Request.Body)
+	if result.Request.BodyHash != expectedHash {
+		t.Errorf("BodyHash mismatch: got %q, want %q", result.Request.BodyHash, expectedHash)
+	}
+}
+
+func TestFakeFields_InvalidPath(t *testing.T) {
+	body := []byte(`{"a":"b"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "foo.bar")
+	result := fn(tape)
+
+	want := []byte(`{"a":"b"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_NoPaths(t *testing.T) {
+	body := []byte(`{"a":"b"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed") // no paths => no-op
+	result := fn(tape)
+
+	want := []byte(`{"a":"b"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestFakeFields_PipelineComposition(t *testing.T) {
+	body := []byte(`{"secret":"value","name":"Alice"}`)
+	tape := Tape{
+		ID:    "test-id",
+		Route: "test-route",
+		Request: RecordedReq{
+			Method:   "POST",
+			URL:      "https://example.com/test",
+			Headers:  http.Header{"Authorization": {"Bearer token"}, "Content-Type": {"application/json"}},
+			Body:     body,
+			BodyHash: BodyHashFromBytes(body),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       body,
+		},
+	}
+
+	p := NewPipeline(
+		RedactHeaders("Authorization"),
+		FakeFields("test-seed", "$.name"),
+	)
+	result := p.Sanitize(tape)
+
+	// Headers should be redacted.
+	if got := result.Request.Headers.Get("Authorization"); got != Redacted {
+		t.Errorf("Authorization: expected %q, got %q", Redacted, got)
+	}
+	// Name should be faked.
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	name := got["name"].(string)
+	if !strings.HasPrefix(name, "fake_") {
+		t.Errorf("name: expected fake_ prefix, got %q", name)
+	}
+	// Secret should be unchanged (not targeted).
+	if got["secret"] != "value" {
+		t.Errorf("secret should be unchanged, got %q", got["secret"])
+	}
+}
+
+func TestFakeFields_WildcardAtLeaf(t *testing.T) {
+	body := []byte(`{"items":[{"a":1},{"a":2}]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.items[*]")
+	result := fn(tape)
+
+	want := []byte(`{"items":[{"a":1},{"a":2}]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+// --- isEmail tests ---
+
+func TestIsEmail(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"alice@corp.com", true},
+		{"a@b", true},
+		{"user@example.com", true},
+		{"", false},
+		{"@", false},
+		{"@domain", false},
+		{"user@", false},
+		{"no-at-sign", false},
+		{"two@@ats", false},
+		{"a@b@c", false},
+	}
+	for _, tt := range tests {
+		got := isEmail(tt.input)
+		if got != tt.want {
+			t.Errorf("isEmail(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+// --- isUUID tests ---
+
+func TestIsUUID(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"550e8400-e29b-41d4-a716-446655440000", true},
+		{"00000000-0000-0000-0000-000000000000", true},
+		{"ABCDEF01-2345-6789-abcd-ef0123456789", true},
+		{"", false},
+		{"not-a-uuid", false},
+		{"550e8400e29b41d4a716446655440000", false},   // no hyphens
+		{"550e8400-e29b-41d4-a716-44665544000", false}, // too short
+		{"550e8400-e29b-41d4-a716-4466554400000", false}, // too long
+		{"550e8400-e29b-41d4-a716-44665544000g", false},  // invalid hex char
+		{"550e8400+e29b-41d4-a716-446655440000", false},  // wrong separator
+	}
+	for _, tt := range tests {
+		got := isUUID(tt.input)
+		if got != tt.want {
+			t.Errorf("isUUID(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestFakeFields_FloatNumber(t *testing.T) {
+	body := []byte(`{"price":3.14}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.price")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	price, ok := got["price"].(float64)
+	if !ok {
+		t.Fatal("price is not a number")
+	}
+	if price <= 0 {
+		t.Errorf("expected positive number, got %f", price)
+	}
+	// Must be an integer (fakeNumericID always returns integers).
+	if price != float64(int64(price)) {
+		t.Errorf("expected integer, got %f", price)
+	}
+}
+
+func TestFakeFields_ScalarBody(t *testing.T) {
+	body := []byte(`"hello"`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.field")
+	result := fn(tape)
+
+	if string(result.Request.Body) != `"hello"` {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, `"hello"`)
+	}
+}
+
+func TestFakeFields_DeepNested(t *testing.T) {
+	body := []byte(`{"a":{"b":{"c":"secret"}}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := FakeFields("test-seed", "$.a.b.c")
+	result := fn(tape)
+
+	var got map[string]any
+	if err := json.Unmarshal(result.Request.Body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	c := got["a"].(map[string]any)["b"].(map[string]any)["c"].(string)
+	if !strings.HasPrefix(c, "fake_") {
+		t.Errorf("expected fake_ prefix, got %q", c)
+	}
+}
+
+func TestFakeFields_BodyHashUnchangedForNonJSON(t *testing.T) {
+	body := []byte("not json")
+	tape := makeTapeWithBody(body, body)
+	originalHash := tape.Request.BodyHash
+
+	fn := FakeFields("test-seed", "$.field")
+	result := fn(tape)
+
+	if result.Request.BodyHash != originalHash {
+		t.Errorf("BodyHash should not change for non-JSON body: got %q, want %q",
+			result.Request.BodyHash, originalHash)
 	}
 }
