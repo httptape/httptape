@@ -1,6 +1,7 @@
 package httptape
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -355,5 +356,464 @@ func TestPipeline_ImplementsSanitizer(t *testing.T) {
 
 	if got := result.Request.Headers.Get("Authorization"); got != Redacted {
 		t.Errorf("expected %q, got %q", Redacted, got)
+	}
+}
+
+// --- Body path redaction tests ---
+
+// makeTapeWithBody creates a minimal Tape with the given request and response bodies.
+func makeTapeWithBody(reqBody, respBody []byte) Tape {
+	return Tape{
+		ID:    "test-id",
+		Route: "test-route",
+		Request: RecordedReq{
+			Method:   "POST",
+			URL:      "https://example.com/test",
+			Headers:  http.Header{"Content-Type": {"application/json"}},
+			Body:     reqBody,
+			BodyHash: BodyHashFromBytes(reqBody),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       respBody,
+		},
+	}
+}
+
+// jsonEqual compares two byte slices as JSON, ignoring key order and whitespace.
+func jsonEqual(t *testing.T, got, want []byte) bool {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal(got, &g); err != nil {
+		t.Fatalf("failed to unmarshal got: %v", err)
+	}
+	if err := json.Unmarshal(want, &w); err != nil {
+		t.Fatalf("failed to unmarshal want: %v", err)
+	}
+	// Re-marshal both to canonical form for comparison.
+	gb, _ := json.Marshal(g)
+	wb, _ := json.Marshal(w)
+	return string(gb) == string(wb)
+}
+
+func TestRedactBodyPaths_TopLevelString(t *testing.T) {
+	body := []byte(`{"api_key":"secret"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.api_key")
+	result := fn(tape)
+
+	want := []byte(`{"api_key":"[REDACTED]"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+	if !jsonEqual(t, result.Response.Body, want) {
+		t.Errorf("response body: got %s, want %s", result.Response.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_TopLevelNumber(t *testing.T) {
+	body := []byte(`{"balance":1234.56}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.balance")
+	result := fn(tape)
+
+	want := []byte(`{"balance":0}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_TopLevelBool(t *testing.T) {
+	body := []byte(`{"active":true}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.active")
+	result := fn(tape)
+
+	want := []byte(`{"active":false}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_NestedField(t *testing.T) {
+	body := []byte(`{"user":{"email":"a@b.c"}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.user.email")
+	result := fn(tape)
+
+	want := []byte(`{"user":{"email":"[REDACTED]"}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_ArrayWildcard(t *testing.T) {
+	body := []byte(`{"users":[{"ssn":"123"},{"ssn":"456"}]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.users[*].ssn")
+	result := fn(tape)
+
+	want := []byte(`{"users":[{"ssn":"[REDACTED]"},{"ssn":"[REDACTED]"}]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_MultiplePaths(t *testing.T) {
+	body := []byte(`{"a":"x","b":1}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.a", "$.b")
+	result := fn(tape)
+
+	want := []byte(`{"a":"[REDACTED]","b":0}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_MissingPath(t *testing.T) {
+	body := []byte(`{"foo":"bar"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.nonexistent")
+	result := fn(tape)
+
+	want := []byte(`{"foo":"bar"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_NonJSONBody(t *testing.T) {
+	body := []byte("plain text body")
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.field")
+	result := fn(tape)
+
+	if string(result.Request.Body) != "plain text body" {
+		t.Errorf("request body changed: got %q", result.Request.Body)
+	}
+	if string(result.Response.Body) != "plain text body" {
+		t.Errorf("response body changed: got %q", result.Response.Body)
+	}
+}
+
+func TestRedactBodyPaths_NilBody(t *testing.T) {
+	tape := makeTapeWithBody(nil, nil)
+
+	fn := RedactBodyPaths("$.field")
+	result := fn(tape)
+
+	if result.Request.Body != nil {
+		t.Errorf("expected nil request body, got %v", result.Request.Body)
+	}
+	if result.Response.Body != nil {
+		t.Errorf("expected nil response body, got %v", result.Response.Body)
+	}
+}
+
+func TestRedactBodyPaths_EmptyBody(t *testing.T) {
+	tape := makeTapeWithBody([]byte{}, []byte{})
+
+	fn := RedactBodyPaths("$.field")
+	result := fn(tape)
+
+	if len(result.Request.Body) != 0 {
+		t.Errorf("expected empty request body, got %v", result.Request.Body)
+	}
+	if len(result.Response.Body) != 0 {
+		t.Errorf("expected empty response body, got %v", result.Response.Body)
+	}
+}
+
+func TestRedactBodyPaths_NullValue(t *testing.T) {
+	body := []byte(`{"token":null}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.token")
+	result := fn(tape)
+
+	want := []byte(`{"token":null}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_ObjectValue(t *testing.T) {
+	body := []byte(`{"data":{"nested":"val"}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.data")
+	result := fn(tape)
+
+	want := []byte(`{"data":{"nested":"val"}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_ArrayValue(t *testing.T) {
+	body := []byte(`{"items":[1,2]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.items")
+	result := fn(tape)
+
+	want := []byte(`{"items":[1,2]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_BothRequestAndResponse(t *testing.T) {
+	reqBody := []byte(`{"secret":"req-secret"}`)
+	respBody := []byte(`{"secret":"resp-secret"}`)
+	tape := makeTapeWithBody(reqBody, respBody)
+
+	fn := RedactBodyPaths("$.secret")
+	result := fn(tape)
+
+	want := []byte(`{"secret":"[REDACTED]"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+	if !jsonEqual(t, result.Response.Body, want) {
+		t.Errorf("response body: got %s, want %s", result.Response.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_DoesNotMutateOriginal(t *testing.T) {
+	body := []byte(`{"a":"b"}`)
+	original := make([]byte, len(body))
+	copy(original, body)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.a")
+	_ = fn(tape)
+
+	// Original tape body must be unchanged.
+	if string(tape.Request.Body) != string(original) {
+		t.Errorf("original request body mutated: got %q", tape.Request.Body)
+	}
+	if string(tape.Response.Body) != string(original) {
+		t.Errorf("original response body mutated: got %q", tape.Response.Body)
+	}
+}
+
+func TestRedactBodyPaths_BodyHashRecalculated(t *testing.T) {
+	body := []byte(`{"pw":"x"}`)
+	tape := makeTapeWithBody(body, body)
+	originalHash := tape.Request.BodyHash
+
+	fn := RedactBodyPaths("$.pw")
+	result := fn(tape)
+
+	// Hash should have changed since body was modified.
+	if result.Request.BodyHash == originalHash {
+		t.Error("expected BodyHash to change after body redaction")
+	}
+
+	// Hash should match the hash of the redacted body.
+	expectedHash := BodyHashFromBytes(result.Request.Body)
+	if result.Request.BodyHash != expectedHash {
+		t.Errorf("BodyHash mismatch: got %q, want %q", result.Request.BodyHash, expectedHash)
+	}
+}
+
+func TestRedactBodyPaths_InvalidPath(t *testing.T) {
+	body := []byte(`{"a":"b"}`)
+	tape := makeTapeWithBody(body, body)
+
+	// "foo.bar" is invalid (missing $. prefix).
+	fn := RedactBodyPaths("foo.bar")
+	result := fn(tape)
+
+	want := []byte(`{"a":"b"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_DeepNested(t *testing.T) {
+	body := []byte(`{"a":{"b":{"c":"s"}}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.a.b.c")
+	result := fn(tape)
+
+	want := []byte(`{"a":{"b":{"c":"[REDACTED]"}}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_NestedArrayWildcard(t *testing.T) {
+	body := []byte(`{"d":{"rows":[{"v":"s"}]}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.d.rows[*].v")
+	result := fn(tape)
+
+	want := []byte(`{"d":{"rows":[{"v":"[REDACTED]"}]}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_NoPaths(t *testing.T) {
+	body := []byte(`{"a":"b"}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths() // no paths => no-op
+	result := fn(tape)
+
+	want := []byte(`{"a":"b"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_ScalarBody(t *testing.T) {
+	body := []byte(`"hello"`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.field")
+	result := fn(tape)
+
+	// Scalar JSON body -- no fields to match, body unchanged.
+	if string(result.Request.Body) != `"hello"` {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, `"hello"`)
+	}
+}
+
+func TestRedactBodyPaths_MultipleWildcards(t *testing.T) {
+	body := []byte(`{"data":{"rows":[{"tags":[{"value":"secret1"},{"value":"secret2"}]}]}}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.data.rows[*].tags[*].value")
+	result := fn(tape)
+
+	want := []byte(`{"data":{"rows":[{"tags":[{"value":"[REDACTED]"},{"value":"[REDACTED]"}]}]}}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_ArrayElementNotObject(t *testing.T) {
+	// Array elements are primitives, not objects -- path should be silently skipped.
+	body := []byte(`{"items":[1,2,3]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.items[*].field")
+	result := fn(tape)
+
+	want := []byte(`{"items":[1,2,3]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+func TestRedactBodyPaths_BodyHashUnchangedForNonJSON(t *testing.T) {
+	body := []byte("not json")
+	tape := makeTapeWithBody(body, body)
+	originalHash := tape.Request.BodyHash
+
+	fn := RedactBodyPaths("$.field")
+	result := fn(tape)
+
+	if result.Request.BodyHash != originalHash {
+		t.Errorf("BodyHash should not change for non-JSON body: got %q, want %q",
+			result.Request.BodyHash, originalHash)
+	}
+}
+
+func TestRedactBodyPaths_PipelineComposition(t *testing.T) {
+	body := []byte(`{"secret":"value"}`)
+	tape := Tape{
+		ID:    "test-id",
+		Route: "test-route",
+		Request: RecordedReq{
+			Method:   "POST",
+			URL:      "https://example.com/test",
+			Headers:  http.Header{"Authorization": {"Bearer token"}, "Content-Type": {"application/json"}},
+			Body:     body,
+			BodyHash: BodyHashFromBytes(body),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       body,
+		},
+	}
+
+	p := NewPipeline(
+		RedactHeaders("Authorization"),
+		RedactBodyPaths("$.secret"),
+	)
+	result := p.Sanitize(tape)
+
+	// Headers should be redacted.
+	if got := result.Request.Headers.Get("Authorization"); got != Redacted {
+		t.Errorf("Authorization: expected %q, got %q", Redacted, got)
+	}
+	// Body should be redacted.
+	want := []byte(`{"secret":"[REDACTED]"}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
+	}
+}
+
+// --- parsePath tests (tested through the exported API and indirectly) ---
+
+func TestParsePath_InvalidPaths(t *testing.T) {
+	invalidPaths := []string{
+		"foo.bar",      // missing $ prefix
+		"$",            // no dot after $
+		"$.",           // empty after $.
+		"$..foo",       // empty segment (double dot)
+		"$.foo.",       // trailing dot (empty segment)
+		"$.a[0]",       // index access not supported
+		"$.a[0].b",     // index access not supported
+		"$[*].field",   // missing key before [*] at root
+		"",             // empty string
+		"$.foo[1].bar", // numeric index not supported
+	}
+
+	body := []byte(`{"a":"b"}`)
+
+	for _, path := range invalidPaths {
+		tape := makeTapeWithBody(body, body)
+		fn := RedactBodyPaths(path)
+		result := fn(tape)
+
+		want := []byte(`{"a":"b"}`)
+		if !jsonEqual(t, result.Request.Body, want) {
+			t.Errorf("path %q: expected body unchanged, got %s", path, result.Request.Body)
+		}
+	}
+}
+
+func TestRedactBodyPaths_WildcardAtLeaf(t *testing.T) {
+	// Wildcard at leaf means the target is array elements (containers) -- should be skipped.
+	body := []byte(`{"items":[{"a":1},{"a":2}]}`)
+	tape := makeTapeWithBody(body, body)
+
+	fn := RedactBodyPaths("$.items[*]")
+	// This path parses to a single segment with wildcard=true.
+	// But [*] requires something after it -- the segment key is "items" with wildcard,
+	// and rest is empty. ADR says: skip.
+	result := fn(tape)
+
+	want := []byte(`{"items":[{"a":1},{"a":2}]}`)
+	if !jsonEqual(t, result.Request.Body, want) {
+		t.Errorf("request body: got %s, want %s", result.Request.Body, want)
 	}
 }
