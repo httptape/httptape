@@ -2,8 +2,13 @@ package httptape
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -315,4 +320,239 @@ func redactValue(v any) any {
 		// nil, map[string]any, []any -- leave unchanged.
 		return v
 	}
+}
+
+// FakeFields returns a SanitizeFunc that replaces field values in JSON
+// request and response bodies with deterministic fakes derived from
+// HMAC-SHA256.
+//
+// The seed is a project-level secret used as the HMAC key. The same seed
+// and input value always produce the same fake output, preserving
+// cross-fixture consistency. Different seeds produce different fakes.
+//
+// Paths use the same JSONPath-like syntax as RedactBodyPaths:
+//   - $.field             -- top-level field
+//   - $.nested.field      -- nested field access
+//   - $.array[*].field    -- field within each element of an array
+//
+// Faking strategies are determined by the detected type of each value:
+//   - Email (string with @): user_<hash>@example.com
+//   - UUID (8-4-4-4-12 hex): deterministic UUID v5
+//   - Number (float64): deterministic positive integer
+//   - Generic string: fake_<hash_prefix>
+//   - Booleans, nulls, objects, arrays: left unchanged
+//
+// If the body is not valid JSON, it is left unchanged (no error).
+// If a path does not match any field in the body, it is silently skipped.
+// Invalid or unsupported paths are silently ignored.
+//
+// The returned function does not mutate the input Tape -- it copies the
+// body byte slices before modification.
+//
+// Example:
+//
+//	sanitizer := NewPipeline(
+//	    RedactHeaders(),
+//	    FakeFields("my-project-seed",
+//	        "$.user.email",
+//	        "$.user.id",
+//	        "$.tokens[*].value",
+//	    ),
+//	)
+func FakeFields(seed string, paths ...string) SanitizeFunc {
+	// Parse all paths at construction time.
+	var parsed []parsedPath
+	for _, p := range paths {
+		if pp, ok := parsePath(p); ok {
+			parsed = append(parsed, pp)
+		}
+	}
+
+	return func(t Tape) Tape {
+		newReqBody := fakeBodyFields(t.Request.Body, parsed, seed)
+		if !bytes.Equal(newReqBody, t.Request.Body) {
+			t.Request.Body = newReqBody
+			t.Request.BodyHash = BodyHashFromBytes(newReqBody)
+		} else {
+			t.Request.Body = newReqBody
+		}
+		t.Response.Body = fakeBodyFields(t.Response.Body, parsed, seed)
+		return t
+	}
+}
+
+// fakeBodyFields unmarshals the body as JSON, applies all path-based
+// faking, and re-marshals the result. If the body is nil, empty, or
+// not valid JSON, it is returned unchanged.
+func fakeBodyFields(body []byte, paths []parsedPath, seed string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	var data any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+
+	for _, p := range paths {
+		fakeAtPath(data, p.segments, seed)
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
+// fakeAtPath recursively traverses the JSON structure following the
+// given segments and replaces the leaf value with a deterministic fake.
+// It modifies the data in-place (caller must ensure data is a fresh
+// copy from json.Unmarshal).
+func fakeAtPath(data any, segments []segment, seed string) {
+	if len(segments) == 0 {
+		return
+	}
+
+	seg := segments[0]
+	rest := segments[1:]
+
+	obj, ok := data.(map[string]any)
+	if !ok {
+		return
+	}
+
+	val, exists := obj[seg.key]
+	if !exists {
+		return
+	}
+
+	if seg.wildcard {
+		arr, ok := val.([]any)
+		if !ok {
+			return
+		}
+		if len(rest) == 0 {
+			// Wildcard at leaf targets array elements (containers) -- skip.
+			return
+		}
+		for _, elem := range arr {
+			fakeAtPath(elem, rest, seed)
+		}
+		return
+	}
+
+	// Not a wildcard segment.
+	if len(rest) == 0 {
+		// Leaf: apply deterministic faking.
+		obj[seg.key] = fakeValue(val, seed)
+		return
+	}
+
+	// Intermediate: recurse deeper.
+	fakeAtPath(val, rest, seed)
+}
+
+// fakeValue returns a deterministic fake replacement for the given JSON
+// value. The fake is derived from the HMAC-SHA256 of the value's string
+// representation using the provided seed.
+//
+// Faking strategies:
+//   - Email string: user_<hash>@example.com
+//   - UUID string: deterministic UUID v5
+//   - float64: deterministic positive integer
+//   - Generic string: fake_<hash_prefix>
+//   - bool, nil, objects, arrays: returned unchanged
+func fakeValue(v any, seed string) any {
+	switch val := v.(type) {
+	case string:
+		h := computeHMAC(seed, val)
+		if isEmail(val) {
+			return fakeEmail(h)
+		}
+		if isUUID(val) {
+			return fakeUUID(h)
+		}
+		return fakeString(h)
+	case float64:
+		h := computeHMAC(seed, strconv.FormatFloat(val, 'f', -1, 64))
+		return fakeNumericID(h)
+	default:
+		// bool, nil, map[string]any, []any -- leave unchanged.
+		return v
+	}
+}
+
+// computeHMAC returns the HMAC-SHA256 of the given message using the
+// provided key. Both key and message are strings; the HMAC operates on
+// their UTF-8 byte representations.
+func computeHMAC(key, message string) []byte {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(message))
+	return mac.Sum(nil)
+}
+
+// isEmail returns true if s looks like an email address: contains exactly
+// one '@' with non-empty parts on both sides. This is a heuristic, not a
+// full RFC 5322 parser.
+func isEmail(s string) bool {
+	at := strings.IndexByte(s, '@')
+	return at > 0 && at < len(s)-1 && strings.Count(s, "@") == 1
+}
+
+// isUUID returns true if s matches the UUID format:
+// 8-4-4-4-12 hex characters separated by hyphens.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// fakeEmail generates a deterministic fake email from the HMAC hash.
+// Format: user_<first 8 hex chars>@example.com
+func fakeEmail(hash []byte) string {
+	return "user_" + hex.EncodeToString(hash[:4]) + "@example.com"
+}
+
+// fakeUUID generates a deterministic UUID v5-style value from the HMAC hash.
+// It takes the first 16 bytes, sets version=5 and variant=RFC4122,
+// then formats as standard UUID string.
+func fakeUUID(hash []byte) string {
+	var buf [16]byte
+	copy(buf[:], hash[:16])
+	buf[6] = (buf[6] & 0x0f) | 0x50 // version 5
+	buf[8] = (buf[8] & 0x3f) | 0x80 // variant RFC 4122
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+// fakeNumericID generates a deterministic positive integer from the HMAC
+// hash. Uses the first 4 bytes interpreted as big-endian uint32, masked
+// to [1, 2^31-1] to ensure a positive non-zero int.
+func fakeNumericID(hash []byte) float64 {
+	n := uint32(hash[0])<<24 | uint32(hash[1])<<16 | uint32(hash[2])<<8 | uint32(hash[3])
+	n = n & 0x7FFFFFFF // clear sign bit: [0, 2^31-1]
+	if n == 0 {
+		n = 1 // avoid zero
+	}
+	return float64(n)
+}
+
+// fakeString generates a deterministic fake string from the HMAC hash.
+// Format: fake_<first 8 hex chars>
+func fakeString(hash []byte) string {
+	return "fake_" + hex.EncodeToString(hash[:4])
 }
