@@ -31,7 +31,7 @@ type Recorder struct {
 	transport http.RoundTripper // inner transport to delegate to
 	store     Store             // where to persist tapes
 	route     string            // logical route label for all tapes produced
-	sanitizer Sanitizer         // optional; may be nil (no-op if nil)
+	sanitizer Sanitizer         // always set; defaults to no-op Pipeline
 	async     bool              // true = non-blocking writes via channel
 	sampleRate float64          // 0.0–1.0; 1.0 = record everything
 	randFloat func() float64   // returns [0.0, 1.0); injectable for testing
@@ -63,8 +63,13 @@ func WithRoute(route string) RecorderOption {
 }
 
 // WithSanitizer sets a Sanitizer to transform tapes before persistence.
+// If s is nil, the sanitizer is set to a no-op Pipeline (NewPipeline()).
 func WithSanitizer(s Sanitizer) RecorderOption {
 	return func(r *Recorder) {
+		if s == nil {
+			r.sanitizer = NewPipeline()
+			return
+		}
 		r.sanitizer = s
 	}
 }
@@ -120,7 +125,7 @@ func WithOnError(fn func(error)) RecorderOption {
 //   - async mode is enabled with a buffer size of 1024
 //   - sample rate is 1.0 (record every request)
 //   - route is "" (empty — caller should set via WithRoute)
-//   - no sanitizer (tapes are stored as-is)
+//   - default no-op sanitizer (tapes are stored as-is unless WithSanitizer configures redaction)
 //   - errors during async writes are silently discarded
 //
 // The caller must call Close when done to flush pending recordings.
@@ -132,6 +137,7 @@ func NewRecorder(store Store, opts ...RecorderOption) *Recorder {
 	r := &Recorder{
 		transport:  http.DefaultTransport,
 		store:      store,
+		sanitizer:  NewPipeline(), // default no-op sanitizer
 		async:      true,
 		sampleRate: 1.0,
 		randFloat:  rand.Float64,
@@ -230,10 +236,8 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	tape := NewTape(r.route, recordedReq, recordedResp)
 
-	// Apply sanitizer if set.
-	if r.sanitizer != nil {
-		tape = r.sanitizer.Sanitize(tape)
-	}
+	// Apply sanitizer (always present — defaults to no-op Pipeline).
+	tape = r.sanitizer.Sanitize(tape)
 
 	// Persist the tape.
 	if r.async {

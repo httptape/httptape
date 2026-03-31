@@ -59,8 +59,11 @@ func TestNewRecorder_Defaults(t *testing.T) {
 	if rec.route != "" {
 		t.Errorf("route = %q, want empty", rec.route)
 	}
-	if rec.sanitizer != nil {
-		t.Error("sanitizer should default to nil")
+	if rec.sanitizer == nil {
+		t.Fatal("sanitizer should default to non-nil Pipeline")
+	}
+	if _, ok := rec.sanitizer.(*Pipeline); !ok {
+		t.Errorf("sanitizer type = %T, want *Pipeline", rec.sanitizer)
 	}
 	if rec.tapeCh == nil {
 		t.Error("tapeCh should be initialized in async mode")
@@ -1023,5 +1026,194 @@ func TestRecorder_Integration_FullClientUsage(t *testing.T) {
 	}
 	if tapes[0].Route != "echo-service" {
 		t.Errorf("tape.Route = %q, want %q", tapes[0].Route, "echo-service")
+	}
+}
+
+// --- Integration: sanitizer redaction tests ---
+
+func TestRecorder_Integration_SanitizerRedactsFixtures(t *testing.T) {
+	// Server returns a JSON body with a password field and an Authorization echo.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Authorization", "Bearer server-token")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"username":"alice","password":"s3cret"}`))
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithRoute("redact-test"),
+		WithSanitizer(NewPipeline(
+			RedactHeaders("Authorization"),
+			RedactBodyPaths("$.password"),
+		)),
+		WithAsync(false),
+	)
+
+	req, err := http.NewRequest("GET", srv.URL+"/api", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer caller-token")
+
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Caller's response must be unmodified.
+	if resp.Header.Get("Authorization") != "Bearer server-token" {
+		t.Errorf("caller resp Authorization = %q, want %q",
+			resp.Header.Get("Authorization"), "Bearer server-token")
+	}
+	callerBody, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(callerBody), "s3cret") {
+		t.Errorf("caller body should contain original password, got %q", callerBody)
+	}
+
+	// Verify the tape in the store is redacted.
+	tapes, err := store.List(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("store.List: %v", err)
+	}
+	if len(tapes) != 1 {
+		t.Fatalf("len(tapes) = %d, want 1", len(tapes))
+	}
+	tape := tapes[0]
+
+	// Request Authorization header must be redacted.
+	if tape.Request.Headers.Get("Authorization") != Redacted {
+		t.Errorf("tape request Authorization = %q, want %q",
+			tape.Request.Headers.Get("Authorization"), Redacted)
+	}
+	// Response Authorization header must be redacted.
+	if tape.Response.Headers.Get("Authorization") != Redacted {
+		t.Errorf("tape response Authorization = %q, want %q",
+			tape.Response.Headers.Get("Authorization"), Redacted)
+	}
+	// Response body password must be redacted.
+	if strings.Contains(string(tape.Response.Body), "s3cret") {
+		t.Errorf("tape response body still contains password: %s", tape.Response.Body)
+	}
+	if !strings.Contains(string(tape.Response.Body), Redacted) {
+		t.Errorf("tape response body should contain %q, got %s", Redacted, tape.Response.Body)
+	}
+}
+
+func TestRecorder_Integration_DefaultNoOpSanitizer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Custom", "custom-value")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"key":"value"}`))
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	// No WithSanitizer — default no-op Pipeline should be used.
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithRoute("noop-test"),
+		WithAsync(false),
+	)
+
+	req, err := http.NewRequest("POST", srv.URL+"/data", strings.NewReader(`{"input":"data"}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, err := store.List(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("store.List: %v", err)
+	}
+	if len(tapes) != 1 {
+		t.Fatalf("len(tapes) = %d, want 1", len(tapes))
+	}
+	tape := tapes[0]
+
+	// Tape should match original request/response exactly (no-op sanitizer).
+	if string(tape.Request.Body) != `{"input":"data"}` {
+		t.Errorf("tape request body = %q, want %q", tape.Request.Body, `{"input":"data"}`)
+	}
+	if string(tape.Response.Body) != `{"key":"value"}` {
+		t.Errorf("tape response body = %q, want %q", tape.Response.Body, `{"key":"value"}`)
+	}
+	if tape.Response.Headers.Get("X-Custom") != "custom-value" {
+		t.Errorf("tape response X-Custom = %q, want %q",
+			tape.Response.Headers.Get("X-Custom"), "custom-value")
+	}
+}
+
+func TestRecorder_Integration_CallerResponseUnmodified(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Authorization", "Bearer upstream-secret")
+		w.Header().Set("X-Request-Id", "req-123")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"password":"hunter2","email":"alice@corp.com"}`))
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	// Aggressive sanitizer: redact Authorization + password + email.
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithSanitizer(NewPipeline(
+			RedactHeaders("Authorization", "X-Request-Id"),
+			RedactBodyPaths("$.password", "$.email"),
+		)),
+		WithAsync(false),
+	)
+
+	req, err := http.NewRequest("GET", srv.URL+"/sensitive", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify caller's response is completely untouched.
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if resp.Header.Get("Authorization") != "Bearer upstream-secret" {
+		t.Errorf("resp Authorization = %q, want %q",
+			resp.Header.Get("Authorization"), "Bearer upstream-secret")
+	}
+	if resp.Header.Get("X-Request-Id") != "req-123" {
+		t.Errorf("resp X-Request-Id = %q, want %q",
+			resp.Header.Get("X-Request-Id"), "req-123")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "hunter2") {
+		t.Errorf("caller body should contain original password, got %q", body)
+	}
+	if !strings.Contains(string(body), "alice@corp.com") {
+		t.Errorf("caller body should contain original email, got %q", body)
+	}
+}
+
+func TestWithSanitizer_NilFallsBackToNoOp(t *testing.T) {
+	store := NewMemoryStore()
+	rec := NewRecorder(store, WithSanitizer(nil), WithAsync(false))
+
+	if rec.sanitizer == nil {
+		t.Fatal("sanitizer should not be nil when WithSanitizer(nil) is passed")
+	}
+	if _, ok := rec.sanitizer.(*Pipeline); !ok {
+		t.Errorf("sanitizer type = %T, want *Pipeline", rec.sanitizer)
 	}
 }
