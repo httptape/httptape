@@ -111,7 +111,7 @@ func WithOnError(fn func(error)) RecorderOption {
 	}
 }
 
-// NewRecorder creates a new Recorder wrapping the given transport.
+// NewRecorder creates a new Recorder wrapping the given store.
 // If transport is nil, http.DefaultTransport is used.
 //
 // By default:
@@ -123,6 +123,10 @@ func WithOnError(fn func(error)) RecorderOption {
 //
 // The caller must call Close when done to flush pending recordings.
 func NewRecorder(store Store, opts ...RecorderOption) *Recorder {
+	if store == nil {
+		panic("httptape: NewRecorder requires a non-nil Store")
+	}
+
 	r := &Recorder{
 		transport:  http.DefaultTransport,
 		store:      store,
@@ -192,13 +196,14 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	var respBody []byte
 	if resp.Body != nil {
 		respBody, err = io.ReadAll(resp.Body)
-		if err != nil {
-			// Return the response with the body in an error state rather than
-			// failing the entire call due to a recording issue.
-			return resp, nil
-		}
 		resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		if err != nil {
+			if r.onError != nil {
+				r.onError(fmt.Errorf("httptape: recorder read response body: %w", err))
+			}
+			return resp, nil
+		}
 	}
 
 	// Build the tape.

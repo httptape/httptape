@@ -837,6 +837,93 @@ func TestRecorder_RoundTrip_ConcurrentRequests(t *testing.T) {
 	}
 }
 
+// --- Nil store guard ---
+
+func TestNewRecorder_NilStore_Panics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for nil store, got none")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected string panic, got %T: %v", r, r)
+		}
+		if !strings.Contains(msg, "non-nil Store") {
+			t.Errorf("panic message = %q, want it to mention non-nil Store", msg)
+		}
+	}()
+
+	NewRecorder(nil)
+}
+
+// --- Response body read failure ---
+
+func TestRecorder_RoundTrip_ResponseBodyReadError_ReportsViaOnError(t *testing.T) {
+	readErr := errors.New("body read exploded")
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       &failingReader{data: []byte("partial"), err: readErr},
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	store := NewMemoryStore()
+	var capturedErr error
+	rec := NewRecorder(store,
+		WithTransport(transport),
+		WithAsync(false),
+		WithOnError(func(err error) { capturedErr = err }),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip should not return error, got: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// The caller should still get partial bytes back via the replaced body.
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "partial" {
+		t.Errorf("response body = %q, want %q", body, "partial")
+	}
+
+	// The error should have been reported via onError.
+	if capturedErr == nil {
+		t.Fatal("expected onError to be called, got nil")
+	}
+	if !errors.Is(capturedErr, readErr) {
+		t.Errorf("onError got %v, want wrapping of %v", capturedErr, readErr)
+	}
+
+	// No tape should have been saved (we bail out before persisting).
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 0 {
+		t.Errorf("len(tapes) = %d, want 0 (no tape when body read fails)", len(tapes))
+	}
+}
+
+// failingReader returns data then an error.
+type failingReader struct {
+	data []byte
+	err  error
+	read bool
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		n := copy(p, r.data)
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func (r *failingReader) Close() error { return nil }
+
 // --- http.RoundTripper interface compliance ---
 
 func TestRecorder_ImplementsRoundTripper(t *testing.T) {
