@@ -800,6 +800,10 @@ provide a simple function instead of implementing the full interface.
 
 ##### ExactMatcher default (`server.go`)
 
+> **Note (ADR-4):** `ExactMatcher` is no longer the constructor default.
+> `DefaultMatcher()` (from ADR-4) replaced it as the server default. `ExactMatcher`
+> remains available for backward compatibility. Both now live in `matcher.go`.
+
 A minimal built-in matcher is provided so the Server is usable out of the box
 without requiring issue #30's full matcher implementation:
 
@@ -849,7 +853,7 @@ type Server struct {
 Fields explained:
 - `store`: required dependency — where tapes live.
 - `matcher`: required dependency — how to find the right tape. Defaults to
-  `ExactMatcher()` if not provided via options.
+  `DefaultMatcher()` if not provided via options (updated by ADR-4).
 - `fallbackStatus`: HTTP status code returned when no tape matches. Defaults
   to `http.StatusNotFound` (404). Configurable via `WithFallbackStatus`.
 - `fallbackBody`: body bytes written in the fallback response. Defaults to
@@ -872,13 +876,14 @@ type ServerOption func(*Server)
 // NewServer creates a new Server that replays tapes from the given store.
 //
 // By default:
-//   - matcher is ExactMatcher() (matches by method + URL path)
+//   - matcher is DefaultMatcher() (matches by method + URL path with scoring;
+//     updated by ADR-4, was ExactMatcher() originally)
 //   - fallback status is 404 Not Found
 //   - fallback body is "httptape: no matching tape found"
 //   - no onNoMatch callback
 //
-// The store must not be nil. If it is, NewServer returns a Server that
-// always responds with 500 Internal Server Error and a descriptive body.
+// The store must not be nil. Passing a nil store is a programming error
+// and will panic.
 func NewServer(store Store, opts ...ServerOption) *Server
 ```
 
@@ -889,7 +894,7 @@ The matcher is an option because a sensible default exists.
 
 ```go
 // WithMatcher sets the Matcher used to find tapes for incoming requests.
-// If not set, ExactMatcher() is used.
+// If not set, DefaultMatcher() is used (updated by ADR-4).
 func WithMatcher(m Matcher) ServerOption
 
 // WithFallbackStatus sets the HTTP status code returned when no tape matches

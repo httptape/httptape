@@ -7,6 +7,42 @@ import (
 	"net/url"
 )
 
+// Matcher selects a Tape from a list of candidates that best matches
+// the incoming HTTP request. Implementations define the matching strategy
+// (exact, fuzzy, regex, etc.).
+type Matcher interface {
+	// Match returns the best-matching Tape for the given request.
+	// If no tape matches, it returns false as the second return value.
+	// The candidates slice is never nil but may be empty.
+	// Implementations must not modify the request or the candidate tapes.
+	Match(req *http.Request, candidates []Tape) (Tape, bool)
+}
+
+// MatcherFunc is an adapter to allow the use of ordinary functions as Matchers.
+type MatcherFunc func(req *http.Request, candidates []Tape) (Tape, bool)
+
+// Match calls f(req, candidates).
+func (f MatcherFunc) Match(req *http.Request, candidates []Tape) (Tape, bool) {
+	return f(req, candidates)
+}
+
+// ExactMatcher is a simple Matcher that matches requests by HTTP method and
+// URL path. It returns the first candidate whose method and URL path are
+// equal to the incoming request's method and URL path.
+//
+// This is intentionally minimal. For advanced matching (headers, body,
+// query params, regex), use CompositeMatcher or DefaultMatcher.
+func ExactMatcher() Matcher {
+	return MatcherFunc(func(req *http.Request, candidates []Tape) (Tape, bool) {
+		for _, t := range candidates {
+			if t.Request.Method == req.Method && t.Request.URL == req.URL.Path {
+				return t, true
+			}
+		}
+		return Tape{}, false
+	})
+}
+
 // MatchCriterion evaluates how well a candidate Tape matches an incoming
 // request for a single dimension (method, path, body, etc.).
 //

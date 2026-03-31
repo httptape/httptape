@@ -150,20 +150,21 @@ func TestServer_NoMatch_Callback(t *testing.T) {
 	mu.Unlock()
 }
 
-func TestServer_NilStore(t *testing.T) {
-	srv := NewServer(nil)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/anything", nil)
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
-	}
-	if !strings.Contains(rec.Body.String(), "nil store") {
-		t.Errorf("body = %q, want it to contain 'nil store'", rec.Body.String())
-	}
+func TestNewServer_NilStore_Panics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for nil store, got none")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected string panic, got %T: %v", r, r)
+		}
+		if !strings.Contains(msg, "nil Store") {
+			t.Errorf("panic message = %q, want it to contain 'nil Store'", msg)
+		}
+	}()
+	NewServer(nil)
 }
 
 func TestServer_StoreError(t *testing.T) {

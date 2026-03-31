@@ -4,42 +4,6 @@ import (
 	"net/http"
 )
 
-// Matcher selects a Tape from a list of candidates that best matches
-// the incoming HTTP request. Implementations define the matching strategy
-// (exact, fuzzy, regex, etc.).
-type Matcher interface {
-	// Match returns the best-matching Tape for the given request.
-	// If no tape matches, it returns false as the second return value.
-	// The candidates slice is never nil but may be empty.
-	// Implementations must not modify the request or the candidate tapes.
-	Match(req *http.Request, candidates []Tape) (Tape, bool)
-}
-
-// MatcherFunc is an adapter to allow the use of ordinary functions as Matchers.
-type MatcherFunc func(req *http.Request, candidates []Tape) (Tape, bool)
-
-// Match calls f(req, candidates).
-func (f MatcherFunc) Match(req *http.Request, candidates []Tape) (Tape, bool) {
-	return f(req, candidates)
-}
-
-// ExactMatcher is a simple Matcher that matches requests by HTTP method and
-// URL path. It returns the first candidate whose method and URL path are
-// equal to the incoming request's method and URL path.
-//
-// This is intentionally minimal. For advanced matching (headers, body,
-// query params, regex), use the matchers from issue #30.
-func ExactMatcher() Matcher {
-	return MatcherFunc(func(req *http.Request, candidates []Tape) (Tape, bool) {
-		for _, t := range candidates {
-			if t.Request.Method == req.Method && t.Request.URL == req.URL.Path {
-				return t, true
-			}
-		}
-		return Tape{}, false
-	})
-}
-
 // Server is an http.Handler that replays recorded HTTP interactions.
 // It receives incoming requests, finds a matching Tape via a Matcher,
 // and writes the recorded response. If no match is found, it returns
@@ -90,9 +54,13 @@ func WithOnNoMatch(fn func(*http.Request)) ServerOption {
 //   - fallback body is "httptape: no matching tape found"
 //   - no onNoMatch callback
 //
-// The store must not be nil. If it is, NewServer returns a Server that
-// always responds with 500 Internal Server Error and a descriptive body.
+// The store must not be nil. Passing a nil store is a programming error and
+// will panic.
 func NewServer(store Store, opts ...ServerOption) *Server {
+	if store == nil {
+		panic("httptape: NewServer requires a non-nil Store")
+	}
+
 	s := &Server{
 		store:          store,
 		matcher:        DefaultMatcher(),
@@ -111,13 +79,7 @@ func NewServer(store Store, opts ...ServerOption) *Server {
 //
 // The method is safe for concurrent use.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Step 2: nil store check.
-	if s.store == nil {
-		http.Error(w, "httptape: server misconfigured (nil store)", http.StatusInternalServerError)
-		return
-	}
-
-	// Step 3: retrieve all tapes from store.
+	// Step 2: retrieve all tapes from store.
 	tapes, err := s.store.List(r.Context(), Filter{})
 	if err != nil {
 		http.Error(w, "httptape: store error", http.StatusInternalServerError)
@@ -138,9 +100,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 6: write the matched tape's response.
-	// 6a: copy response headers.
+	// 6a: copy response headers (clone slices to prevent aliasing with tape data).
 	for key, values := range tape.Response.Headers {
-		w.Header()[key] = values
+		w.Header()[key] = append([]string(nil), values...)
 	}
 	// 6b: write status code.
 	w.WriteHeader(tape.Response.StatusCode)
