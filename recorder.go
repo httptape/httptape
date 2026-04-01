@@ -40,7 +40,9 @@ type Recorder struct {
 	sampleRate float64          // 0.0–1.0; 1.0 = record everything
 	randFloat func() float64   // returns [0.0, 1.0); injectable for testing
 	bufSize   int               // channel buffer size (only used when async=true)
-	onError   func(error)       // callback for async write errors; defaults to no-op
+	onError       func(error)   // callback for async write errors; defaults to no-op
+	maxBodySize   int           // max body size in bytes; 0 = no limit
+	skipRedirects bool          // when true, skip recording 3xx responses
 
 	// async internals
 	sendMu    sync.Mutex   // coordinates closed-check-then-send with close-channel
@@ -120,6 +122,35 @@ func WithBufferSize(size int) RecorderOption {
 func WithOnError(fn func(error)) RecorderOption {
 	return func(r *Recorder) {
 		r.onError = fn
+	}
+}
+
+// WithMaxBodySize sets the maximum body size in bytes for both request and
+// response bodies. Bodies exceeding this size are truncated and the
+// Truncated flag is set on the recorded request/response.
+// A value of 0 means no limit (default).
+// Negative values are treated as 0 (no limit).
+func WithMaxBodySize(n int) RecorderOption {
+	return func(r *Recorder) {
+		if n < 0 {
+			n = 0
+		}
+		r.maxBodySize = n
+	}
+}
+
+// WithSkipRedirects controls whether intermediate redirect responses (3xx)
+// are skipped during recording. When true, 3xx responses are not recorded --
+// only the final non-redirect response is stored. When false (default),
+// all responses are recorded including redirects.
+//
+// This is useful when using an http.Client that follows redirects
+// automatically: each redirect hop produces a separate RoundTrip call to
+// the Recorder. With SkipRedirects(true), only the terminal response is
+// stored, keeping fixtures clean.
+func WithSkipRedirects(skip bool) RecorderOption {
+	return func(r *Recorder) {
+		r.skipRedirects = skip
 	}
 }
 
@@ -211,6 +242,11 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
+	// Skip redirect responses if configured.
+	if r.skipRedirects && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return resp, nil
+	}
+
 	// Capture response body.
 	var respBody []byte
 	if resp.Body != nil {
@@ -225,18 +261,51 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
+	// Detect body encodings based on Content-Type headers.
+	reqBodyEncoding := detectBodyEncoding(req.Header.Get("Content-Type"))
+	respBodyEncoding := detectBodyEncoding(resp.Header.Get("Content-Type"))
+
+	// Apply body truncation if maxBodySize is set.
+	var reqTruncated, respTruncated bool
+	var reqOrigSize, respOrigSize int64
+
+	if r.maxBodySize > 0 {
+		if len(reqBody) > r.maxBodySize {
+			reqOrigSize = int64(len(reqBody))
+			reqBody = reqBody[:r.maxBodySize]
+			reqTruncated = true
+			if r.onError != nil {
+				r.onError(fmt.Errorf("httptape: request body truncated from %d to %d bytes", reqOrigSize, r.maxBodySize))
+			}
+		}
+		if len(respBody) > r.maxBodySize {
+			respOrigSize = int64(len(respBody))
+			respBody = respBody[:r.maxBodySize]
+			respTruncated = true
+			if r.onError != nil {
+				r.onError(fmt.Errorf("httptape: response body truncated from %d to %d bytes", respOrigSize, r.maxBodySize))
+			}
+		}
+	}
+
 	// Build the tape.
 	recordedReq := RecordedReq{
-		Method:   req.Method,
-		URL:      req.URL.String(),
-		Headers:  req.Header.Clone(),
-		Body:     reqBody,
-		BodyHash: BodyHashFromBytes(reqBody),
+		Method:           req.Method,
+		URL:              req.URL.String(),
+		Headers:          req.Header.Clone(),
+		Body:             reqBody,
+		BodyHash:         BodyHashFromBytes(reqBody),
+		BodyEncoding:     reqBodyEncoding,
+		Truncated:        reqTruncated,
+		OriginalBodySize: reqOrigSize,
 	}
 	recordedResp := RecordedResp{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Header.Clone(),
-		Body:       respBody,
+		StatusCode:       resp.StatusCode,
+		Headers:          resp.Header.Clone(),
+		Body:             respBody,
+		BodyEncoding:     respBodyEncoding,
+		Truncated:        respTruncated,
+		OriginalBodySize: respOrigSize,
 	}
 
 	tape := NewTape(r.route, recordedReq, recordedResp)

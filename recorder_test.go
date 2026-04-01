@@ -1373,3 +1373,495 @@ func BenchmarkRecorderRoundTrip_Sync(b *testing.B) {
 		})
 	}
 }
+
+// --- ADR-17: Edge case tests ---
+
+// TestDetectBodyEncoding verifies that detectBodyEncoding classifies
+// Content-Type headers into identity (text) vs base64 (binary).
+func TestDetectBodyEncoding(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		want        BodyEncoding
+	}{
+		{"empty", "", BodyEncodingIdentity},
+		{"text/plain", "text/plain", BodyEncodingIdentity},
+		{"text/html", "text/html; charset=utf-8", BodyEncodingIdentity},
+		{"application/json", "application/json", BodyEncodingIdentity},
+		{"json with charset", "application/json; charset=utf-8", BodyEncodingIdentity},
+		{"json suffix", "application/vnd.api+json", BodyEncodingIdentity},
+		{"application/xml", "application/xml", BodyEncodingIdentity},
+		{"xml suffix", "application/atom+xml", BodyEncodingIdentity},
+		{"image/png", "image/png", BodyEncodingBase64},
+		{"image/jpeg", "image/jpeg", BodyEncodingBase64},
+		{"audio/mpeg", "audio/mpeg", BodyEncodingBase64},
+		{"video/mp4", "video/mp4", BodyEncodingBase64},
+		{"octet-stream", "application/octet-stream", BodyEncodingBase64},
+		{"protobuf", "application/protobuf", BodyEncodingBase64},
+		{"grpc", "application/grpc", BodyEncodingBase64},
+		{"x-protobuf", "application/x-protobuf", BodyEncodingBase64},
+		{"unparseable", "///invalid", BodyEncodingIdentity},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectBodyEncoding(tt.contentType)
+			if got != tt.want {
+				t.Errorf("detectBodyEncoding(%q) = %q, want %q", tt.contentType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRecorder_BinaryBody verifies that binary response bodies are recorded
+// with BodyEncoding set to base64.
+func TestRecorder_BinaryBody(t *testing.T) {
+	binaryData := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} // PNG header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		w.Write(binaryData)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithRoute("binary-test"),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/image.png", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	tape := tapes[0]
+	if tape.Response.BodyEncoding != BodyEncodingBase64 {
+		t.Errorf("response BodyEncoding = %q, want %q", tape.Response.BodyEncoding, BodyEncodingBase64)
+	}
+	if !bytes.Equal(tape.Response.Body, binaryData) {
+		t.Error("binary body not preserved correctly")
+	}
+}
+
+// TestRecorder_TextBody verifies that text response bodies get BodyEncodingIdentity.
+func TestRecorder_TextBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if tapes[0].Response.BodyEncoding != BodyEncodingIdentity {
+		t.Errorf("response BodyEncoding = %q, want %q", tapes[0].Response.BodyEncoding, BodyEncodingIdentity)
+	}
+}
+
+// TestRecorder_MaxBodySize_Truncation verifies that bodies exceeding
+// the max size are truncated and metadata is set.
+func TestRecorder_MaxBodySize_Truncation(t *testing.T) {
+	largeBody := bytes.Repeat([]byte("A"), 2000)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write(largeBody)
+	}))
+	defer srv.Close()
+
+	var warnings []string
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithMaxBodySize(500),
+		WithAsync(false),
+		WithOnError(func(err error) {
+			warnings = append(warnings, err.Error())
+		}),
+	)
+
+	reqBody := bytes.Repeat([]byte("B"), 1000)
+	req, _ := http.NewRequest("POST", srv.URL+"/upload", io.NopCloser(bytes.NewReader(reqBody)))
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	tape := tapes[0]
+
+	// Request body should be truncated.
+	if !tape.Request.Truncated {
+		t.Error("request Truncated should be true")
+	}
+	if tape.Request.OriginalBodySize != 1000 {
+		t.Errorf("request OriginalBodySize = %d, want 1000", tape.Request.OriginalBodySize)
+	}
+	if len(tape.Request.Body) != 500 {
+		t.Errorf("request body len = %d, want 500", len(tape.Request.Body))
+	}
+
+	// Response body should be truncated.
+	if !tape.Response.Truncated {
+		t.Error("response Truncated should be true")
+	}
+	if tape.Response.OriginalBodySize != 2000 {
+		t.Errorf("response OriginalBodySize = %d, want 2000", tape.Response.OriginalBodySize)
+	}
+	if len(tape.Response.Body) != 500 {
+		t.Errorf("response body len = %d, want 500", len(tape.Response.Body))
+	}
+
+	// BodyHash should be computed on truncated body.
+	expectedHash := BodyHashFromBytes(tape.Request.Body)
+	if tape.Request.BodyHash != expectedHash {
+		t.Errorf("request BodyHash does not match truncated body hash")
+	}
+
+	// Warnings should be emitted.
+	if len(warnings) != 2 {
+		t.Errorf("expected 2 warnings, got %d: %v", len(warnings), warnings)
+	}
+}
+
+// TestRecorder_MaxBodySize_NoTruncation verifies that bodies within the
+// limit are not truncated.
+func TestRecorder_MaxBodySize_NoTruncation(t *testing.T) {
+	smallBody := []byte("small")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write(smallBody)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithMaxBodySize(1000),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/small", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	tape := tapes[0]
+	if tape.Response.Truncated {
+		t.Error("response should not be truncated")
+	}
+	if tape.Response.OriginalBodySize != 0 {
+		t.Errorf("OriginalBodySize = %d, want 0", tape.Response.OriginalBodySize)
+	}
+}
+
+// TestRecorder_MaxBodySize_Zero verifies that maxBodySize=0 means no limit.
+func TestRecorder_MaxBodySize_Zero(t *testing.T) {
+	largeBody := bytes.Repeat([]byte("X"), 10000)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(largeBody)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithMaxBodySize(0),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/big", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if len(tapes[0].Response.Body) != 10000 {
+		t.Errorf("body len = %d, want 10000", len(tapes[0].Response.Body))
+	}
+}
+
+// TestWithMaxBodySize_Negative verifies that negative maxBodySize is treated as 0.
+func TestWithMaxBodySize_Negative(t *testing.T) {
+	store := NewMemoryStore()
+	rec := NewRecorder(store, WithMaxBodySize(-100), WithAsync(false))
+	if rec.maxBodySize != 0 {
+		t.Errorf("maxBodySize = %d, want 0", rec.maxBodySize)
+	}
+}
+
+// TestRecorder_204NoContent verifies that recording a 204 response produces
+// a tape with empty body and correct status code.
+func TestRecorder_204NoContent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("DELETE", srv.URL+"/resource", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	tape := tapes[0]
+	if tape.Response.StatusCode != 204 {
+		t.Errorf("status code = %d, want 204", tape.Response.StatusCode)
+	}
+	if len(tape.Response.Body) != 0 {
+		t.Errorf("body should be empty, got %d bytes", len(tape.Response.Body))
+	}
+	if tape.Request.BodyHash != "" {
+		t.Errorf("request BodyHash should be empty for nil body, got %q", tape.Request.BodyHash)
+	}
+}
+
+// TestRecorder_204NoContent_ExplicitEmptyBody verifies that a 204 response
+// with an explicit empty body also records correctly.
+func TestRecorder_204NoContent_ExplicitEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+		w.Write([]byte{}) // explicit empty write
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("DELETE", srv.URL+"/resource", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	tape := tapes[0]
+	if tape.Response.StatusCode != 204 {
+		t.Errorf("status code = %d, want 204", tape.Response.StatusCode)
+	}
+}
+
+// TestRecorder_SkipRedirects verifies that 3xx responses are not recorded
+// when skipRedirects is true.
+func TestRecorder_SkipRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			w.Header().Set("Location", "/final")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("final response"))
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithSkipRedirects(true),
+		WithAsync(false),
+	)
+
+	// First call: redirect response (302) -- should be skipped.
+	req, _ := http.NewRequest("GET", srv.URL+"/redirect", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302, got %d", resp.StatusCode)
+	}
+
+	// Second call: final response (200) -- should be recorded.
+	req2, _ := http.NewRequest("GET", srv.URL+"/final", nil)
+	resp2, err := rec.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp2.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape (redirect skipped), got %d", len(tapes))
+	}
+	if tapes[0].Response.StatusCode != 200 {
+		t.Errorf("recorded tape status = %d, want 200", tapes[0].Response.StatusCode)
+	}
+}
+
+// TestRecorder_SkipRedirects_False verifies that 3xx responses are recorded
+// when skipRedirects is false (default).
+func TestRecorder_SkipRedirects_False(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/final")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithSkipRedirects(false),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/old", nil)
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape (redirects recorded), got %d", len(tapes))
+	}
+	if tapes[0].Response.StatusCode != 301 {
+		t.Errorf("recorded tape status = %d, want 301", tapes[0].Response.StatusCode)
+	}
+}
+
+// TestRecorder_SkipRedirects_AllCodes verifies that all 3xx codes are skipped.
+func TestRecorder_SkipRedirects_AllCodes(t *testing.T) {
+	codes := []int{300, 301, 302, 303, 304, 307, 308}
+	for _, code := range codes {
+		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "/target")
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			store := NewMemoryStore()
+			rec := NewRecorder(store,
+				WithTransport(srv.Client().Transport),
+				WithSkipRedirects(true),
+				WithAsync(false),
+			)
+
+			req, _ := http.NewRequest("GET", srv.URL+"/test", nil)
+			resp, err := rec.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip error: %v", err)
+			}
+			resp.Body.Close()
+
+			tapes, _ := store.List(context.Background(), Filter{})
+			if len(tapes) != 0 {
+				t.Errorf("expected 0 tapes for status %d, got %d", code, len(tapes))
+			}
+		})
+	}
+}
+
+// TestRecorder_MalformedJSON verifies that malformed JSON bodies are
+// stored as raw bytes without error.
+func TestRecorder_MalformedJSON(t *testing.T) {
+	malformed := []byte(`{"broken: json}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(malformed)
+	}))
+	defer srv.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(srv.Client().Transport),
+		WithSanitizer(NewPipeline(RedactBodyPaths("$.secret"))),
+		WithAsync(false),
+	)
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api", io.NopCloser(bytes.NewReader(malformed)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := rec.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+
+	// Body should be stored as-is (sanitizer skips malformed JSON).
+	if !bytes.Equal(tapes[0].Response.Body, malformed) {
+		t.Error("malformed JSON body was unexpectedly modified")
+	}
+	if !bytes.Equal(tapes[0].Request.Body, malformed) {
+		t.Error("malformed JSON request body was unexpectedly modified")
+	}
+}

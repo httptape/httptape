@@ -5,8 +5,24 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"mime"
 	"net/http"
+	"strings"
 	"time"
+)
+
+// BodyEncoding indicates how the body was encoded for storage.
+// "identity" means UTF-8 text stored as-is by JSON marshaling.
+// "base64" means binary content (Go's encoding/json handles this
+// transparently for []byte fields).
+type BodyEncoding string
+
+const (
+	// BodyEncodingIdentity indicates the body is UTF-8 text.
+	BodyEncodingIdentity BodyEncoding = "identity"
+	// BodyEncodingBase64 indicates the body is binary, base64-encoded by
+	// Go's encoding/json marshaler.
+	BodyEncodingBase64 BodyEncoding = "base64"
 )
 
 // Tape represents a single recorded HTTP interaction (request + response pair).
@@ -47,6 +63,18 @@ type RecordedReq struct {
 	// BodyHash is a hex-encoded SHA-256 hash of the original request body.
 	// Used for matching without comparing full bodies.
 	BodyHash string `json:"body_hash"`
+
+	// BodyEncoding describes how the body is encoded in the JSON fixture.
+	// Set automatically by the Recorder based on Content-Type detection.
+	BodyEncoding BodyEncoding `json:"body_encoding,omitempty"`
+
+	// Truncated is true if the body was truncated due to exceeding the
+	// configured maximum body size.
+	Truncated bool `json:"truncated,omitempty"`
+
+	// OriginalBodySize is the original body size in bytes before truncation.
+	// Only set when Truncated is true.
+	OriginalBodySize int64 `json:"original_body_size,omitempty"`
 }
 
 // RecordedResp captures the essential parts of an HTTP response for replay.
@@ -59,6 +87,18 @@ type RecordedResp struct {
 
 	// Body is the full response body bytes.
 	Body []byte `json:"body"`
+
+	// BodyEncoding describes how the body is encoded in the JSON fixture.
+	// Set automatically by the Recorder based on Content-Type detection.
+	BodyEncoding BodyEncoding `json:"body_encoding,omitempty"`
+
+	// Truncated is true if the body was truncated due to exceeding the
+	// configured maximum body size.
+	Truncated bool `json:"truncated,omitempty"`
+
+	// OriginalBodySize is the original body size in bytes before truncation.
+	// Only set when Truncated is true.
+	OriginalBodySize int64 `json:"original_body_size,omitempty"`
 }
 
 // NewTape creates a new Tape with a generated ID and the current UTC timestamp.
@@ -80,6 +120,34 @@ func BodyHashFromBytes(b []byte) string {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// detectBodyEncoding returns BodyEncodingBase64 if the Content-Type header
+// indicates a binary content type, otherwise BodyEncodingIdentity.
+// Binary types: image/*, audio/*, video/*, application/octet-stream,
+// application/protobuf, application/grpc, application/x-protobuf,
+// or any type with a non-text, non-json, non-xml primary type.
+func detectBodyEncoding(contentType string) BodyEncoding {
+	if contentType == "" {
+		return BodyEncodingIdentity
+	}
+	mediaType, _, _ := mime.ParseMediaType(contentType)
+	if mediaType == "" {
+		return BodyEncodingIdentity
+	}
+	// Text types are identity.
+	if strings.HasPrefix(mediaType, "text/") {
+		return BodyEncodingIdentity
+	}
+	// JSON and XML are text-like.
+	if mediaType == "application/json" ||
+		strings.HasSuffix(mediaType, "+json") ||
+		mediaType == "application/xml" ||
+		strings.HasSuffix(mediaType, "+xml") {
+		return BodyEncodingIdentity
+	}
+	// Everything else is binary.
+	return BodyEncodingBase64
 }
 
 // newUUID generates a UUID v4 string using crypto/rand.

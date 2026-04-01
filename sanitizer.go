@@ -236,7 +236,9 @@ func RedactBodyPaths(paths ...string) SanitizeFunc {
 
 // redactBodyFields unmarshals the body as JSON, applies all path
 // redactions, and re-marshals the result. If the body is nil, empty,
-// or not valid JSON, it is returned unchanged.
+// or not valid JSON, it is returned unchanged. This is intentional:
+// malformed JSON bodies are stored as raw bytes and body-level
+// sanitization is silently skipped. See ADR-17.
 func redactBodyFields(body []byte, paths []parsedPath) []byte {
 	if len(body) == 0 {
 		return body
@@ -383,7 +385,9 @@ func FakeFields(seed string, paths ...string) SanitizeFunc {
 
 // fakeBodyFields unmarshals the body as JSON, applies all path-based
 // faking, and re-marshals the result. If the body is nil, empty, or
-// not valid JSON, it is returned unchanged.
+// not valid JSON, it is returned unchanged. This is intentional:
+// malformed JSON bodies are stored as raw bytes and body-level
+// sanitization is silently skipped. See ADR-17.
 func fakeBodyFields(body []byte, paths []parsedPath, seed string) []byte {
 	if len(body) == 0 {
 		return body
