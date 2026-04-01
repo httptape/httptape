@@ -279,6 +279,268 @@ func TestMatchBodyHash_BodyRestored(t *testing.T) {
 	}
 }
 
+// --- MatchHeaders tests ---
+
+func TestMatchHeaders_SingleHeader(t *testing.T) {
+	criterion := MatchHeaders("Content-Type", "application/json")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Content-Type", "application/json")
+	tape := Tape{Request: RecordedReq{
+		Method:  "GET",
+		URL:     "/test",
+		Headers: http.Header{"Content-Type": {"application/json"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 3 {
+		t.Errorf("MatchHeaders() = %d, want 3", got)
+	}
+}
+
+func TestMatchHeaders_CaseInsensitiveName(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{"lowercase", "content-type"},
+		{"uppercase", "CONTENT-TYPE"},
+		{"canonical", "Content-Type"},
+		{"mixed", "cOnTeNt-TyPe"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			criterion := MatchHeaders(tt.key, "application/json")
+
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.Header.Set("Content-Type", "application/json")
+			tape := Tape{Request: RecordedReq{
+				Headers: http.Header{"Content-Type": {"application/json"}},
+			}}
+
+			got := criterion(req, tape)
+			if got != 3 {
+				t.Errorf("MatchHeaders(%q, ...) = %d, want 3", tt.key, got)
+			}
+		})
+	}
+}
+
+func TestMatchHeaders_CaseSensitiveValue(t *testing.T) {
+	criterion := MatchHeaders("Accept", "Application/JSON")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Accept", "application/json")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"Accept": {"application/json"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() with case mismatch value = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_HeaderNotInRequest(t *testing.T) {
+	criterion := MatchHeaders("X-Custom", "value")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	// No X-Custom header set on request.
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"X-Custom": {"value"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() header not in request = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_HeaderNotInTape(t *testing.T) {
+	criterion := MatchHeaders("X-Custom", "value")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Custom", "value")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() header not in tape = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_WrongValueInRequest(t *testing.T) {
+	criterion := MatchHeaders("Accept", "application/xml")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Accept", "application/json")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"Accept": {"application/xml"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() wrong value in request = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_WrongValueInTape(t *testing.T) {
+	criterion := MatchHeaders("Accept", "application/xml")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Accept", "application/xml")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"Accept": {"application/json"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() wrong value in tape = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_MultiValuedHeader_AnyOf(t *testing.T) {
+	criterion := MatchHeaders("Accept", "application/json")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Add("Accept", "text/html")
+	req.Header.Add("Accept", "application/json")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"Accept": {"text/html", "application/json"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 3 {
+		t.Errorf("MatchHeaders() multi-valued any-of = %d, want 3", got)
+	}
+}
+
+func TestMatchHeaders_MultiValuedHeader_NotPresent(t *testing.T) {
+	criterion := MatchHeaders("Accept", "application/xml")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Add("Accept", "text/html")
+	req.Header.Add("Accept", "application/json")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{"Accept": {"text/html", "application/json"}},
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() multi-valued not present = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_NilTapeHeaders(t *testing.T) {
+	criterion := MatchHeaders("X-Custom", "value")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Custom", "value")
+	tape := Tape{Request: RecordedReq{}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchHeaders() nil tape headers = %d, want 0", got)
+	}
+}
+
+func TestMatchHeaders_MultipleCriteria_AND(t *testing.T) {
+	m := NewCompositeMatcher(
+		MatchMethod(),
+		MatchPath(),
+		MatchHeaders("Accept", "application/json"),
+		MatchHeaders("X-Api-Version", "v2"),
+	)
+
+	candidates := []Tape{
+		{
+			ID: "v1-json",
+			Request: RecordedReq{
+				Method:  "GET",
+				URL:     "/api/data",
+				Headers: http.Header{"Accept": {"application/json"}, "X-Api-Version": {"v1"}},
+			},
+		},
+		{
+			ID: "v2-json",
+			Request: RecordedReq{
+				Method:  "GET",
+				URL:     "/api/data",
+				Headers: http.Header{"Accept": {"application/json"}, "X-Api-Version": {"v2"}},
+			},
+		},
+		{
+			ID: "v2-xml",
+			Request: RecordedReq{
+				Method:  "GET",
+				URL:     "/api/data",
+				Headers: http.Header{"Accept": {"application/xml"}, "X-Api-Version": {"v2"}},
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Api-Version", "v2")
+
+	tape, ok := m.Match(req, candidates)
+	if !ok {
+		t.Fatal("expected a match")
+	}
+	if tape.ID != "v2-json" {
+		t.Errorf("got tape ID=%s, want v2-json", tape.ID)
+	}
+}
+
+func TestMatchHeaders_ScoreStacking(t *testing.T) {
+	// Two header criteria should contribute 6 total (3 + 3).
+	c1 := MatchHeaders("Accept", "application/json")
+	c2 := MatchHeaders("X-Api-Version", "v2")
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Api-Version", "v2")
+	tape := Tape{Request: RecordedReq{
+		Headers: http.Header{
+			"Accept":        {"application/json"},
+			"X-Api-Version": {"v2"},
+		},
+	}}
+
+	s1 := c1(req, tape)
+	s2 := c2(req, tape)
+	if s1+s2 != 6 {
+		t.Errorf("stacked header scores = %d, want 6", s1+s2)
+	}
+}
+
+func TestHeaderContains(t *testing.T) {
+	tests := []struct {
+		name         string
+		h            http.Header
+		canonicalKey string
+		value        string
+		want         bool
+	}{
+		{"found", http.Header{"Accept": {"application/json"}}, "Accept", "application/json", true},
+		{"not found", http.Header{"Accept": {"text/html"}}, "Accept", "application/json", false},
+		{"multi-value found", http.Header{"Accept": {"text/html", "application/json"}}, "Accept", "application/json", true},
+		{"missing key", http.Header{}, "Accept", "application/json", false},
+		{"nil header", nil, "Accept", "application/json", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := headerContains(tt.h, tt.canonicalKey, tt.value)
+			if got != tt.want {
+				t.Errorf("headerContains() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // --- CompositeMatcher tests ---
 
 func TestCompositeMatcher_DefaultMatcher(t *testing.T) {

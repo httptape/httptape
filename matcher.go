@@ -279,6 +279,58 @@ func DefaultMatcher() *CompositeMatcher {
 	return NewCompositeMatcher(MatchMethod(), MatchPath())
 }
 
+// MatchHeaders returns a MatchCriterion that requires the specified header to
+// be present in both the incoming request and the candidate tape's recorded
+// request, with an exact value match.
+//
+// The header name is canonicalized using http.CanonicalHeaderKey, making it
+// case-insensitive per HTTP specification (RFC 7230 section 3.2). The header
+// value comparison is exact and case-sensitive.
+//
+// If the header has multiple values in either the request or the tape, the
+// criterion checks whether the specified value appears among them (any-of
+// semantics). This handles the common case where a header may be set multiple
+// times (e.g., multiple Accept values).
+//
+// To require multiple headers, add multiple MatchHeaders criteria to the
+// CompositeMatcher. They are AND-ed together naturally: if any criterion
+// returns 0, the candidate is eliminated.
+//
+// Returns score 3 on match, 0 on mismatch.
+//
+// Example:
+//
+//	matcher := NewCompositeMatcher(
+//	    MatchMethod(),
+//	    MatchPath(),
+//	    MatchHeaders("Accept", "application/vnd.api.v2+json"),
+//	    MatchHeaders("X-Feature-Flag", "new-checkout"),
+//	)
+func MatchHeaders(key, value string) MatchCriterion {
+	canonicalKey := http.CanonicalHeaderKey(key)
+	return func(req *http.Request, candidate Tape) int {
+		if !headerContains(req.Header, canonicalKey, value) {
+			return 0
+		}
+		if !headerContains(candidate.Request.Headers, canonicalKey, value) {
+			return 0
+		}
+		return 3
+	}
+}
+
+// headerContains reports whether the header map contains the specified
+// canonical key with the specified value among its values.
+func headerContains(h http.Header, canonicalKey, value string) bool {
+	values := h[canonicalKey]
+	for _, v := range values {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
 // stringSlicesEqual reports whether two string slices contain the same elements
 // in the same order.
 func stringSlicesEqual(a, b []string) bool {
