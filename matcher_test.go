@@ -542,6 +542,214 @@ func TestStringSlicesEqual(t *testing.T) {
 	}
 }
 
+// --- MatchPathRegex tests ---
+
+func TestMatchPathRegex_Match(t *testing.T) {
+	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/456/orders", nil)
+	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users/123/orders"}}
+	got := criterion(req, tape)
+	if got != 1 {
+		t.Errorf("MatchPathRegex() = %d, want 1", got)
+	}
+}
+
+func TestMatchPathRegex_RequestNoMatch(t *testing.T) {
+	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/products/1", nil)
+	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users/123/orders"}}
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchPathRegex() = %d, want 0", got)
+	}
+}
+
+func TestMatchPathRegex_TapeNoMatch(t *testing.T) {
+	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/456/orders", nil)
+	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/products/42"}}
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchPathRegex() = %d, want 0", got)
+	}
+}
+
+func TestMatchPathRegex_UnparsableTapeURL(t *testing.T) {
+	criterion, err := MatchPathRegex(`^/users/\d+$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/123", nil)
+	tape := Tape{Request: RecordedReq{URL: "://not-a-url"}}
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchPathRegex() with unparsable URL = %d, want 0", got)
+	}
+}
+
+func TestMatchPathRegex_InvalidPattern(t *testing.T) {
+	criterion, err := MatchPathRegex("[invalid")
+	if err == nil {
+		t.Fatal("expected error for invalid regex pattern")
+	}
+	if criterion != nil {
+		t.Error("expected nil criterion for invalid regex pattern")
+	}
+}
+
+func TestMatchPathRegex_BroadPattern(t *testing.T) {
+	criterion, err := MatchPathRegex(`.*`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/anything/at/all", nil)
+	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/something/else"}}
+	got := criterion(req, tape)
+	if got != 1 {
+		t.Errorf("MatchPathRegex(\".*\") = %d, want 1", got)
+	}
+}
+
+func TestMatchPathRegex_AnchoredPattern(t *testing.T) {
+	tests := []struct {
+		name      string
+		pattern   string
+		reqPath   string
+		tapeURL   string
+		wantScore int
+	}{
+		{
+			"unanchored matches partial",
+			`/users/\d+`,
+			"/users/123/extra",
+			"https://api.example.com/users/456/extra",
+			1,
+		},
+		{
+			"anchored rejects partial",
+			`^/users/\d+$`,
+			"/users/123/extra",
+			"https://api.example.com/users/456/extra",
+			0,
+		},
+		{
+			"anchored matches exact",
+			`^/users/\d+$`,
+			"/users/123",
+			"https://api.example.com/users/456",
+			1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			criterion, err := MatchPathRegex(tt.pattern)
+			if err != nil {
+				t.Fatalf("MatchPathRegex(%q) error = %v", tt.pattern, err)
+			}
+			req := httptest.NewRequest("GET", tt.reqPath, nil)
+			tape := Tape{Request: RecordedReq{URL: tt.tapeURL}}
+			got := criterion(req, tape)
+			if got != tt.wantScore {
+				t.Errorf("MatchPathRegex(%q) = %d, want %d", tt.pattern, got, tt.wantScore)
+			}
+		})
+	}
+}
+
+func TestMatchPathRegex_EmptyPattern(t *testing.T) {
+	criterion, err := MatchPathRegex("")
+	if err != nil {
+		t.Fatalf("MatchPathRegex(\"\") error = %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/anything", nil)
+	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/whatever"}}
+	got := criterion(req, tape)
+	if got != 1 {
+		t.Errorf("MatchPathRegex(\"\") = %d, want 1", got)
+	}
+}
+
+func TestCompositeMatcher_RegexPath(t *testing.T) {
+	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+
+	m := NewCompositeMatcher(MatchMethod(), criterion)
+
+	candidates := []Tape{
+		{ID: "user-orders", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/users/123/orders"}},
+		{ID: "products", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/products/42"}},
+		{ID: "user-profile", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/users/123"}},
+	}
+
+	req := httptest.NewRequest("GET", "/users/456/orders", nil)
+	tape, ok := m.Match(req, candidates)
+	if !ok {
+		t.Fatal("expected a match")
+	}
+	if tape.ID != "user-orders" {
+		t.Errorf("got tape ID=%s, want user-orders", tape.ID)
+	}
+}
+
+func TestCompositeMatcher_ExactBeatsRegex(t *testing.T) {
+	// Exact matcher: MatchMethod (1) + MatchPath (2) = 3
+	exactMatcher := NewCompositeMatcher(MatchMethod(), MatchPath())
+
+	// Regex matcher: MatchMethod (1) + MatchPathRegex (1) = 2
+	regexCriterion, err := MatchPathRegex(`^/users/\d+$`)
+	if err != nil {
+		t.Fatalf("MatchPathRegex() error = %v", err)
+	}
+	regexMatcher := NewCompositeMatcher(MatchMethod(), regexCriterion)
+
+	candidates := []Tape{
+		{ID: "user-123", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/users/123"}},
+	}
+
+	req := httptest.NewRequest("GET", "/users/123", nil)
+
+	exactTape, exactOk := exactMatcher.Match(req, candidates)
+	regexTape, regexOk := regexMatcher.Match(req, candidates)
+
+	if !exactOk || !regexOk {
+		t.Fatal("both matchers should find a match")
+	}
+
+	// Both match the same tape, but exact matcher should produce a higher score.
+	// We verify this indirectly: exact matcher score = 3 (method 1 + path 2),
+	// regex matcher score = 2 (method 1 + regex 1).
+	// The key property is that exact > regex, which is the design intent.
+	if exactTape.ID != "user-123" || regexTape.ID != "user-123" {
+		t.Errorf("exact=%s regex=%s, both should be user-123", exactTape.ID, regexTape.ID)
+	}
+
+	// Verify scores directly by running criteria.
+	exactPathScore := MatchPath()(req, candidates[0])
+	regexPathScore := regexCriterion(req, candidates[0])
+	if exactPathScore <= regexPathScore {
+		t.Errorf("MatchPath score (%d) should be greater than MatchPathRegex score (%d)",
+			exactPathScore, regexPathScore)
+	}
+}
+
 // --- Server integration: verify DefaultMatcher is used by default ---
 
 func TestServer_UsesDefaultMatcher(t *testing.T) {

@@ -2,9 +2,11 @@ package httptape
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 )
 
 // Matcher selects a Tape from a list of candidates that best matches
@@ -85,6 +87,50 @@ func MatchPath() MatchCriterion {
 		}
 		return 0
 	}
+}
+
+// MatchPathRegex returns a MatchCriterion that matches the incoming request's
+// URL path against a compiled regular expression, and also verifies that the
+// candidate tape's stored URL path matches the same expression. This ensures
+// that only tapes belonging to the same "path family" as the request are
+// considered matches.
+//
+// The pattern is compiled once at construction time using regexp.Compile.
+// If the pattern is invalid, MatchPathRegex returns a non-nil error and a
+// nil MatchCriterion. Callers must check the error before using the criterion.
+//
+// Returns score 1 on match, 0 on mismatch.
+//
+// Usage: use MatchPathRegex as a replacement for MatchPath when regex matching
+// is desired, not alongside it. If MatchPath is also present in the same
+// CompositeMatcher, candidates that do not exact-match will be eliminated by
+// MatchPath (score 0) regardless of the regex result.
+//
+// Example:
+//
+//	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	matcher := NewCompositeMatcher(MatchMethod(), criterion)
+func MatchPathRegex(pattern string) (MatchCriterion, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("httptape: invalid path regex %q: %w", pattern, err)
+	}
+	return func(req *http.Request, candidate Tape) int {
+		if !re.MatchString(req.URL.Path) {
+			return 0
+		}
+		parsed, err := url.Parse(candidate.Request.URL)
+		if err != nil {
+			return 0
+		}
+		if !re.MatchString(parsed.Path) {
+			return 0
+		}
+		return 1
+	}, nil
 }
 
 // MatchRoute returns a MatchCriterion that requires the tape's Route field
