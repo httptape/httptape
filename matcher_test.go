@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1009,6 +1010,488 @@ func TestCompositeMatcher_ExactBeatsRegex(t *testing.T) {
 	if exactPathScore <= regexPathScore {
 		t.Errorf("MatchPath score (%d) should be greater than MatchPathRegex score (%d)",
 			exactPathScore, regexPathScore)
+	}
+}
+
+// --- MatchBodyFuzzy tests ---
+
+func TestMatchBodyFuzzy_SingleField(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create","timestamp":"2026-01-01T00:00:00Z"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create","timestamp":"2025-06-15T12:00:00Z"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_MultipleFields(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action", "$.user")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create","user":"alice","nonce":"abc123"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create","user":"alice","nonce":"xyz789"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_NestedField(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.user.id")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"user":{"id":42,"session":"s1"}}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"user":{"id":42,"session":"s2"}}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() nested = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_ArrayWildcard(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.items[*].sku")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"items":[{"sku":"A1","qty":5},{"sku":"B2","qty":3}]}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"items":[{"sku":"A1","qty":10},{"sku":"B2","qty":7}]}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() array wildcard = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_FieldValueDiffers(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"delete"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() mismatch = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_NonJSONRequestBody(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader("not json"))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() non-JSON request = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_NonJSONTapeBody(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte("not json"),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() non-JSON tape = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_EmptyPaths(t *testing.T) {
+	criterion := MatchBodyFuzzy()
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() empty paths = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_PathInRequestNotInTape(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action", "$.extra")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create","extra":"value"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	// "extra" is skipped (not in tape), "action" matches => score 6
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() path in req not tape = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_PathInTapeNotInRequest(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action", "$.extra")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create","extra":"value"}`),
+	}}
+
+	// "extra" is skipped (not in request), "action" matches => score 6
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() path in tape not req = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_BothBodiesEmpty(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	req := httptest.NewRequest("POST", "/test", nil)
+	tape := Tape{Request: RecordedReq{Body: nil}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() both empty = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_InvalidPaths(t *testing.T) {
+	// All paths invalid => parsed list is empty => returns 0
+	criterion := MatchBodyFuzzy("not-a-path", "also-bad")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() invalid paths = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_AllPathsMissing(t *testing.T) {
+	// Valid paths but none exist in either body => matched=0 => returns 0
+	criterion := MatchBodyFuzzy("$.nonexistent")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"action":"create"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() all paths missing = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_BodyRestored(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.action")
+
+	body := `{"action":"create"}`
+	req := httptest.NewRequest("POST", "/test", strings.NewReader(body))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"action":"create"}`),
+	}}
+
+	criterion(req, tape)
+
+	// Body should be restored for subsequent reads.
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("reading restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Errorf("restored body = %q, want %q", string(restored), body)
+	}
+}
+
+func TestMatchBodyFuzzy_DeepNestedObject(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.a.b.c")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"a":{"b":{"c":"deep"}}}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"a":{"b":{"c":"deep"}}}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() deep nested = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_NumericValue(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.count")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"count":42}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"count":42}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() numeric = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_BooleanValue(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.active")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"active":true}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"active":true}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() boolean = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_NullValue(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.data")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"data":null}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"data":null}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() null = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_ObjectValue(t *testing.T) {
+	// Comparing an entire nested object
+	criterion := MatchBodyFuzzy("$.config")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"config":{"retries":3,"timeout":30},"id":"abc"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"config":{"retries":3,"timeout":30},"id":"xyz"}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 6 {
+		t.Errorf("MatchBodyFuzzy() object value = %d, want 6", got)
+	}
+}
+
+func TestMatchBodyFuzzy_ArrayWildcard_DifferentValues(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.items[*].sku")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"items":[{"sku":"A1"},{"sku":"C3"}]}`),
+	}}
+
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() array wildcard mismatch = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_ArrayWildcard_DifferentLengths(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.items[*].sku")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"items":[{"sku":"A1"}]}`),
+	}}
+
+	// Different array lengths produce different collected slices
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() array different lengths = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_Composability(t *testing.T) {
+	m := NewCompositeMatcher(
+		MatchMethod(),
+		MatchPath(),
+		MatchBodyFuzzy("$.action"),
+	)
+
+	candidates := []Tape{
+		{
+			ID: "create",
+			Request: RecordedReq{
+				Method: "POST",
+				URL:    "/api/do",
+				Body:   []byte(`{"action":"create","ts":"2025-01-01"}`),
+			},
+		},
+		{
+			ID: "delete",
+			Request: RecordedReq{
+				Method: "POST",
+				URL:    "/api/do",
+				Body:   []byte(`{"action":"delete","ts":"2025-02-01"}`),
+			},
+		},
+	}
+
+	req := httptest.NewRequest("POST", "/api/do",
+		strings.NewReader(`{"action":"delete","ts":"2026-03-30"}`))
+	tape, ok := m.Match(req, candidates)
+	if !ok {
+		t.Fatal("expected a match")
+	}
+	if tape.ID != "delete" {
+		t.Errorf("got tape ID=%s, want delete", tape.ID)
+	}
+}
+
+func TestMatchBodyFuzzy_WildcardNotArray(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.items[*].sku")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"items":"not-an-array"}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"items":"not-an-array"}`),
+	}}
+
+	// items is not an array, so path extraction fails => skipped => matched=0 => 0
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() wildcard not array = %d, want 0", got)
+	}
+}
+
+func TestMatchBodyFuzzy_WildcardMissingFieldInElement(t *testing.T) {
+	criterion := MatchBodyFuzzy("$.items[*].sku")
+
+	req := httptest.NewRequest("POST", "/test",
+		strings.NewReader(`{"items":[{"sku":"A1"},{"name":"B2"}]}`))
+	tape := Tape{Request: RecordedReq{
+		Body: []byte(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`),
+	}}
+
+	// Second element in request doesn't have "sku" => extractAtPath returns false (all-or-nothing)
+	got := criterion(req, tape)
+	if got != 0 {
+		t.Errorf("MatchBodyFuzzy() wildcard missing field = %d, want 0", got)
+	}
+}
+
+// --- extractAtPath tests ---
+
+func TestExtractAtPath_TopLevel(t *testing.T) {
+	data := map[string]any{"name": "alice"}
+	val, ok := extractAtPath(data, []segment{{key: "name"}})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if val != "alice" {
+		t.Errorf("got %v, want alice", val)
+	}
+}
+
+func TestExtractAtPath_Nested(t *testing.T) {
+	data := map[string]any{"user": map[string]any{"id": float64(42)}}
+	val, ok := extractAtPath(data, []segment{{key: "user"}, {key: "id"}})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if val != float64(42) {
+		t.Errorf("got %v, want 42", val)
+	}
+}
+
+func TestExtractAtPath_Missing(t *testing.T) {
+	data := map[string]any{"name": "alice"}
+	_, ok := extractAtPath(data, []segment{{key: "missing"}})
+	if ok {
+		t.Error("expected ok=false for missing key")
+	}
+}
+
+func TestExtractAtPath_NotObject(t *testing.T) {
+	data := "just a string"
+	_, ok := extractAtPath(data, []segment{{key: "field"}})
+	if ok {
+		t.Error("expected ok=false for non-object data")
+	}
+}
+
+func TestExtractAtPath_Wildcard(t *testing.T) {
+	data := map[string]any{
+		"items": []any{
+			map[string]any{"sku": "A1"},
+			map[string]any{"sku": "B2"},
+		},
+	}
+	val, ok := extractAtPath(data, []segment{
+		{key: "items", wildcard: true},
+		{key: "sku"},
+	})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	expected := []any{"A1", "B2"}
+	if !reflect.DeepEqual(val, expected) {
+		t.Errorf("got %v, want %v", val, expected)
+	}
+}
+
+func TestExtractAtPath_WildcardAtLeaf(t *testing.T) {
+	data := map[string]any{
+		"tags": []any{"go", "test"},
+	}
+	val, ok := extractAtPath(data, []segment{
+		{key: "tags", wildcard: true},
+	})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	expected := []any{"go", "test"}
+	if !reflect.DeepEqual(val, expected) {
+		t.Errorf("got %v, want %v", val, expected)
+	}
+}
+
+func TestExtractAtPath_EmptySegments(t *testing.T) {
+	data := map[string]any{"name": "alice"}
+	val, ok := extractAtPath(data, nil)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !reflect.DeepEqual(val, data) {
+		t.Errorf("got %v, want %v", val, data)
 	}
 }
 

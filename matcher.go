@@ -2,10 +2,12 @@ package httptape
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 )
 
@@ -329,6 +331,158 @@ func headerContains(h http.Header, canonicalKey, value string) bool {
 		}
 	}
 	return false
+}
+
+// MatchBodyFuzzy returns a MatchCriterion that compares specific fields in
+// the JSON request body between the incoming request and the candidate tape.
+// Only the fields at the specified paths are compared; all other fields are
+// ignored. This is useful when request bodies contain volatile fields
+// (timestamps, nonces, request IDs) that vary per invocation.
+//
+// Paths use the same JSONPath-like syntax as RedactBodyPaths and FakeFields:
+//   - $.field             -- top-level field
+//   - $.nested.field      -- nested field access
+//   - $.array[*].field    -- field within each element of an array
+//
+// Matching semantics:
+//   - Both bodies are unmarshaled as JSON. If either body is not valid JSON,
+//     the criterion returns 0 (no match).
+//   - For each specified path, the value is extracted from both the request
+//     and the tape body. If a path does not exist in both bodies, it is
+//     skipped (does not cause a mismatch).
+//   - If a path exists in both bodies, the extracted values must be
+//     deeply equal (compared via reflect.DeepEqual on the unmarshaled
+//     any values). If any compared field differs, the criterion returns 0.
+//   - If no paths are provided, or no paths match fields present in both
+//     bodies, the criterion returns 0 (no match — nothing to compare means
+//     no evidence of a match).
+//   - If at least one path matched and all matched fields are equal, the
+//     criterion returns its score.
+//
+// The request body is read fully, then restored (replaced with a new reader
+// over the same bytes) so subsequent criteria can read it again.
+//
+// Invalid or unsupported paths are silently ignored (same as RedactBodyPaths).
+//
+// Returns score 6 on match, 0 on mismatch.
+//
+// Note: using both MatchBodyFuzzy and MatchBodyHash in the same
+// CompositeMatcher is safe but semantically redundant. If MatchBodyHash
+// passes (exact match), MatchBodyFuzzy will also pass. If MatchBodyHash
+// fails, the candidate is already eliminated. Choose one or the other.
+//
+// Example:
+//
+//	matcher := NewCompositeMatcher(
+//	    MatchMethod(),
+//	    MatchPath(),
+//	    MatchBodyFuzzy("$.action", "$.user.id", "$.items[*].sku"),
+//	)
+func MatchBodyFuzzy(paths ...string) MatchCriterion {
+	// Parse all paths at construction time (reuses parsePath from sanitizer.go).
+	var parsed []parsedPath
+	for _, p := range paths {
+		if pp, ok := parsePath(p); ok {
+			parsed = append(parsed, pp)
+		}
+	}
+
+	return func(req *http.Request, candidate Tape) int {
+		if len(parsed) == 0 {
+			return 0
+		}
+
+		// Read and restore the incoming request body.
+		var reqBody []byte
+		if req.Body != nil {
+			bodyBytes, err := io.ReadAll(req.Body)
+			if err != nil {
+				return 0
+			}
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			reqBody = bodyBytes
+		}
+
+		// Unmarshal both bodies.
+		var reqData, tapeData any
+		if err := json.Unmarshal(reqBody, &reqData); err != nil {
+			return 0
+		}
+		if err := json.Unmarshal(candidate.Request.Body, &tapeData); err != nil {
+			return 0
+		}
+
+		// Compare specified fields.
+		matched := 0
+		for _, p := range parsed {
+			reqVal, reqOk := extractAtPath(reqData, p.segments)
+			tapeVal, tapeOk := extractAtPath(tapeData, p.segments)
+
+			if !reqOk || !tapeOk {
+				// Path doesn't exist in one or both — skip, not a mismatch.
+				continue
+			}
+
+			if !reflect.DeepEqual(reqVal, tapeVal) {
+				return 0 // field exists in both but values differ — eliminate.
+			}
+			matched++
+		}
+
+		if matched == 0 {
+			return 0 // no fields compared — no evidence of match.
+		}
+		return 6
+	}
+}
+
+// extractAtPath traverses the JSON structure following the given segments
+// and returns the value at the leaf. Returns (value, true) if the path
+// exists, or (nil, false) if any segment is missing or the structure does
+// not match (e.g., expected object but found array).
+//
+// For wildcard segments (array[*].field), it collects the matching values
+// from all array elements into a []any slice and returns that.
+func extractAtPath(data any, segments []segment) (any, bool) {
+	if len(segments) == 0 {
+		return data, true
+	}
+
+	seg := segments[0]
+	rest := segments[1:]
+
+	obj, ok := data.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+
+	val, exists := obj[seg.key]
+	if !exists {
+		return nil, false
+	}
+
+	if seg.wildcard {
+		arr, ok := val.([]any)
+		if !ok {
+			return nil, false
+		}
+		if len(rest) == 0 {
+			// Wildcard at leaf: return the array itself.
+			return arr, true
+		}
+		// Collect values from each element.
+		collected := make([]any, 0, len(arr))
+		for _, elem := range arr {
+			v, ok := extractAtPath(elem, rest)
+			if !ok {
+				return nil, false // all-or-nothing for arrays
+			}
+			collected = append(collected, v)
+		}
+		return collected, true
+	}
+
+	return extractAtPath(val, rest)
 }
 
 // stringSlicesEqual reports whether two string slices contain the same elements
