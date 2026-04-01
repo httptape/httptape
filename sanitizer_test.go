@@ -2,6 +2,7 @@ package httptape
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -1426,5 +1427,142 @@ func TestFakeFields_BodyHashUnchangedForNonJSON(t *testing.T) {
 	if result.Request.BodyHash != originalHash {
 		t.Errorf("BodyHash should not change for non-JSON body: got %q, want %q",
 			result.Request.BodyHash, originalHash)
+	}
+}
+
+// --- Benchmarks ---
+
+// generateJSONBody creates a JSON object with n user entries, each containing
+// email, id, name, and nested tokens array. Returns the JSON bytes.
+func generateJSONBody(n int) []byte {
+	type token struct {
+		Value string `json:"value"`
+	}
+	type user struct {
+		Email  string  `json:"email"`
+		ID     int     `json:"id"`
+		Name   string  `json:"name"`
+		Tokens []token `json:"tokens"`
+	}
+	type body struct {
+		Users []user `json:"users"`
+	}
+
+	b := body{Users: make([]user, n)}
+	for i := 0; i < n; i++ {
+		b.Users[i] = user{
+			Email:  fmt.Sprintf("user%d@test.com", i),
+			ID:     1000 + i,
+			Name:   fmt.Sprintf("User %d", i),
+			Tokens: []token{{Value: fmt.Sprintf("tok%d", i)}},
+		}
+	}
+
+	data, _ := json.Marshal(b)
+	return data
+}
+
+func makeBenchTapeWithBody(bodyBytes []byte) Tape {
+	return Tape{
+		ID:    "bench-tape",
+		Route: "bench-route",
+		Request: RecordedReq{
+			Method:   "POST",
+			URL:      "https://example.com/api/users",
+			Headers:  http.Header{"Content-Type": {"application/json"}, "Authorization": {"Bearer secret-token"}},
+			Body:     bodyBytes,
+			BodyHash: BodyHashFromBytes(bodyBytes),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}, "Set-Cookie": {"session=abc123"}},
+			Body:       bodyBytes,
+		},
+	}
+}
+
+// BenchmarkSanitizer_RedactBodyPaths measures RedactBodyPaths throughput.
+func BenchmarkSanitizer_RedactBodyPaths(b *testing.B) {
+	sizes := []struct {
+		name  string
+		users int
+	}{
+		{"1KB", 5},
+		{"10KB", 60},
+		{"100KB", 600},
+	}
+
+	for _, sz := range sizes {
+		b.Run(sz.name, func(b *testing.B) {
+			body := generateJSONBody(sz.users)
+			tape := makeBenchTapeWithBody(body)
+			pipeline := NewPipeline(RedactBodyPaths("$.users[*].email", "$.users[*].id"))
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				pipeline.Sanitize(tape)
+			}
+		})
+	}
+}
+
+// BenchmarkSanitizer_FakeFields measures FakeFields throughput (includes HMAC).
+func BenchmarkSanitizer_FakeFields(b *testing.B) {
+	sizes := []struct {
+		name  string
+		users int
+	}{
+		{"1KB", 5},
+		{"10KB", 60},
+		{"100KB", 600},
+	}
+
+	for _, sz := range sizes {
+		b.Run(sz.name, func(b *testing.B) {
+			body := generateJSONBody(sz.users)
+			tape := makeBenchTapeWithBody(body)
+			pipeline := NewPipeline(FakeFields("bench-seed", "$.users[*].email", "$.users[*].id"))
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				pipeline.Sanitize(tape)
+			}
+		})
+	}
+}
+
+// BenchmarkSanitizer_FullPipeline measures a realistic pipeline with
+// RedactHeaders + RedactBodyPaths + FakeFields combined.
+func BenchmarkSanitizer_FullPipeline(b *testing.B) {
+	sizes := []struct {
+		name  string
+		users int
+	}{
+		{"1KB", 5},
+		{"10KB", 60},
+		{"100KB", 600},
+	}
+
+	for _, sz := range sizes {
+		b.Run(sz.name, func(b *testing.B) {
+			body := generateJSONBody(sz.users)
+			tape := makeBenchTapeWithBody(body)
+			pipeline := NewPipeline(
+				RedactHeaders(),
+				RedactBodyPaths("$.users[*].email"),
+				FakeFields("bench-seed", "$.users[*].id", "$.users[*].name"),
+			)
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				pipeline.Sanitize(tape)
+			}
+		})
 	}
 }

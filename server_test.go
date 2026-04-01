@@ -3,6 +3,7 @@ package httptape
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -387,6 +388,60 @@ func TestServer_WithHTTPTestServer(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+}
+
+// --- Benchmarks ---
+
+// BenchmarkServerServeHTTP_ExactMatch measures response latency with exact match.
+// Scales from 1 to 1000 candidate tapes to show matching cost.
+func BenchmarkServerServeHTTP_ExactMatch(b *testing.B) {
+	tapeCounts := []int{1, 10, 100, 1000}
+
+	for _, n := range tapeCounts {
+		b.Run(fmt.Sprintf("%dtapes", n), func(b *testing.B) {
+			b.ReportAllocs()
+
+			store := NewMemoryStore()
+			ctx := context.Background()
+
+			// Populate store with n-1 non-matching tapes plus 1 matching tape.
+			for i := 0; i < n-1; i++ {
+				tape := NewTape("bench-route", RecordedReq{
+					Method: "GET",
+					URL:    fmt.Sprintf("/api/other/%d", i),
+				}, RecordedResp{
+					StatusCode: 200,
+					Headers:    http.Header{"Content-Type": {"application/json"}},
+					Body:       []byte(`{"id":1}`),
+				})
+				if err := store.Save(ctx, tape); err != nil {
+					b.Fatalf("Save: %v", err)
+				}
+			}
+
+			// Add the matching tape.
+			matchingTape := NewTape("bench-route", RecordedReq{
+				Method: "GET",
+				URL:    "/api/users",
+			}, RecordedResp{
+				StatusCode: 200,
+				Headers:    http.Header{"Content-Type": {"application/json"}},
+				Body:       []byte(`{"users":[]}`),
+			})
+			if err := store.Save(ctx, matchingTape); err != nil {
+				b.Fatalf("Save: %v", err)
+			}
+
+			srv := NewServer(store)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest("GET", "/api/users", nil)
+				srv.ServeHTTP(rec, req)
+			}
+		})
 	}
 }
 

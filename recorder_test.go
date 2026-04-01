@@ -1217,3 +1217,159 @@ func TestWithSanitizer_NilFallsBackToNoOp(t *testing.T) {
 		t.Errorf("sanitizer type = %T, want *Pipeline", rec.sanitizer)
 	}
 }
+
+// --- Benchmarks ---
+
+// noopTransport is an http.RoundTripper that returns a fixed response without
+// making any network call. Used to isolate recorder overhead in benchmarks.
+type noopTransport struct {
+	statusCode int
+	body       []byte
+	header     http.Header
+}
+
+func (t *noopTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.statusCode,
+		Header:     t.header.Clone(),
+		Body:       io.NopCloser(bytes.NewReader(t.body)),
+	}, nil
+}
+
+func newNoopTransport(body []byte) *noopTransport {
+	return &noopTransport{
+		statusCode: 200,
+		body:       body,
+		header:     http.Header{"Content-Type": {"application/json"}},
+	}
+}
+
+func makeBenchRequest(body []byte) *http.Request {
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	req, _ := http.NewRequest("POST", "http://example.com/api/users", bodyReader)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token-12345")
+	return req
+}
+
+// BenchmarkRecorderRoundTrip_Async measures the overhead of async recording.
+// The inner transport is a no-op stub returning a fixed response.
+func BenchmarkRecorderRoundTrip_Async(b *testing.B) {
+	smallBody := []byte(`{"ok":true}`)
+	mediumBody := bytes.Repeat([]byte(`{"key":"value"},`), 625) // ~10KB
+	mediumBody = append([]byte(`[`), mediumBody...)
+	mediumBody[len(mediumBody)-1] = ']'
+
+	benchCases := []struct {
+		name      string
+		sanitizer Sanitizer
+		reqBody   []byte
+		respBody  []byte
+	}{
+		{
+			name:      "NoSanitizer",
+			sanitizer: NewPipeline(),
+			reqBody:   smallBody,
+			respBody:  smallBody,
+		},
+		{
+			name:      "WithRedactHeaders",
+			sanitizer: NewPipeline(RedactHeaders("Authorization")),
+			reqBody:   smallBody,
+			respBody:  smallBody,
+		},
+		{
+			name:      "SmallBody",
+			sanitizer: NewPipeline(),
+			reqBody:   make([]byte, 100),
+			respBody:  make([]byte, 100),
+		},
+		{
+			name:      "MediumBody",
+			sanitizer: NewPipeline(),
+			reqBody:   mediumBody,
+			respBody:  mediumBody,
+		},
+	}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			store := NewMemoryStore()
+			transport := newNoopTransport(bc.respBody)
+			rec := NewRecorder(store,
+				WithTransport(transport),
+				WithRoute("bench-route"),
+				WithSanitizer(bc.sanitizer),
+				WithAsync(true),
+				WithBufferSize(4096),
+			)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req := makeBenchRequest(bc.reqBody)
+				resp, err := rec.RoundTrip(req)
+				if err != nil {
+					b.Fatalf("RoundTrip error: %v", err)
+				}
+				resp.Body.Close()
+			}
+			b.StopTimer()
+			rec.Close()
+		})
+	}
+}
+
+// BenchmarkRecorderRoundTrip_Sync measures sync recording overhead for comparison.
+func BenchmarkRecorderRoundTrip_Sync(b *testing.B) {
+	smallBody := []byte(`{"ok":true}`)
+
+	benchCases := []struct {
+		name      string
+		sanitizer Sanitizer
+		reqBody   []byte
+		respBody  []byte
+	}{
+		{
+			name:      "NoSanitizer",
+			sanitizer: NewPipeline(),
+			reqBody:   smallBody,
+			respBody:  smallBody,
+		},
+		{
+			name:      "WithRedactHeaders",
+			sanitizer: NewPipeline(RedactHeaders("Authorization")),
+			reqBody:   smallBody,
+			respBody:  smallBody,
+		},
+	}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			store := NewMemoryStore()
+			transport := newNoopTransport(bc.respBody)
+			rec := NewRecorder(store,
+				WithTransport(transport),
+				WithRoute("bench-route"),
+				WithSanitizer(bc.sanitizer),
+				WithAsync(false),
+			)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				req := makeBenchRequest(bc.reqBody)
+				resp, err := rec.RoundTrip(req)
+				if err != nil {
+					b.Fatalf("RoundTrip error: %v", err)
+				}
+				resp.Body.Close()
+			}
+		})
+	}
+}

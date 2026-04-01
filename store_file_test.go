@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -607,6 +610,109 @@ func TestFileStore_TrailingNewline(t *testing.T) {
 	}
 	if data[len(data)-1] != '\n' {
 		t.Error("JSON file does not end with trailing newline")
+	}
+}
+
+// --- Benchmarks ---
+
+func makeBenchFileTape(id string, body []byte) Tape {
+	return Tape{
+		ID:    id,
+		Route: "bench-route",
+		Request: RecordedReq{
+			Method:   "POST",
+			URL:      "https://example.com/api/data",
+			Headers:  http.Header{"Content-Type": {"application/json"}},
+			Body:     body,
+			BodyHash: BodyHashFromBytes(body),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       body,
+		},
+	}
+}
+
+// BenchmarkFileStore_Save measures sequential write throughput.
+func BenchmarkFileStore_Save(b *testing.B) {
+	smallBody := []byte(`{"key":"value"}`)
+	mediumBody := make([]byte, 10*1024)
+	for i := range mediumBody {
+		mediumBody[i] = 'x'
+	}
+
+	benchCases := []struct {
+		name string
+		body []byte
+	}{
+		{"SmallTape", smallBody},
+		{"MediumTape", mediumBody},
+	}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			dir := b.TempDir()
+			store, err := NewFileStore(WithDirectory(dir))
+			if err != nil {
+				b.Fatalf("NewFileStore: %v", err)
+			}
+			ctx := context.Background()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				id := fmt.Sprintf("tape-%d", i)
+				tape := makeBenchFileTape(id, bc.body)
+				if err := store.Save(ctx, tape); err != nil {
+					b.Fatalf("Save: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkFileStore_Save_Concurrent measures concurrent write throughput.
+func BenchmarkFileStore_Save_Concurrent(b *testing.B) {
+	smallBody := []byte(`{"key":"value"}`)
+	mediumBody := make([]byte, 10*1024)
+	for i := range mediumBody {
+		mediumBody[i] = 'x'
+	}
+
+	benchCases := []struct {
+		name string
+		body []byte
+	}{
+		{"SmallTape", smallBody},
+		{"MediumTape", mediumBody},
+	}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			dir := b.TempDir()
+			store, err := NewFileStore(WithDirectory(dir))
+			if err != nil {
+				b.Fatalf("NewFileStore: %v", err)
+			}
+			ctx := context.Background()
+			var counter atomic.Int64
+
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					n := counter.Add(1)
+					id := fmt.Sprintf("tape-%d", n)
+					tape := makeBenchFileTape(id, bc.body)
+					if err := store.Save(ctx, tape); err != nil {
+						b.Errorf("Save: %v", err)
+					}
+				}
+			})
+		})
 	}
 }
 

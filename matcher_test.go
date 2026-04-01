@@ -2,6 +2,7 @@ package httptape
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1528,4 +1529,110 @@ func TestServer_UsesDefaultMatcher(t *testing.T) {
 	if got := w.Body.String(); got != "ok" {
 		t.Errorf("body = %q, want %q", got, "ok")
 	}
+}
+
+// --- Benchmarks ---
+
+// generateCandidates creates n candidate tapes. The matching tape for
+// GET /api/target is placed at position matchIdx.
+func generateCandidates(n, matchIdx int) []Tape {
+	candidates := make([]Tape, n)
+	for i := 0; i < n; i++ {
+		candidates[i] = Tape{
+			ID:    fmt.Sprintf("tape-%d", i),
+			Route: "bench-route",
+			Request: RecordedReq{
+				Method:   "GET",
+				URL:      fmt.Sprintf("https://api.example.com/api/other/%d", i),
+				Headers:  http.Header{"Content-Type": {"application/json"}},
+				Body:     []byte(`{"id":1}`),
+				BodyHash: BodyHashFromBytes([]byte(`{"id":1}`)),
+			},
+			Response: RecordedResp{
+				StatusCode: 200,
+				Body:       []byte(`{"ok":true}`),
+			},
+		}
+	}
+	// Place the matching tape at matchIdx.
+	candidates[matchIdx] = Tape{
+		ID:    "target-tape",
+		Route: "bench-route",
+		Request: RecordedReq{
+			Method:   "GET",
+			URL:      "https://api.example.com/api/target",
+			Headers:  http.Header{"Content-Type": {"application/json"}},
+			Body:     []byte(`{"action":"find"}`),
+			BodyHash: BodyHashFromBytes([]byte(`{"action":"find"}`)),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Body:       []byte(`{"found":true}`),
+		},
+	}
+	return candidates
+}
+
+// BenchmarkCompositeMatcher_Match measures matching with DefaultMatcher criteria.
+func BenchmarkCompositeMatcher_Match(b *testing.B) {
+	candidateCounts := []int{10, 100, 1000, 5000}
+
+	b.Run("Default", func(b *testing.B) {
+		for _, n := range candidateCounts {
+			b.Run(fmt.Sprintf("%dcandidates", n), func(b *testing.B) {
+				b.ReportAllocs()
+
+				// Place matching tape at ~middle position (fixed for reproducibility).
+				matchIdx := n / 2
+				candidates := generateCandidates(n, matchIdx)
+				matcher := DefaultMatcher()
+				req := httptest.NewRequest("GET", "/api/target", nil)
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					tape, ok := matcher.Match(req, candidates)
+					if !ok {
+						b.Fatal("expected match")
+					}
+					if tape.ID != "target-tape" {
+						b.Fatalf("wrong tape: %s", tape.ID)
+					}
+				}
+			})
+		}
+	})
+
+	b.Run("WithQueryAndBody", func(b *testing.B) {
+		queryCounts := []int{100, 1000}
+		for _, n := range queryCounts {
+			b.Run(fmt.Sprintf("%dcandidates", n), func(b *testing.B) {
+				b.ReportAllocs()
+
+				matchIdx := n / 2
+				candidates := generateCandidates(n, matchIdx)
+				matcher := NewCompositeMatcher(
+					MatchMethod(),
+					MatchPath(),
+					MatchQueryParams(),
+					MatchBodyHash(),
+				)
+
+				body := []byte(`{"action":"find"}`)
+				req := httptest.NewRequest("GET", "/api/target", bytes.NewReader(body))
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					// Reset request body for each iteration since MatchBodyHash reads it.
+					req.Body = io.NopCloser(bytes.NewReader(body))
+					tape, ok := matcher.Match(req, candidates)
+					if !ok {
+						b.Fatal("expected match")
+					}
+					if tape.ID != "target-tape" {
+						b.Fatalf("wrong tape: %s", tape.ID)
+					}
+				}
+			})
+		}
+	})
 }
