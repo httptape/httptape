@@ -3806,3 +3806,232 @@ the result, and verifies the manifest and fixture set.
   large.
 - **Manifest accuracy**: Because filtering happens before `buildManifest`, the
   manifest always accurately reflects the filtered set with no extra logic.
+
+---
+
+### ADR-12: MatchPathRegex — Regex path matching criterion
+
+**Date**: 2026-03-30
+**Issue**: #38
+**Status**: Accepted
+
+#### Context
+
+Exact path matching (`MatchPath`, ADR-4) does not work for parameterized REST
+APIs. A fixture recorded for `/users/123/orders` cannot serve a replay request
+for `/users/456/orders` because the path segments differ. Issue #38 requests a
+regex-based path matching criterion so a single recorded fixture can match
+multiple parameterized URLs.
+
+The existing matcher infrastructure from ADR-4 is designed for exactly this kind
+of extension: add a new `MatchCriterion` function, assign it a score weight, and
+users compose it into a `CompositeMatcher`. No changes to the `Matcher` interface,
+`CompositeMatcher`, or existing criteria are needed.
+
+Key constraints:
+- Stdlib only (L-04). Go's `regexp` package is stdlib.
+- No panics (L-11). Invalid regex must be reported as an error, not a panic.
+- Progressive matching (L-09). Regex is opt-in; `DefaultMatcher` is unchanged.
+- Functional options pattern (L-12). `MatchPathRegex` follows the same pattern
+  as existing criteria constructors.
+
+#### Decision
+
+##### MatchPathRegex constructor
+
+```go
+// MatchPathRegex returns a MatchCriterion that matches the incoming request's
+// URL path against a compiled regular expression, and also verifies that the
+// candidate tape's stored URL path matches the same expression. This ensures
+// that only tapes belonging to the same "path family" as the request are
+// considered matches.
+//
+// The pattern is compiled once at construction time using regexp.Compile.
+// If the pattern is invalid, MatchPathRegex returns a non-nil error and a
+// nil MatchCriterion. Callers must check the error before using the criterion.
+//
+// Returns score 1 on match, 0 on mismatch.
+//
+// Usage: use MatchPathRegex as a replacement for MatchPath when regex matching
+// is desired, not alongside it. If MatchPath is also present in the same
+// CompositeMatcher, candidates that do not exact-match will be eliminated by
+// MatchPath (score 0) regardless of the regex result.
+//
+// Example:
+//
+//	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	matcher := NewCompositeMatcher(MatchMethod(), criterion)
+func MatchPathRegex(pattern string) (MatchCriterion, error)
+```
+
+##### Why return (MatchCriterion, error) instead of panicking
+
+All existing criterion constructors (`MatchMethod`, `MatchPath`, etc.) return
+`MatchCriterion` directly with no error. They cannot fail because they take no
+user-controlled input that could be invalid. `MatchPathRegex` takes a regex
+pattern string that can be syntactically invalid. The project constitution (L-11)
+prohibits panics. Therefore `MatchPathRegex` must return an error.
+
+This is a deliberate break from the constructor signature pattern of other
+criteria. The alternative — accepting a pre-compiled `*regexp.Regexp` — was
+considered but rejected because:
+- It leaks the `regexp` type into the public API for callers who just want to
+  pass a string pattern.
+- It shifts the compilation responsibility to the caller, who might forget to
+  handle the compile error or might compile with `MustCompile` (which panics).
+- The `(MatchCriterion, error)` return is idiomatic Go and clearly communicates
+  that construction can fail.
+
+##### Regex compilation: at construction time, not per call
+
+The regex is compiled once via `regexp.Compile` when `MatchPathRegex` is called.
+The resulting `*regexp.Regexp` is captured in the closure returned as the
+`MatchCriterion`. This means:
+- Invalid patterns fail fast at configuration time, not at request time.
+- No repeated compilation overhead per request or per candidate.
+- The `*regexp.Regexp` is safe for concurrent use (Go's regexp is goroutine-safe
+  after compilation), so the criterion can be shared across goroutines.
+
+##### Matching logic
+
+The criterion performs two checks:
+
+1. **Request path check**: `re.MatchString(req.URL.Path)` — does the incoming
+   request's URL path match the pattern?
+2. **Tape path check**: Parse `candidate.Request.URL` with `url.Parse`, then
+   `re.MatchString(parsed.Path)` — does the tape's stored URL path match the
+   same pattern?
+
+Both must match for the criterion to return a positive score. This dual-match
+design ensures that:
+- A tape recorded for `/users/123/orders` matches a request for
+  `/users/456/orders` when the pattern is `^/users/\d+/orders$` (both paths
+  belong to the same "family").
+- A tape recorded for `/products/42` does NOT match a request for
+  `/users/456/orders` even though the request matches the user-orders pattern
+  (the tape path does not match the pattern, so it is eliminated).
+
+If the tape's URL cannot be parsed, the criterion returns 0 (consistent with
+`MatchPath` and `MatchQueryParams` behavior from ADR-4).
+
+##### Score weight: 1
+
+| Criterion | Score | Rationale |
+|---|---|---|
+| `MatchMethod` | 1 | Low specificity — many tapes share a method. |
+| `MatchPath` | 2 | Exact path — high specificity. |
+| **`MatchPathRegex`** | **1** | **Regex path — lower specificity than exact.** |
+| `MatchRoute` | 1 | Scoping label. |
+| `MatchQueryParams` | 4 | Significantly narrows candidates. |
+| `MatchBodyHash` | 8 | Most specific — uniquely identifies a request body. |
+
+Score 1 is correct because:
+- A regex match is inherently less specific than an exact path match (a regex
+  can match many paths, an exact match matches exactly one).
+- Score 1 ensures that if a user builds two `CompositeMatcher` instances — one
+  with `MatchPath` (score 2) and one with `MatchPathRegex` (score 1) — and uses
+  a fallback strategy, the exact matcher naturally produces higher scores.
+- Score 1 is also appropriate because the regex pattern is user-provided and may
+  be broad (e.g., `.*`) or narrow (e.g., `^/users/\d+$`). A fixed low score
+  avoids overweighting broad patterns.
+
+Note: `MatchPathRegex` is intended as a **replacement** for `MatchPath` in a
+given `CompositeMatcher`, not as an addition alongside it. Using both in the same
+`CompositeMatcher` would cause `MatchPath` to eliminate candidates that don't
+exact-match, defeating the purpose of regex matching. The godoc on
+`MatchPathRegex` documents this usage pattern.
+
+##### Implementation sketch
+
+```go
+func MatchPathRegex(pattern string) (MatchCriterion, error) {
+    re, err := regexp.Compile(pattern)
+    if err != nil {
+        return nil, fmt.Errorf("httptape: invalid path regex %q: %w", pattern, err)
+    }
+    return func(req *http.Request, candidate Tape) int {
+        if !re.MatchString(req.URL.Path) {
+            return 0
+        }
+        parsed, err := url.Parse(candidate.Request.URL)
+        if err != nil {
+            return 0
+        }
+        if !re.MatchString(parsed.Path) {
+            return 0
+        }
+        return 1
+    }, nil
+}
+```
+
+#### File layout
+
+| File | Contents | New/Modified |
+|---|---|---|
+| `matcher.go` | `MatchPathRegex` function | Modified — add function and `regexp` + `fmt` imports |
+| `matcher_test.go` | Table-driven tests for `MatchPathRegex` | Modified — add test functions |
+
+No other files are modified. `DefaultMatcher` is unchanged.
+
+#### Test strategy
+
+**`matcher_test.go`** — all tests are table-driven, following the patterns
+established in ADR-4.
+
+**Individual criterion tests:**
+
+| Test | What it verifies |
+|---|---|
+| `TestMatchPathRegex_Match` | Pattern `^/users/\d+/orders$` matches request `/users/456/orders` against tape with URL `https://api.example.com/users/123/orders`. Returns 1. |
+| `TestMatchPathRegex_RequestNoMatch` | Pattern `^/users/\d+/orders$` does not match request `/products/1`. Returns 0. |
+| `TestMatchPathRegex_TapeNoMatch` | Request path matches pattern but tape path does not (different tape). Returns 0. |
+| `TestMatchPathRegex_UnparsableTapeURL` | Tape URL is garbage. Returns 0. |
+| `TestMatchPathRegex_InvalidPattern` | `MatchPathRegex("[invalid")` returns non-nil error and nil criterion. |
+| `TestMatchPathRegex_BroadPattern` | Pattern `.*` matches everything. Returns 1. |
+| `TestMatchPathRegex_AnchoredPattern` | Pattern without anchors matches partial paths. Pattern with `^` and `$` matches only full paths. |
+
+**Composition tests:**
+
+| Test | What it verifies |
+|---|---|
+| `TestCompositeMatcher_RegexPath` | `NewCompositeMatcher(MatchMethod(), regexCriterion)` selects correct tape from multiple candidates with parameterized paths. |
+| `TestCompositeMatcher_ExactBeatsRegex` | Two separate matchers: one with `MatchPath` (exact), one with `MatchPathRegex`. Exact matcher scores higher (3 vs 2 for method+path vs method+regex). Demonstrates the priority relationship. |
+
+#### Error cases
+
+| Scenario | Behavior |
+|---|---|
+| Invalid regex pattern (e.g., `[invalid`) | `MatchPathRegex` returns `(nil, error)`. Error wraps the `regexp.Compile` error with context. |
+| Valid pattern, request path does not match | Criterion returns 0. Candidate eliminated. |
+| Valid pattern, tape URL cannot be parsed | Criterion returns 0. Candidate eliminated. Other candidates still evaluated. |
+| Valid pattern, request matches but tape does not | Criterion returns 0. Candidate eliminated. |
+| Empty pattern `""` | Compiles successfully (matches any string). Both request and tape paths match. Returns 1. |
+
+#### Consequences
+
+- **No changes to existing code**: `MatchPathRegex` is a new function added to
+  `matcher.go`. No existing functions, types, or interfaces are modified.
+  `DefaultMatcher` is unchanged.
+- **Idiomatic error handling**: The `(MatchCriterion, error)` return type is a
+  deliberate departure from other criterion constructors that cannot fail. This
+  is the correct Go idiom for fallible construction.
+- **Compile-once semantics**: The regex is compiled once and reused for all
+  candidate evaluations. No per-request or per-candidate compilation overhead.
+  The compiled `*regexp.Regexp` is goroutine-safe.
+- **Dual-match design**: Checking both request and tape paths against the pattern
+  ensures tapes are only matched against requests in the same "path family."
+  This prevents a regex like `.*` from matching any tape against any request
+  (both would match, but the tape must also match the pattern).
+- **Score 1 ensures exact > regex**: When comparing `CompositeMatcher` instances,
+  one using `MatchPath` (score 2) and one using `MatchPathRegex` (score 1), the
+  exact matcher naturally wins. This satisfies the acceptance criteria.
+- **Future extension point**: Path parameter extraction (capturing groups for
+  response interpolation) is explicitly out of scope per issue #38. The compiled
+  `*regexp.Regexp` already supports capturing groups, so a future criterion or
+  wrapper could extract matches without changing `MatchPathRegex` itself.
+- **Import addition**: `matcher.go` will need `regexp` and `fmt` added to its
+  import block. Both are stdlib (L-04 compliant).
