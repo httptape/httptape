@@ -1,6 +1,7 @@
 package httptape
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -514,5 +515,95 @@ func TestExactMatcher(t *testing.T) {
 				t.Errorf("Match() status = %d, want %d", tape.Response.StatusCode, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// --- ADR-17: Server edge case tests ---
+
+// TestServer_Replay204NoContent verifies that the server correctly replays
+// a 204 No Content response with empty body.
+func TestServer_Replay204NoContent(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "DELETE", "/resource/1", 204, "", nil)
+
+	srv := NewServer(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("DELETE", "/resource/1", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 204 {
+		t.Errorf("status = %d, want 204", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %d bytes: %q", rec.Body.Len(), rec.Body.String())
+	}
+}
+
+// TestServer_ReplayBinaryBody verifies that binary bodies are replayed correctly.
+func TestServer_ReplayBinaryBody(t *testing.T) {
+	binaryData := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF}
+
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/image.png",
+	}, RecordedResp{
+		StatusCode:   200,
+		Headers:      http.Header{"Content-Type": {"image/png"}},
+		Body:         binaryData,
+		BodyEncoding: BodyEncodingBase64,
+	})
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save tape: %v", err)
+	}
+
+	srv := NewServer(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/image.png", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), binaryData) {
+		t.Error("binary body not replayed correctly")
+	}
+	if rec.Header().Get("Content-Type") != "image/png" {
+		t.Errorf("Content-Type = %q, want image/png", rec.Header().Get("Content-Type"))
+	}
+}
+
+// TestServer_ReplayTruncatedBody verifies that a truncated body is replayed as-is.
+func TestServer_ReplayTruncatedBody(t *testing.T) {
+	truncatedBody := []byte("partial content...")
+
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/large",
+	}, RecordedResp{
+		StatusCode:       200,
+		Headers:          http.Header{"Content-Type": {"text/plain"}},
+		Body:             truncatedBody,
+		Truncated:        true,
+		OriginalBodySize: 100000,
+	})
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save tape: %v", err)
+	}
+
+	srv := NewServer(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/large", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), truncatedBody) {
+		t.Errorf("truncated body not replayed correctly, got %q", rec.Body.String())
 	}
 }
