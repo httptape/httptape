@@ -110,6 +110,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Del("Content-Length")
 	// 6c: write status code.
 	w.WriteHeader(tape.Response.StatusCode)
-	// 6c: write body.
+	// 6d: write body.
 	w.Write(tape.Response.Body) //nolint:errcheck // response write failure is not actionable
 }

@@ -5,8 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -199,9 +197,7 @@ func TestIntegration_RecordReplay_MemoryStore(t *testing.T) {
 // flow using FileStore.
 func TestIntegration_RecordReplay_FileStore(t *testing.T) {
 	// Create a temp directory for the FileStore.
-	dir := filepath.Join(os.TempDir(), "httptape-integration-filestore-"+t.Name())
-	os.RemoveAll(dir)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Start a real upstream server.
 	upstream := httptest.NewServer(upstreamHandler())
@@ -331,12 +327,8 @@ func TestIntegration_RecordReplay_WithSanitization(t *testing.T) {
 }
 
 // TestIntegration_RecordReplay_WithFakeFields tests that deterministic
-// faking via FakeFields produces consistent replayed values.
-//
-// This test uses httptest.NewRecorder for replay instead of a full HTTP
-// client to avoid a known Content-Length mismatch: the Recorder captures
-// the upstream's Content-Length header, but FakeFields changes the body
-// length, causing the Go HTTP client to truncate reads.
+// faking via FakeFields produces consistent replayed values through the
+// full record-replay flow including a real HTTP client.
 func TestIntegration_RecordReplay_WithFakeFields(t *testing.T) {
 	upstream := httptest.NewServer(upstreamHandler())
 	defer upstream.Close()
@@ -390,17 +382,24 @@ func TestIntegration_RecordReplay_WithFakeFields(t *testing.T) {
 		t.Error("stored tape should NOT contain original name Bob")
 	}
 
-	// Replay via httptest.NewRecorder to verify Server writes the faked body.
+	// Replay via a real HTTP client — the Content-Length fix in ServeHTTP
+	// ensures the faked body (different length) is served correctly.
 	srv := NewServer(store)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/users", nil)
-	srv.ServeHTTP(w, req)
+	replayTS := httptest.NewServer(srv)
+	defer replayTS.Close()
 
-	if w.Code != http.StatusOK {
-		t.Errorf("replay status = %d, want %d", w.Code, http.StatusOK)
+	replayResp, err := http.Get(replayTS.URL + "/api/users")
+	if err != nil {
+		t.Fatalf("replay GET /api/users: %v", err)
+	}
+	replayBody, _ := io.ReadAll(replayResp.Body)
+	replayResp.Body.Close()
+
+	if replayResp.StatusCode != http.StatusOK {
+		t.Errorf("replay status = %d, want %d", replayResp.StatusCode, http.StatusOK)
 	}
 
-	replayStr := w.Body.String()
+	replayStr := string(replayBody)
 
 	if strings.Contains(replayStr, "alice@corp.example") {
 		t.Error("replayed response should NOT contain original email alice@corp.example")
@@ -410,7 +409,6 @@ func TestIntegration_RecordReplay_WithFakeFields(t *testing.T) {
 	}
 
 	// Verify determinism: same seed + same input = same output.
-	// Run the same faking again and compare.
 	store2 := NewMemoryStore()
 	rec2 := NewRecorder(store2, WithAsync(false), WithSanitizer(
 		NewPipeline(FakeFields("test-seed", "$.users[*].email", "$.users[*].name")),
@@ -450,9 +448,7 @@ func TestIntegration_BothStores_IdenticalReplay(t *testing.T) {
 	memRec.Close()
 
 	// --- Record with FileStore ---
-	dir := filepath.Join(os.TempDir(), "httptape-integration-both-"+t.Name())
-	os.RemoveAll(dir)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	fileStore, err := NewFileStore(WithDirectory(dir))
 	if err != nil {
@@ -542,9 +538,7 @@ func TestIntegration_BothStores_IdenticalReplay(t *testing.T) {
 // record-sanitize-replay flow using FileStore to verify sanitized data
 // survives JSON serialization round-trips.
 func TestIntegration_RecordReplay_FileStore_Sanitized(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), "httptape-integration-file-sanitized-"+t.Name())
-	os.RemoveAll(dir)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	upstream := httptest.NewServer(upstreamHandler())
 	defer upstream.Close()
