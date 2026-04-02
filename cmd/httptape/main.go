@@ -238,8 +238,9 @@ func runRecord(args []string) error {
 		}
 		if err := recorder.Close(); err != nil {
 			logger.Printf("recorder close error: %v", err)
+		} else {
+			logger.Println("recorder flushed")
 		}
-		logger.Println("recorder flushed")
 	}()
 
 	logger.Printf("record mode: listening on %s, upstream=%s, fixtures=%s", addr, *upstream, *fixtures)
@@ -316,17 +317,28 @@ func runExport(args []string) error {
 	}
 
 	var w io.Writer = os.Stdout
+	var outputFile *os.File
 	if *output != "" {
 		f, err := os.Create(*output)
 		if err != nil {
 			return fmt.Errorf("create output file: %w", err)
 		}
-		defer f.Close()
+		defer func() {
+			// Close error captured below; defer is a safety net.
+			f.Close()
+		}()
+		outputFile = f
 		w = f
 	}
 
 	if _, err := io.Copy(w, reader); err != nil {
 		return fmt.Errorf("write export: %w", err)
+	}
+
+	if outputFile != nil {
+		if err := outputFile.Close(); err != nil {
+			return fmt.Errorf("close output file: %w", err)
+		}
 	}
 
 	return nil
