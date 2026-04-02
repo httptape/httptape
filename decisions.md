@@ -5373,3 +5373,106 @@ this layout. No module path changes are needed.
 - **Future extensibility**: Adding flags (e.g., `--verbose`, `--tls-cert`)
   is straightforward with `flag.FlagSet`. Adding subcommands is a new case
   in the dispatch switch.
+
+### ADR-20: Docker Image
+
+**Date**: 2026-03-30
+**Issue**: #77
+**Status**: Accepted
+**Depends on**: ADR-19 (Standalone CLI)
+
+#### Context
+
+The CLI binary (ADR-19) gives us a standalone executable, but running httptape
+in CI pipelines, docker-compose stacks, and Kubernetes side-cars still requires
+a Go toolchain to build from source. A pre-built Docker image removes that
+requirement entirely: pull, mount fixtures, run.
+
+Design constraints:
+
+1. **Minimal image size** (~10-15 MB) — no shell, no OS, fast pulls in CI.
+2. **Scratch base** — the binary is statically linked (CGO_ENABLED=0), so we
+   need nothing beyond CA certificates for HTTPS upstreams.
+3. **CLI is the interface** — the ENTRYPOINT is the httptape binary; Docker
+   users pass subcommands and flags exactly as they would on the host.
+4. **No new library code** — the Dockerfile and CI workflow are pure
+   infrastructure; the core library and the CLI source remain unchanged.
+
+#### Decision
+
+##### Multi-stage Dockerfile
+
+```
+# Builder: golang:1.26-alpine
+#   - CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w"
+#   - Produces a static ~10 MB binary
+#
+# Final: scratch
+#   - COPY ca-certificates.crt (for HTTPS record mode)
+#   - COPY httptape binary to /usr/local/bin/httptape
+#   - VOLUME ["/fixtures", "/config"]
+#   - EXPOSE 8081
+#   - ENTRYPOINT ["httptape"]
+```
+
+Key choices:
+
+| Choice | Rationale |
+|---|---|
+| `scratch` over `distroless` | Smaller image, no unnecessary files. The binary is fully static and self-contained. |
+| Alpine builder | Smaller download than `golang:1.26`, and `apk` provides `ca-certificates`. |
+| `-trimpath -ldflags="-s -w"` | Strip debug info and paths to minimise binary size. |
+| `/fixtures` and `/config` volumes | Convention matching the CLI flags `--fixtures` and `--config`. Users mount host dirs here. |
+| Port 8081 | Matches the CLI's `--port` default (ADR-19). The issue suggested 8080, but we align with the existing CLI default to avoid confusion. |
+| ENTRYPOINT, no CMD | Users supply the subcommand (`serve`, `record`, `export`, `import`) as `docker run` arguments. |
+
+##### Docker Compose example
+
+Two services, `serve` and `record`, demonstrate the sidecar pattern:
+
+- `serve`: mounts `./fixtures` read-only, exposes 8081.
+- `record`: mounts `./fixtures` read-write (recordings persist), mounts
+  config read-only, requires `--upstream`.
+
+File: `docker-compose.yml` at the repo root (example, not production).
+
+##### GitHub Actions workflow
+
+File: `.github/workflows/docker.yml`
+
+- **Triggers**: push to `main`, tags matching `v*`.
+- **Registry**: `ghcr.io/vibewarden/httptape`.
+- **Tagging strategy**:
+  - Push to `main` -> `latest`
+  - Tag `v1.2.3` -> `1.2.3`, `1.2`
+- **Caching**: GitHub Actions cache (`type=gha`) for layer reuse.
+- Uses `docker/metadata-action` for tag generation, `docker/build-push-action`
+  for building and pushing.
+
+##### Deferred items (not in this ADR)
+
+- **Environment variable overrides** (`HTTPTAPE_PORT`, `HTTPTAPE_FIXTURES`,
+  `HTTPTAPE_CONFIG`): requires CLI code changes. Will be addressed in a
+  follow-up issue if demand materialises. Docker users can pass flags directly.
+- **Health check endpoint** (`/healthz`): requires a library-level change to
+  the server. Deferred to a separate issue. Docker HEALTHCHECK can use
+  `wget`/`curl` once a non-scratch base is considered, or a future `--healthz`
+  flag can be added to the CLI.
+- **Multi-arch builds** (ARM64): out of scope per the issue; can be added
+  later with `docker/setup-qemu-action`.
+- **Major version tags** (`v0`, `v1`): semver `major.minor` tags are
+  sufficient; single-digit major tags can be added if users request them.
+
+#### Consequences
+
+- **Zero Go toolchain required**: CI and docker-compose users pull a ~12 MB
+  image and run immediately.
+- **No library changes**: The Docker image is pure packaging. ADR-19's CLI
+  binary is the only artifact being containerised.
+- **Automated publishing**: Every push to `main` and every semver tag
+  produces a fresh image on GHCR with no manual steps.
+- **Scratch trade-off**: No shell inside the container means `docker exec sh`
+  is impossible. This is acceptable for a single-purpose sidecar; debugging
+  can use ephemeral debug containers or a future `distroless/debug` variant.
+- **Unblocks #78**: The testcontainers module can reference
+  `ghcr.io/vibewarden/httptape` as its container image.

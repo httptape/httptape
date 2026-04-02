@@ -1,0 +1,24 @@
+# Version control
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Test artifacts
+testdata
+*_test.go
+coverage.out
+
+# CI / Docker
+.github
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+*.md
+LICENSE

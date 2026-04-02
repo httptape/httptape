@@ -1,0 +1,34 @@
+# Example docker-compose.yml — httptape as a sidecar.
+#
+# Usage:
+#   docker compose --profile serve up     # replay fixtures
+#   docker compose --profile record up    # record against upstream
+
+services:
+  serve:
+    image: ghcr.io/vibewarden/httptape:latest
+    profiles: [serve]
+    command:
+      - serve
+      - --fixtures=/fixtures
+      - --port=8081
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./fixtures:/fixtures:ro
+      - ./config.json:/config/config.json:ro
+
+  record:
+    image: ghcr.io/vibewarden/httptape:latest
+    profiles: [record]
+    command:
+      - record
+      - --upstream=https://api.example.com
+      - --fixtures=/fixtures
+      - --config=/config/config.json
+      - --port=8081
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./fixtures:/fixtures
+      - ./config.json:/config/config.json:ro
