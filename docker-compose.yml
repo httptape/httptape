@@ -1,12 +1,13 @@
 # Example docker-compose.yml — httptape as a sidecar.
 #
 # Usage:
-#   docker compose up serve        # replay fixtures
-#   docker compose up record       # record against upstream
+#   docker compose --profile serve up     # replay fixtures
+#   docker compose --profile record up    # record against upstream
 
 services:
   serve:
     image: ghcr.io/vibewarden/httptape:latest
+    profiles: [serve]
     command:
       - serve
       - --fixtures=/fixtures
@@ -19,6 +20,7 @@ services:
 
   record:
     image: ghcr.io/vibewarden/httptape:latest
+    profiles: [record]
     command:
       - record
       - --upstream=https://api.example.com

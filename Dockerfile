@@ -6,7 +6,7 @@ FROM golang:1.26-alpine AS builder
 RUN apk add --no-cache ca-certificates
 
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
@@ -29,5 +29,7 @@ COPY --from=builder /usr/local/bin/httptape /usr/local/bin/httptape
 VOLUME ["/fixtures", "/config"]
 
 EXPOSE 8081
+
+USER 65534
 
 ENTRYPOINT ["httptape"]
