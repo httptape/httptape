@@ -105,8 +105,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for key, values := range tape.Response.Headers {
 		w.Header()[key] = append([]string(nil), values...)
 	}
-	// 6b: write status code.
+	// 6b: remove Content-Length — the recorded value may be stale if the body
+	// was modified by sanitization. Let net/http set it from the actual body.
+	w.Header().Del("Content-Length")
+	// 6c: write status code.
 	w.WriteHeader(tape.Response.StatusCode)
-	// 6c: write body.
+	// 6d: write body.
 	w.Write(tape.Response.Body) //nolint:errcheck // response write failure is not actionable
 }
