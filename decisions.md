@@ -4937,3 +4937,196 @@ are unexported and test-only.
 - **MemoryStore used for isolation**: Recorder and Server benchmarks use
   `MemoryStore` to avoid filesystem overhead skewing results. FileStore has its
   own dedicated benchmarks that intentionally include filesystem overhead.
+
+---
+
+### ADR-18: Declarative sanitization config (JSON)
+
+**Date**: 2026-03-30
+**Issue**: #76
+**Status**: Accepted
+
+#### Context
+
+httptape's sanitization pipeline (`Pipeline`, `RedactHeaders`, `RedactBodyPaths`,
+`FakeFields`) is currently configurable only via Go code. The distribution milestone
+(CLI, Docker, testcontainers) requires a way to express sanitization rules without
+writing Go code. A declarative JSON configuration format bridges this gap.
+
+This is the foundational enabler for the distribution milestone:
+- Issue #44 (CLI) depends on this to accept a config file.
+- Issue #77 (Docker image) depends on CLI.
+- Issue #78 (Testcontainers module) depends on Docker.
+
+Key constraints:
+- stdlib only: `encoding/json` -- no external JSON schema or config libraries.
+- Must map 1:1 to the existing Go API (`RedactHeaders`, `RedactBodyPaths`, `FakeFields`).
+- Config types must be exported so users can build configs programmatically.
+- Validation must produce clear, actionable error messages.
+- The config format must be extensible for future sanitization actions.
+
+#### Decision
+
+##### Config format: rules array
+
+The config uses a `rules` array where each rule has an `action` discriminator
+field and action-specific parameters. This is more extensible than a flat
+structure: new actions can be added without changing the top-level schema.
+
+```json
+{
+  "version": "1",
+  "rules": [
+    {"action": "redact_headers", "headers": ["Authorization", "Cookie"]},
+    {"action": "redact_headers"},
+    {"action": "redact_body", "paths": ["$.card.number", "$.ssn"]},
+    {"action": "fake", "seed": "project-seed", "paths": ["$.email", "$.user_id"]}
+  ]
+}
+```
+
+Format rules:
+- `version` is required and must be `"1"`. This allows future schema evolution.
+- `rules` is required and must be a non-empty array.
+- Each rule must have an `action` field with one of the known values.
+- Unknown fields on the top-level config or within rules cause validation errors
+  (using `json.Decoder` with `DisallowUnknownFields`).
+
+##### Action definitions
+
+| Action | Required fields | Optional fields | Maps to |
+|---|---|---|---|
+| `redact_headers` | (none) | `headers` (string array) | `RedactHeaders(headers...)` |
+| `redact_body` | `paths` (non-empty string array) | (none) | `RedactBodyPaths(paths...)` |
+| `fake` | `seed` (non-empty string), `paths` (non-empty string array) | (none) | `FakeFields(seed, paths...)` |
+
+When `redact_headers` has no `headers` field (or an empty array), it maps to
+`RedactHeaders()` which uses `DefaultSensitiveHeaders()`. This matches the Go
+API's zero-argument behavior.
+
+For `redact_body`, `paths` is required and must be non-empty -- unlike
+`redact_headers` which has sensible defaults, there are no default body paths.
+
+For `fake`, both `seed` and `paths` are required. The seed must be non-empty
+(an empty seed produces degenerate HMAC output).
+
+##### Path validation
+
+All paths in `redact_body` and `fake` rules are validated at config load time
+using the existing `parsePath` function. Invalid paths cause a validation error
+with the specific path and reason. This is stricter than the Go API (which
+silently ignores invalid paths) because config files are typically written once
+and should fail loudly on typos.
+
+##### Exported Go types (`config.go`)
+
+```go
+// Config represents a declarative sanitization configuration.
+// It can be loaded from JSON or constructed programmatically.
+type Config struct {
+    Version string `json:"version"`
+    Rules   []Rule `json:"rules"`
+}
+
+// Rule represents a single sanitization rule within a Config.
+// The Action field determines which other fields are relevant.
+type Rule struct {
+    Action  string   `json:"action"`
+    Headers []string `json:"headers,omitempty"`
+    Paths   []string `json:"paths,omitempty"`
+    Seed    string   `json:"seed,omitempty"`
+}
+```
+
+The types are exported so users can build configs programmatically and serialize
+them for use with the CLI or Docker.
+
+##### Loading functions (`config.go`)
+
+```go
+// LoadConfig reads a JSON sanitization config from r, validates it, and
+// returns a Config. It returns an error if the JSON is malformed, contains
+// unknown fields, or fails validation.
+func LoadConfig(r io.Reader) (*Config, error)
+
+// LoadConfigFile is a convenience wrapper that opens the file at path and
+// calls LoadConfig.
+func LoadConfigFile(path string) (*Config, error)
+```
+
+`LoadConfig` performs two-phase processing:
+1. **Parse**: decode JSON with `DisallowUnknownFields`.
+2. **Validate**: check version, action names, required fields, path syntax.
+
+##### Pipeline construction (`config.go`)
+
+```go
+// BuildPipeline converts the Config into a Pipeline by mapping each Rule
+// to the corresponding SanitizeFunc.
+func (c *Config) BuildPipeline() *Pipeline
+```
+
+This method assumes the config has been validated (via `LoadConfig`). It maps
+each rule to a `SanitizeFunc`:
+- `redact_headers` -> `RedactHeaders(rule.Headers...)`
+- `redact_body` -> `RedactBodyPaths(rule.Paths...)`
+- `fake` -> `FakeFields(rule.Seed, rule.Paths...)`
+
+Rules are applied in order, matching the Pipeline's sequential semantics.
+
+##### Validation errors
+
+Validation produces a single error that aggregates all issues found:
+
+```go
+// ValidateConfig checks c for structural and semantic errors. It returns
+// nil if the config is valid, or an error describing all issues found.
+func (c *Config) Validate() error
+```
+
+Error messages are human-readable and include the rule index:
+
+```
+config validation: rule[0]: unknown action "redact"
+config validation: rule[2]: "redact_body" requires non-empty "paths"
+config validation: rule[3]: "fake" path "$.": invalid path syntax
+```
+
+##### JSON Schema (`config.schema.json`)
+
+A JSON Schema file is provided for IDE validation and documentation. It uses
+JSON Schema draft 2020-12 and lives at the repository root. The schema is not
+used by the Go code at runtime -- it is a documentation artifact for editors
+and CI linting.
+
+##### File organization
+
+All config code goes in `config.go` with tests in `config_test.go`. This
+follows the project's single-package layout. The JSON Schema goes in
+`config.schema.json` at the repository root.
+
+The package structure entry in CLAUDE.md should be updated to include:
+```
+config.go            # Declarative JSON config for sanitization pipeline
+config_test.go
+config.schema.json   # JSON Schema for config file validation (IDE/CI use)
+```
+
+#### Consequences
+
+- **CLI enablement**: The CLI (#44) can accept `--config path/to/config.json`
+  and call `LoadConfigFile` + `BuildPipeline` without importing any sanitizer
+  functions directly.
+- **Docker enablement**: The Docker image (#77) can mount a config file and
+  pass it to the CLI.
+- **Programmatic use**: Go users can build `Config` structs in code, serialize
+  them to JSON, and share them across projects.
+- **Strict validation**: Config files fail loudly on errors, unlike the Go API
+  which silently ignores invalid paths. This is intentional -- config files are
+  written by humans and should give immediate feedback.
+- **Version field**: The `"version": "1"` field allows future schema evolution
+  without breaking existing configs.
+- **Extensibility**: New sanitization actions can be added by extending the
+  action discriminator. Existing configs remain valid.
+- **No runtime schema validation**: The JSON Schema file is for editor tooling
+  only. Runtime validation is done in Go code, keeping the stdlib-only constraint.

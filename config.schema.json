@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/VibeWarden/httptape/config.schema.json",
+  "title": "httptape sanitization config",
+  "description": "Declarative configuration for httptape's sanitization pipeline. Maps to the Go API: RedactHeaders, RedactBodyPaths, FakeFields.",
+  "type": "object",
+  "required": ["version", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1",
+      "description": "Config schema version. Must be \"1\"."
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of sanitization rules. Applied sequentially to each recorded tape.",
+      "items": {
+        "type": "object",
+        "required": ["action"],
+        "oneOf": [
+          {
+            "properties": {
+              "action": {
+                "const": "redact_headers"
+              },
+              "headers": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "HTTP header names to redact. If omitted or empty, DefaultSensitiveHeaders are used (Authorization, Cookie, Set-Cookie, X-Api-Key, Proxy-Authorization, X-Forwarded-For)."
+              }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "redact_body"
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^\\$\\..+",
+                  "minLength": 3
+                },
+                "minItems": 1,
+                "description": "JSONPath-like paths to redact in request/response bodies. Syntax: $.field, $.nested.field, $.array[*].field"
+              }
+            },
+            "required": ["action", "paths"],
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "fake"
+              },
+              "seed": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Project-level seed for HMAC-SHA256 deterministic faking. Same seed + same input = same fake output."
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^\\$\\..+",
+                  "minLength": 3
+                },
+                "minItems": 1,
+                "description": "JSONPath-like paths to fake in request/response bodies."
+              }
+            },
+            "required": ["action", "seed", "paths"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  }
+}

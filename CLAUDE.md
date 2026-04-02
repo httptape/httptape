@@ -64,6 +64,9 @@ httptape/
   store_file_test.go
   store_memory.go      # In-memory storage adapter (for tests)
   store_memory_test.go
+  config.go            # Declarative JSON config for sanitization pipeline
+  config_test.go
+  config.schema.json   # JSON Schema for config file validation (IDE/CI use)
   bundle.go            # Import/export (tar.gz)
   bundle_test.go
   integration_test.go  # End-to-end integration tests
