@@ -5130,3 +5130,246 @@ config.schema.json   # JSON Schema for config file validation (IDE/CI use)
   action discriminator. Existing configs remain valid.
 - **No runtime schema validation**: The JSON Schema file is for editor tooling
   only. Runtime validation is done in Go code, keeping the stdlib-only constraint.
+
+### ADR-19: Standalone CLI
+
+**Date**: 2026-03-30
+**Issue**: #44
+**Status**: Accepted
+**Depends on**: ADR-18 (Declarative sanitization config)
+
+#### Context
+
+httptape is currently usable only as an embedded Go library. The distribution
+milestone requires a standalone CLI binary so that non-Go users (and CI
+pipelines, Docker images, testcontainers) can record, replay, and manage
+HTTP fixtures without writing Go code.
+
+The CLI must be a thin wrapper over the existing library API -- no business
+logic in `cmd/`. It must use stdlib only (`flag` package) to honour the
+project's zero-dependency constraint. The core library package must remain
+unchanged; all new code lives in `cmd/httptape/`.
+
+#### Decision
+
+##### Command structure
+
+The binary exposes four subcommands via positional argument dispatching
+(no third-party CLI frameworks):
+
+```
+httptape <command> [flags]
+
+Commands:
+  serve    Replay mode — serve recorded fixtures as a mock HTTP server
+  record   Proxy mode — forward requests to upstream, record + sanitize responses
+  export   Export fixtures to a tar.gz bundle
+  import   Import fixtures from a tar.gz bundle
+```
+
+Running `httptape` with no arguments or with `-h`/`--help` prints the usage
+summary and exits with code 0.
+
+##### `httptape serve`
+
+Starts an HTTP server that replays recorded fixtures.
+
+| Flag | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `--fixtures` | string | yes | — | Path to fixture directory |
+| `--config` | string | no | — | Path to sanitization config JSON (accepted for API uniformity; not used by serve) |
+| `--port` | int | no | 8081 | Listen port |
+| `--fallback-status` | int | no | 404 | HTTP status when no tape matches |
+
+Implementation:
+1. Create `FileStore` with `WithDirectory(fixtures)`.
+2. Create `Server` with `WithFallbackStatus(fallbackStatus)`.
+3. Bind `http.Server{Addr: ":port", Handler: server}`.
+4. Start listening; log the address to stderr.
+5. Wait for SIGINT/SIGTERM, then call `http.Server.Shutdown` with a 5-second
+   timeout for graceful drain.
+
+The `--config` flag is accepted but ignored in serve mode. This keeps the
+flag set uniform across serve/record, which simplifies Docker entrypoints
+and documentation. A future enhancement could use the config to validate
+that fixtures match expected sanitization rules.
+
+##### `httptape record`
+
+Starts a reverse proxy that forwards requests to an upstream server, records
+interactions through `httptape.Recorder`, and applies sanitization.
+
+| Flag | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `--upstream` | string | yes | — | Upstream URL (scheme + host, e.g. `https://api.example.com`) |
+| `--fixtures` | string | yes | — | Path to fixture directory (recordings saved here) |
+| `--config` | string | no | — | Path to sanitization config JSON |
+| `--port` | int | no | 8081 | Listen port |
+
+Implementation:
+1. Parse and validate `--upstream` as a URL (`url.Parse`; must have scheme and host).
+2. Create `FileStore` with `WithDirectory(fixtures)`.
+3. If `--config` is provided, call `httptape.LoadConfigFile` then `BuildPipeline`.
+4. Create `Recorder` with `WithSanitizer(pipeline)` and `WithAsync(true)`.
+5. Create `net/http/httputil.ReverseProxy` with:
+   - `Rewrite` function that sets the target scheme, host, and path from the
+     upstream URL.
+   - `Transport` set to the `Recorder` (which implements `http.RoundTripper`).
+6. Bind `http.Server{Addr: ":port", Handler: proxy}`.
+7. Start listening; log the upstream and local address to stderr.
+8. On SIGINT/SIGTERM: call `http.Server.Shutdown` (5s timeout), then
+   `recorder.Close()` to flush pending async recordings.
+
+The reverse proxy approach means the CLI acts as a transparent forward proxy:
+clients point at `localhost:8081` instead of the real upstream. The Recorder
+wraps the transport, so every round-trip is captured and sanitized before
+hitting the FileStore.
+
+##### `httptape export`
+
+Exports fixtures from a directory to a tar.gz bundle.
+
+| Flag | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `--fixtures` | string | yes | — | Path to fixture directory |
+| `--output` | string | no | — (stdout) | Output file path; omit for stdout |
+| `--routes` | string | no | — | Comma-separated route filter |
+| `--methods` | string | no | — | Comma-separated HTTP method filter |
+| `--since` | string | no | — | RFC 3339 timestamp filter |
+
+Implementation:
+1. Create `FileStore` with `WithDirectory(fixtures)`.
+2. Build `[]ExportOption` from flags (`WithRoutes`, `WithMethods`, `WithSince`).
+3. Call `ExportBundle(ctx, store, opts...)`.
+4. Copy the returned `io.Reader` to the output (file or stdout).
+5. Exit 0 on success.
+
+When `--output` is omitted, the tar.gz stream is written to stdout, enabling
+piping (`httptape export --fixtures ./dir | ssh remote tar xzf -`).
+
+##### `httptape import`
+
+Imports fixtures from a tar.gz bundle into a directory.
+
+| Flag | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `--fixtures` | string | yes | — | Path to fixture directory |
+| `--input` | string | no | — (stdin) | Input file path; omit for stdin |
+
+Implementation:
+1. Create `FileStore` with `WithDirectory(fixtures)`.
+2. Open the input (file or stdin).
+3. Call `ImportBundle(ctx, store, reader)`.
+4. Exit 0 on success.
+
+When `--input` is omitted, the bundle is read from stdin, enabling piping.
+
+##### File layout
+
+```
+cmd/
+  httptape/
+    main.go     # Entry point, subcommand dispatch, signal handling
+```
+
+All CLI code lives in a single `main.go` file. The file contains:
+- `main()`: subcommand dispatch, top-level error handling, exit codes.
+- `runServe(args []string) error`: parse flags, wire up serve mode.
+- `runRecord(args []string) error`: parse flags, wire up record mode.
+- `runExport(args []string) error`: parse flags, wire up export mode.
+- `runImport(args []string) error`: parse flags, wire up import mode.
+- `awaitShutdown() <-chan os.Signal`: helper for SIGINT/SIGTERM.
+
+A single file is appropriate because the CLI is a thin wrapper with no
+business logic. If it grows beyond ~500 lines, it can be split into
+per-command files within the same `main` package.
+
+##### CLI parsing: stdlib `flag` package
+
+Each subcommand creates its own `flag.FlagSet` with `flag.ContinueOnError`
+(so we can return errors instead of calling `os.Exit` from within flag
+parsing). Subcommand dispatch is a `switch` on `os.Args[1]`.
+
+No third-party CLI frameworks (cobra, urfave/cli, kong). The `flag` package
+is sufficient for four subcommands with flat flag sets.
+
+##### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Usage error (bad flags, missing required flags, unknown subcommand) |
+| 2 | Runtime error (store failure, upstream unreachable, config invalid) |
+
+`main()` calls `os.Exit` exactly once, at the end, based on the error
+returned by the subcommand runner. This ensures deferred functions run.
+
+##### Graceful shutdown
+
+The serve and record commands install a signal handler for SIGINT and
+SIGTERM using `signal.NotifyContext`. On signal:
+
+1. `http.Server.Shutdown(ctx)` is called with a 5-second deadline. This
+   stops accepting new connections and waits for in-flight requests.
+2. For record mode, `recorder.Close()` is called after server shutdown to
+   flush any buffered tapes.
+3. If the shutdown deadline expires, `http.Server.Close()` is called for
+   immediate termination.
+
+##### Logging
+
+All diagnostic output goes to stderr via `log.New(os.Stderr, "httptape: ", 0)`.
+No structured logging library — plain text with a prefix. This keeps the
+binary small and avoids dependencies. Logged events:
+
+- Server start: address and mode (serve/record).
+- Record mode: upstream URL.
+- Shutdown initiated.
+- Shutdown complete (with flush count for record mode).
+- Errors: config load failures, upstream validation, store errors.
+
+Request-level logging is intentionally omitted in v1 to avoid noise. A
+future `--verbose` flag could enable per-request logging.
+
+##### Relationship to core library
+
+The CLI imports `httptape` as a regular Go module dependency. It calls only
+exported API:
+- `NewFileStore`, `WithDirectory`
+- `NewServer`, `WithFallbackStatus`
+- `NewRecorder`, `WithSanitizer`, `WithAsync`, `WithOnError`
+- `LoadConfigFile`, `(*Config).BuildPipeline`
+- `ExportBundle`, `ImportBundle`, `WithRoutes`, `WithMethods`, `WithSince`
+
+No changes to the core library are required. The `cmd/httptape/` package
+has zero coupling to unexported internals.
+
+##### Build and installation
+
+```bash
+go build -o httptape ./cmd/httptape
+go install github.com/VibeWarden/httptape/cmd/httptape@latest
+```
+
+The `go.mod` module path (`github.com/VibeWarden/httptape`) already supports
+this layout. No module path changes are needed.
+
+#### Consequences
+
+- **Distribution unblocked**: The CLI binary enables Docker images (#77) and
+  testcontainers (#78) without requiring users to write Go code.
+- **Zero library changes**: The core package is untouched. The CLI is a pure
+  consumer of the public API, validating that the API is sufficient for
+  real-world use.
+- **Stdlib only**: No new dependencies. The `flag`, `net/http`,
+  `net/http/httputil`, `os/signal`, and `log` packages provide everything
+  needed.
+- **Simple mental model**: Four subcommands mapping 1:1 to the library's
+  four capabilities (replay, record, export, import).
+- **Pipe-friendly**: Export writes to stdout by default; import reads from
+  stdin by default. This enables Unix-style composition.
+- **Graceful shutdown**: In-flight requests complete and async recordings
+  flush before exit, preventing data loss.
+- **Future extensibility**: Adding flags (e.g., `--verbose`, `--tls-cert`)
+  is straightforward with `flag.FlagSet`. Adding subcommands is a new case
+  in the dispatch switch.
