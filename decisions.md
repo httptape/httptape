@@ -5630,3 +5630,114 @@ tree is unaffected, and users `go get` only what they need.
 - **Maintenance surface**: a new `go.mod` means a separate dependency
   update cadence. Dependabot or Renovate should be configured to cover
   `testcontainers/go.mod`.
+
+---
+
+### ADR-22: LoadFixtures convenience functions
+
+**Date**: 2026-03-30
+**Issue**: #91
+**Status**: Accepted
+
+#### Context
+
+Loading fixture files for test mocking currently requires multiple steps:
+creating a `FileStore` or `MemoryStore`, configuring it, and then the store
+is ready. For the most common use case — loading pre-existing fixture JSON
+files from a directory for replay — this boilerplate is repeated in every
+test file. The issue requests a one-liner convenience API.
+
+Two variants are needed:
+
+1. **Filesystem directory**: for tests that read fixtures from `testdata/`
+   at runtime. Returns a `*FileStore` pointing at the given directory.
+2. **`fs.FS` (embed.FS)**: for self-contained test binaries that embed
+   fixtures at compile time. Reads JSON files into a `*MemoryStore` since
+   `embed.FS` is read-only and `FileStore` requires a writable directory.
+
+Both functions must recursively walk the directory, decode every `.json`
+file as a `Tape`, and return a populated store ready for use with
+`NewServer`.
+
+#### Decision
+
+Add two exported convenience functions in a new file `fixtures.go`:
+
+```go
+// LoadFixtures creates a FileStore rooted at the given filesystem directory.
+// It validates that the directory exists and contains at least parseable JSON
+// tape files by performing a read-only scan. The returned FileStore points at
+// dir and is immediately usable with NewServer.
+//
+// All .json files in dir (non-recursive, matching FileStore's flat-directory
+// model) are validated as Tape JSON. Files that fail to parse cause an error
+// that includes the filename.
+func LoadFixtures(dir string) (*FileStore, error)
+
+// LoadFixturesFS reads all .json Tape files from the given fs.FS directory
+// (recursive walk) and returns a MemoryStore populated with the decoded tapes.
+// This is designed for use with embed.FS for self-contained test binaries.
+//
+// Files that fail to decode as a Tape cause an error that includes the
+// filename. The returned MemoryStore is immediately usable with NewServer.
+func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
+```
+
+##### Design choices
+
+1. **Return concrete types, not `Store` interface**: `LoadFixtures` returns
+   `*FileStore` and `LoadFixturesFS` returns `*MemoryStore`. This follows
+   Go best practice of returning concrete types and accepting interfaces.
+   Callers who need `Store` can assign to a `Store` variable since both
+   types implement the interface.
+
+2. **`LoadFixtures` delegates to `NewFileStore`**: rather than duplicating
+   directory creation logic, `LoadFixtures` calls `NewFileStore` with
+   `WithDirectory(dir)` and then performs a validation scan. This keeps
+   `FileStore` as the single source of truth for filesystem operations.
+
+3. **`LoadFixturesFS` walks recursively**: since `fs.FS` is read-only and
+   there is no concern about accidentally writing to nested directories,
+   recursive walking is safe and useful for organizing fixtures in
+   subdirectories (e.g., by route or service).
+
+4. **`LoadFixtures` scans flat (non-recursive)**: this matches the existing
+   `FileStore.List` behavior which reads only the base directory. Introducing
+   recursive filesystem walking would be inconsistent with how `FileStore`
+   operates.
+
+5. **Validation on load**: both functions validate that every `.json` file
+   in scope is a valid `Tape`. This fails fast with a clear error including
+   the filename, rather than silently loading invalid data that would cause
+   confusing failures later during replay.
+
+6. **New file `fixtures.go`**: these are convenience wrappers that
+   orchestrate existing types (`FileStore`, `MemoryStore`). They don't
+   belong in `store_file.go` or `store_memory.go` because they span both.
+   A dedicated file keeps responsibilities clean.
+
+7. **No functional options**: these are convenience functions — the whole
+   point is minimal ceremony. Advanced users who need options can use
+   `NewFileStore` / `NewMemoryStore` directly.
+
+8. **Empty directory is not an error**: an empty directory produces an
+   empty store. This is a valid use case (e.g., a fresh test setup).
+
+##### File placement
+
+- `fixtures.go` — implementation
+- `fixtures_test.go` — table-driven tests covering: happy path, empty
+  directory, invalid JSON, nested directories (for `LoadFixturesFS`),
+  non-existent directory, `embed.FS`
+
+#### Consequences
+
+- **Reduced boilerplate**: the most common test setup is now a one-liner.
+- **No breaking changes**: these are purely additive new exports.
+- **stdlib only**: `fs.FS` and `io/fs` are stdlib. No new dependencies.
+- **Discoverability**: users searching for "fixtures" or "load" in godoc
+  will find these functions immediately.
+- **FileStore flat-directory limitation**: `LoadFixtures` does not support
+  nested directories, matching `FileStore`'s existing behavior. Users who
+  need recursive loading from the real filesystem can use
+  `LoadFixturesFS(os.DirFS(dir), ".")` as a workaround.
