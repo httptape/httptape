@@ -114,6 +114,9 @@ func runServe(args []string) error {
 	port := fs.Int("port", 8081, "Listen port")
 	fallbackStatus := fs.Int("fallback-status", 404, "HTTP status when no tape matches")
 	_ = fs.String("config", "", "Path to sanitization config JSON (accepted but not used by serve)")
+	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
+	delay := fs.Duration("delay", 0, "Fixed delay before every response (e.g., 200ms, 1s)")
+	errorRate := fs.Float64("error-rate", 0, "Fraction of requests that return 500 (0.0-1.0)")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -129,7 +132,19 @@ func runServe(args []string) error {
 		return fmt.Errorf("create store: %w", err)
 	}
 
-	server := httptape.NewServer(store, httptape.WithFallbackStatus(*fallbackStatus))
+	var serverOpts []httptape.ServerOption
+	serverOpts = append(serverOpts, httptape.WithFallbackStatus(*fallbackStatus))
+	if *cors {
+		serverOpts = append(serverOpts, httptape.WithCORS())
+	}
+	if *delay > 0 {
+		serverOpts = append(serverOpts, httptape.WithDelay(*delay))
+	}
+	if *errorRate > 0 {
+		serverOpts = append(serverOpts, httptape.WithErrorRate(*errorRate))
+	}
+
+	server := httptape.NewServer(store, serverOpts...)
 
 	addr := fmt.Sprintf(":%d", *port)
 	httpServer := &http.Server{
@@ -166,6 +181,7 @@ func runRecord(args []string) error {
 	fixtures := fs.String("fixtures", "", "Path to fixture directory (required)")
 	configPath := fs.String("config", "", "Path to sanitization config JSON")
 	port := fs.Int("port", 8081, "Listen port")
+	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -218,10 +234,25 @@ func runRecord(args []string) error {
 		Transport: recorder,
 	}
 
+	var handler http.Handler = proxy
+	if *cors {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			proxy.ServeHTTP(w, r)
+		})
+	}
+
 	addr := fmt.Sprintf(":%d", *port)
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: proxy,
+		Handler: handler,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

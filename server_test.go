@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // storeTape creates and saves a minimal tape to the store, returning the saved tape.
@@ -605,5 +606,484 @@ func TestServer_ReplayTruncatedBody(t *testing.T) {
 	}
 	if !bytes.Equal(rec.Body.Bytes(), truncatedBody) {
 		t.Errorf("truncated body not replayed correctly, got %q", rec.Body.String())
+	}
+}
+
+// --- ADR-24: CORS support tests ---
+
+func TestServer_CORS_HeadersPresent(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store, WithCORS())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+
+	tests := []struct {
+		header string
+		want   string
+	}{
+		{"Access-Control-Allow-Origin", "*"},
+		{"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD"},
+		{"Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept"},
+		{"Access-Control-Max-Age", "86400"},
+	}
+	for _, tt := range tests {
+		if got := rec.Header().Get(tt.header); got != tt.want {
+			t.Errorf("%s = %q, want %q", tt.header, got, tt.want)
+		}
+	}
+}
+
+func TestServer_CORS_Disabled_NoHeaders(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store) // no WithCORS
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin should be absent, got %q", got)
+	}
+}
+
+func TestServer_CORS_OptionsPreflight(t *testing.T) {
+	store := NewMemoryStore()
+	srv := NewServer(store, WithCORS())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("OPTIONS", "/api/data", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty for OPTIONS, got %d bytes", rec.Body.Len())
+	}
+}
+
+func TestServer_CORS_OptionsWithoutCORS(t *testing.T) {
+	store := NewMemoryStore()
+	srv := NewServer(store) // no WithCORS
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("OPTIONS", "/api/data", nil)
+
+	srv.ServeHTTP(rec, req)
+
+	// Without CORS enabled, OPTIONS is treated as a normal request (no match -> 404).
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestServer_CORS_WithVariousMethods(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "POST", "/api/data", 201, "created", nil)
+	storeTape(t, store, "DELETE", "/api/data", 204, "", nil)
+
+	srv := NewServer(store, WithCORS())
+
+	methods := []struct {
+		method string
+		want   int
+	}{
+		{"POST", 201},
+		{"DELETE", 204},
+	}
+	for _, tt := range methods {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(tt.method, "/api/data", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != tt.want {
+			t.Errorf("%s status = %d, want %d", tt.method, rec.Code, tt.want)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("%s CORS header missing", tt.method)
+		}
+	}
+}
+
+// --- ADR-24: Latency simulation tests ---
+
+func TestServer_Delay_GlobalDelay(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store, WithDelay(50*time.Millisecond))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+
+	start := time.Now()
+	srv.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 40ms", elapsed)
+	}
+}
+
+func TestServer_Delay_ZeroDelay(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store, WithDelay(0))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+
+	start := time.Now()
+	srv.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	// Should be near-instant.
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("zero delay took %v, expected near-instant", elapsed)
+	}
+}
+
+func TestServer_Delay_PerFixtureOverride(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/slow",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte("slow response"),
+	})
+	tape.Metadata = map[string]any{"delay": "50ms"}
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := NewServer(store, WithDelay(1*time.Millisecond)) // global is 1ms
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/slow", nil)
+
+	start := time.Now()
+	srv.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	// Per-fixture delay of 50ms should override the 1ms global.
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("per-fixture delay elapsed = %v, want >= 40ms", elapsed)
+	}
+}
+
+func TestServer_Delay_ContextCancellation(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store, WithDelay(5*time.Second)) // very long delay
+
+	rec := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", "/api/data", nil).WithContext(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Cancel after a short time.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// Good, returned quickly.
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeHTTP did not return after context cancellation")
+	}
+}
+
+func TestServer_Delay_NoDelayOnNoMatch(t *testing.T) {
+	store := NewMemoryStore() // empty store, no tapes
+
+	srv := NewServer(store, WithDelay(5*time.Second))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/nonexistent", nil)
+
+	start := time.Now()
+	srv.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	// No-match should not be delayed.
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("no-match took %v, expected near-instant", elapsed)
+	}
+}
+
+// --- ADR-24: Error simulation tests ---
+
+func TestServer_ErrorRate_Zero_NoErrors(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	// randFloat always returns 0.5, but errorRate is 0 so it should never trigger.
+	srv := NewServer(store, withRandFloat(func() float64 { return 0.5 }))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestServer_ErrorRate_One_AllErrors(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	// randFloat returns 0.5, errorRate is 1.0 so all requests fail.
+	srv := NewServer(store,
+		WithErrorRate(1.0),
+		withRandFloat(func() float64 { return 0.5 }),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if got := rec.Header().Get("X-Httptape-Error"); got != "simulated" {
+		t.Errorf("X-Httptape-Error = %q, want %q", got, "simulated")
+	}
+	if !strings.Contains(rec.Body.String(), "simulated error") {
+		t.Errorf("body = %q, want it to contain 'simulated error'", rec.Body.String())
+	}
+}
+
+func TestServer_ErrorRate_Deterministic(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	// Error rate 0.5: randFloat < 0.5 -> error, randFloat >= 0.5 -> success.
+	callCount := 0
+	srv := NewServer(store,
+		WithErrorRate(0.5),
+		withRandFloat(func() float64 {
+			callCount++
+			if callCount%2 == 1 {
+				return 0.1 // below rate -> error
+			}
+			return 0.9 // above rate -> success
+		}),
+	)
+
+	// First request: error.
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusInternalServerError {
+		t.Errorf("req1 status = %d, want 500", rec1.Code)
+	}
+
+	// Second request: success.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Errorf("req2 status = %d, want 200", rec2.Code)
+	}
+}
+
+func TestServer_ErrorRate_WithCORS(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/api/data", 200, "ok", nil)
+
+	srv := NewServer(store,
+		WithCORS(),
+		WithErrorRate(1.0),
+		withRandFloat(func() float64 { return 0.0 }),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	// Even on error, CORS headers must be present.
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("CORS header missing on error response: %q", got)
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestServer_ErrorRate_InvalidPanics(t *testing.T) {
+	tests := []struct {
+		name string
+		rate float64
+	}{
+		{"negative", -0.1},
+		{"above one", 1.1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("expected panic, got none")
+				}
+				msg, ok := r.(string)
+				if !ok {
+					t.Fatalf("expected string panic, got %T", r)
+				}
+				if !strings.Contains(msg, "between 0.0 and 1.0") {
+					t.Errorf("panic message = %q, want it to contain 'between 0.0 and 1.0'", msg)
+				}
+			}()
+			WithErrorRate(tt.rate)(&Server{})
+		})
+	}
+}
+
+func TestServer_PerFixtureError(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/broken",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte("should not see this"),
+	})
+	tape.Metadata = map[string]any{
+		"error": map[string]any{
+			"status": float64(503),
+			"body":   "service unavailable",
+		},
+	}
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := NewServer(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/broken", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 503 {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service unavailable") {
+		t.Errorf("body = %q, want it to contain 'service unavailable'", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Httptape-Error"); got != "simulated" {
+		t.Errorf("X-Httptape-Error = %q, want %q", got, "simulated")
+	}
+}
+
+func TestServer_PerFixtureError_DefaultStatus(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/err",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte("normal"),
+	})
+	// error with no status field -> default 500
+	tape.Metadata = map[string]any{
+		"error": map[string]any{},
+	}
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := NewServer(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/err", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestServer_PerFixtureError_WithCORS(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/broken",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte("ok"),
+	})
+	tape.Metadata = map[string]any{
+		"error": map[string]any{
+			"status": float64(429),
+			"body":   "rate limited",
+		},
+	}
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	srv := NewServer(store, WithCORS())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/broken", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 429 {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("CORS header missing on per-fixture error: %q", got)
+	}
+}
+
+// --- ADR-24: Metadata field on Tape ---
+
+func TestTape_MetadataOmitEmpty(t *testing.T) {
+	tape := NewTape("route", RecordedReq{Method: "GET", URL: "/test"}, RecordedResp{StatusCode: 200})
+	if tape.Metadata != nil {
+		t.Errorf("new tape Metadata should be nil, got %v", tape.Metadata)
+	}
+}
+
+func TestTape_MetadataRoundTrip(t *testing.T) {
+	tape := NewTape("route", RecordedReq{Method: "GET", URL: "/test"}, RecordedResp{StatusCode: 200})
+	tape.Metadata = map[string]any{
+		"delay": "500ms",
+		"error": map[string]any{"status": float64(503)},
+	}
+
+	if tape.Metadata["delay"] != "500ms" {
+		t.Errorf("delay = %v, want 500ms", tape.Metadata["delay"])
 	}
 }

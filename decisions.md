@@ -5904,3 +5904,548 @@ func Binary(b []byte) Body  // no auto content type
 - **Limited matching**: stubs only support method + path matching. This is
   intentional — the DSL optimizes for the 80% case. Advanced users compose
   Tape + CompositeMatcher directly.
+
+
+### ADR-24: CORS support, latency simulation, and error simulation
+
+**Date**: 2026-03-30
+**Issues**: #94, #95, #96
+**Status**: Accepted
+
+#### Context
+
+Milestone 8 (UI-First Dev) focuses on making httptape a first-class mock
+backend for frontend development. Three related features are needed:
+
+1. **CORS support (#94)**: Browsers block cross-origin requests from the
+   frontend dev server (e.g., `localhost:3000`) to the httptape mock
+   (e.g., `localhost:3001`). Without CORS headers, httptape is unusable
+   for frontend development.
+
+2. **Latency simulation (#95)**: Real APIs have latency, but mock servers
+   respond instantly. Frontend developers cannot test loading states,
+   spinners, or timeout handling without simulated delay.
+
+3. **Error simulation (#96)**: Real APIs fail. Without error simulation,
+   error handling code paths (retry logic, error toasts, fallback UI)
+   go untested during development.
+
+All three features modify Server behavior, are opt-in via ServerOption
+functions, and need corresponding CLI flags. They are designed together
+to ensure consistent architecture and avoid conflicting middleware
+ordering.
+
+#### Decision
+
+Add three new ServerOption functions and corresponding CLI flags. All
+implementation goes in `server.go` with tests in `server_test.go`. CLI
+changes go in `cmd/httptape/main.go`.
+
+##### Middleware execution order
+
+When multiple features are enabled, they execute in this order within
+`ServeHTTP`:
+
+1. **CORS** (first) -- add CORS headers and handle OPTIONS preflight
+2. **Error simulation** (second) -- short-circuit with 500 before any work
+3. **Delay** (third) -- sleep before writing the real response
+4. **Normal replay** (last) -- existing match-and-respond logic
+
+This order is intentional:
+- CORS headers must be present even on error responses (browsers need them)
+- Error simulation should skip the delay (a simulated 500 returns fast)
+- Delay applies only to successful replay responses
+
+##### Feature 1: CORS support (#94)
+
+**New Server fields:**
+
+```go
+type Server struct {
+    // ... existing fields ...
+    cors bool // if true, add CORS headers to all responses
+}
+```
+
+**New ServerOption:**
+
+```go
+// WithCORS enables CORS headers on all responses. When enabled, the
+// server adds permissive CORS headers (Access-Control-Allow-Origin: *)
+// and handles OPTIONS preflight requests automatically with 204 No Content.
+//
+// This is intended for local development where the frontend dev server
+// (e.g., localhost:3000) calls the mock backend (e.g., localhost:3001).
+// It is opt-in only.
+func WithCORS() ServerOption {
+    return func(s *Server) { s.cors = true }
+}
+```
+
+**ServeHTTP changes:**
+
+At the top of `ServeHTTP`, before any other logic:
+
+```go
+// CORS: add headers to every response if enabled.
+if s.cors {
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+    w.Header().Set("Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+    w.Header().Set("Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-Requested-With, Accept")
+    w.Header().Set("Access-Control-Max-Age", "86400")
+
+    // Handle OPTIONS preflight: return 204 with CORS headers, no body.
+    if r.Method == http.MethodOptions {
+        w.WriteHeader(http.StatusNoContent)
+        return
+    }
+}
+```
+
+**CLI flag:**
+
+```go
+// In runServe:
+cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
+
+// When building ServerOptions:
+if *cors {
+    serverOpts = append(serverOpts, httptape.WithCORS())
+}
+```
+
+The `--cors` flag is also added to `runRecord` since the recording proxy
+may also serve a frontend during development.
+
+##### Feature 2: Latency simulation (#95)
+
+**New Server fields:**
+
+```go
+type Server struct {
+    // ... existing fields ...
+    delay time.Duration // fixed delay before every response; zero means no delay
+}
+```
+
+**New ServerOption:**
+
+```go
+// WithDelay adds a fixed delay before every response. The delay is
+// applied after matching but before writing the response. If the
+// request context is cancelled during the delay (e.g., client
+// disconnects), ServeHTTP returns immediately without writing.
+//
+// A zero or negative duration is a no-op.
+func WithDelay(d time.Duration) ServerOption {
+    return func(s *Server) { s.delay = d }
+}
+```
+
+**ServeHTTP changes:**
+
+After matching a tape, before writing the response:
+
+```go
+// Delay: sleep before writing the response if configured.
+if s.delay > 0 {
+    timer := time.NewTimer(s.delay)
+    defer timer.Stop()
+    select {
+    case <-timer.C:
+        // delay elapsed, proceed to write response
+    case <-r.Context().Done():
+        // client disconnected during delay, bail out
+        return
+    }
+}
+```
+
+The delay is applied only to successful matches. Fallback (no-match)
+responses are not delayed -- there is no point in delaying an error
+response for a missing fixture.
+
+**Per-fixture delay** (from issue #95 acceptance criteria): The Tape
+`Metadata` map (type `map[string]any`, already present in the Tape
+struct's JSON representation) can carry a `"delay"` key with a Go
+duration string value. When present, it overrides the global delay for
+that specific fixture.
+
+```go
+// After matching, check per-fixture delay override.
+effectiveDelay := s.delay
+if tape.Metadata != nil {
+    if raw, ok := tape.Metadata["delay"]; ok {
+        if ds, ok := raw.(string); ok {
+            if parsed, err := time.ParseDuration(ds); err == nil {
+                effectiveDelay = parsed
+            }
+        }
+    }
+}
+```
+
+**CLI flag:**
+
+```go
+// In runServe:
+delay := fs.Duration("delay", 0, "Fixed delay before every response (e.g., 200ms, 1s)")
+
+// When building ServerOptions:
+if *delay > 0 {
+    serverOpts = append(serverOpts, httptape.WithDelay(*delay))
+}
+```
+
+Note: `flag.Duration` parses Go duration strings natively -- no custom
+parsing needed.
+
+##### Feature 3: Error simulation (#96)
+
+**New Server fields:**
+
+```go
+type Server struct {
+    // ... existing fields ...
+    errorRate float64              // fraction of requests that return 500 (0.0-1.0)
+    randFloat func() float64      // random number generator (injectable for testing)
+}
+```
+
+**New ServerOptions:**
+
+```go
+// WithErrorRate causes a fraction of requests to return 500 Internal
+// Server Error with an "X-Httptape-Error: simulated" header instead of
+// the recorded response. The rate must be between 0.0 and 1.0 inclusive.
+//
+// A rate of 0.0 disables error simulation (default). A rate of 1.0
+// causes all requests to fail.
+//
+// Panics if rate is outside [0.0, 1.0]. This is a programming error,
+// following the constructor-guard convention (see L-11).
+func WithErrorRate(rate float64) ServerOption {
+    return func(s *Server) {
+        if rate < 0 || rate > 1 {
+            panic("httptape: WithErrorRate rate must be between 0.0 and 1.0")
+        }
+        s.errorRate = rate
+    }
+}
+
+// withRandFloat overrides the random number generator for testing.
+// This is unexported -- only used in tests to make error simulation
+// deterministic.
+func withRandFloat(fn func() float64) ServerOption {
+    return func(s *Server) { s.randFloat = fn }
+}
+```
+
+**NewServer default for randFloat:**
+
+```go
+// In NewServer, after applying options:
+if s.randFloat == nil {
+    s.randFloat = rand.Float64
+}
+```
+
+This uses `math/rand.Float64` from the top-level package (which is
+auto-seeded since Go 1.20). The injectable `randFloat` field allows
+tests to provide a deterministic function.
+
+**ServeHTTP changes:**
+
+After CORS handling, before delay and matching:
+
+```go
+// Error simulation: randomly return 500 if error rate is set.
+if s.errorRate > 0 && s.randFloat() < s.errorRate {
+    if s.cors {
+        // CORS headers already set above
+    }
+    w.Header().Set("X-Httptape-Error", "simulated")
+    http.Error(w, "httptape: simulated error", http.StatusInternalServerError)
+    return
+}
+```
+
+**Per-fixture error** (from issue #96 acceptance criteria): When a tape's
+Metadata contains an `"error"` key with a map value containing `"status"`
+(int) and optionally `"body"` (string), that tape always returns the
+specified error instead of the recorded response.
+
+```go
+// After matching, check per-fixture error override.
+if tape.Metadata != nil {
+    if raw, ok := tape.Metadata["error"]; ok {
+        if errMap, ok := raw.(map[string]any); ok {
+            status := http.StatusInternalServerError
+            body := "httptape: fixture error"
+            if s, ok := errMap["status"].(float64); ok {
+                status = int(s)
+            }
+            if b, ok := errMap["body"].(string); ok {
+                body = b
+            }
+            w.Header().Set("X-Httptape-Error", "simulated")
+            http.Error(w, body, status)
+            return
+        }
+    }
+}
+```
+
+Note: JSON unmarshaling into `map[string]any` produces `float64` for
+numbers, which is why the status is read as `float64` and cast to `int`.
+
+**CLI flag:**
+
+```go
+// In runServe:
+errorRate := fs.Float64("error-rate", 0, "Fraction of requests that return 500 (0.0-1.0)")
+
+// When building ServerOptions:
+if *errorRate > 0 {
+    serverOpts = append(serverOpts, httptape.WithErrorRate(*errorRate))
+}
+```
+
+##### Complete ServeHTTP flow (revised)
+
+```go
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    // 1. CORS headers (if enabled).
+    if s.cors {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+        w.Header().Set("Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+        w.Header().Set("Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Requested-With, Accept")
+        w.Header().Set("Access-Control-Max-Age", "86400")
+        if r.Method == http.MethodOptions {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+    }
+
+    // 2. Random error simulation (if enabled).
+    if s.errorRate > 0 && s.randFloat() < s.errorRate {
+        w.Header().Set("X-Httptape-Error", "simulated")
+        http.Error(w, "httptape: simulated error", http.StatusInternalServerError)
+        return
+    }
+
+    // 3. Retrieve tapes from store.
+    tapes, err := s.store.List(r.Context(), Filter{})
+    if err != nil {
+        http.Error(w, "httptape: store error", http.StatusInternalServerError)
+        return
+    }
+
+    // 4. Find a matching tape.
+    tape, ok := s.matcher.Match(r, tapes)
+    if !ok {
+        if s.onNoMatch != nil {
+            s.onNoMatch(r)
+        }
+        w.WriteHeader(s.fallbackStatus)
+        w.Write(s.fallbackBody)
+        return
+    }
+
+    // 5. Per-fixture error override.
+    if tape.Metadata != nil {
+        if raw, ok := tape.Metadata["error"]; ok {
+            if errMap, ok := raw.(map[string]any); ok {
+                status := http.StatusInternalServerError
+                body := "httptape: fixture error"
+                if s, ok := errMap["status"].(float64); ok {
+                    status = int(s)
+                }
+                if b, ok := errMap["body"].(string); ok {
+                    body = b
+                }
+                w.Header().Set("X-Httptape-Error", "simulated")
+                http.Error(w, body, status)
+                return
+            }
+        }
+    }
+
+    // 6. Delay (global or per-fixture override).
+    effectiveDelay := s.delay
+    if tape.Metadata != nil {
+        if raw, ok := tape.Metadata["delay"]; ok {
+            if ds, ok := raw.(string); ok {
+                if parsed, err := time.ParseDuration(ds); err == nil {
+                    effectiveDelay = parsed
+                }
+            }
+        }
+    }
+    if effectiveDelay > 0 {
+        timer := time.NewTimer(effectiveDelay)
+        defer timer.Stop()
+        select {
+        case <-timer.C:
+        case <-r.Context().Done():
+            return
+        }
+    }
+
+    // 7. Write the matched tape's response.
+    for key, values := range tape.Response.Headers {
+        w.Header()[key] = append([]string(nil), values...)
+    }
+    w.Header().Del("Content-Length")
+    w.WriteHeader(tape.Response.StatusCode)
+    w.Write(tape.Response.Body)
+}
+```
+
+##### CLI changes summary
+
+Both `runServe` and `runRecord` get three new flags:
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--cors` | bool | false | Enable CORS headers |
+| `--delay` | duration | 0 | Fixed delay before responses |
+| `--error-rate` | float64 | 0.0 | Fraction of requests returning 500 |
+
+The `runServe` function collects `[]httptape.ServerOption` before calling
+`httptape.NewServer`, passing all configured options. The `runRecord`
+function wraps the reverse proxy handler the same way. Since `runRecord`
+uses `httputil.ReverseProxy` as the handler (not `Server`), the CORS and
+error-rate middleware for `runRecord` is applied by wrapping the proxy
+handler in an `http.HandlerFunc` that applies the same CORS/delay/error
+logic. Alternatively, a simpler approach: for `runRecord`, only `--cors`
+is relevant (CORS headers on the proxy response). Delay and error-rate
+do not make sense for recording mode since you want accurate recordings.
+Therefore: `--cors` is added to both `runServe` and `runRecord`, but
+`--delay` and `--error-rate` are added to `runServe` only.
+
+##### Metadata field on Tape
+
+The per-fixture features (delay override, error override) require a
+`Metadata` field on `Tape`. If `Tape` does not already have this field,
+add it:
+
+```go
+type Tape struct {
+    // ... existing fields ...
+
+    // Metadata holds optional key-value pairs for fixture-level
+    // configuration (e.g., delay, error simulation). Not used for
+    // matching. Values are preserved through JSON round-trip.
+    Metadata map[string]any `json:"metadata,omitempty"`
+}
+```
+
+The `omitempty` tag ensures existing fixtures without metadata produce
+clean JSON. The field is not used by matchers, sanitizers, or the
+recorder -- it is consumed only by `Server.ServeHTTP`.
+
+##### New imports in server.go
+
+```go
+import (
+    "math/rand"
+    "net/http"
+    "time"
+)
+```
+
+##### Design choices
+
+1. **All in `server.go`**: these features are Server concerns. They modify
+   `ServeHTTP` behavior via functional options. No new files needed.
+
+2. **Inline middleware, not separate handlers**: wrapping `http.Handler`
+   in middleware chains is idiomatic Go, but these features are tightly
+   coupled to Server internals (e.g., per-fixture metadata requires
+   access to the matched tape). Inline checks in `ServeHTTP` are simpler
+   and avoid the complexity of passing matched-tape context through
+   middleware.
+
+3. **CORS is permissive (`*`)**: this is a dev tool. Granular origin
+   control is out of scope for v1 (per issue #94).
+
+4. **`randFloat` injection**: the `withRandFloat` unexported option lets
+   tests supply a deterministic function (e.g., always returns 0.0 or
+   1.0) without exposing internals. This follows the existing pattern of
+   unexported test helpers in the codebase.
+
+5. **`time.NewTimer` + select for delay**: this is the correct way to
+   implement a cancellable sleep in Go. Using `time.Sleep` would not
+   respect context cancellation.
+
+6. **Error simulation before matching**: random errors skip the
+   store.List call entirely. This is both more efficient and more
+   realistic (a 500 from an overloaded server happens before request
+   processing).
+
+7. **Per-fixture error after matching**: per-fixture errors are
+   deterministic overrides, not random. They always fire for the matched
+   fixture, regardless of `errorRate`.
+
+8. **CORS on error responses**: CORS headers are set first, before any
+   short-circuit. This ensures browsers can read error responses (without
+   CORS headers, the browser hides the response body from JavaScript).
+
+##### File placement
+
+- `server.go` -- all three ServerOption functions, updated ServeHTTP
+- `server_test.go` -- new test cases for CORS, delay, error rate
+- `tape.go` -- add Metadata field if not already present
+- `cmd/httptape/main.go` -- new CLI flags
+
+##### Test plan
+
+**CORS tests:**
+- CORS headers present when `WithCORS()` enabled
+- CORS headers absent when not enabled
+- OPTIONS preflight returns 204 with CORS headers
+- OPTIONS without CORS returns normal fallback
+- CORS headers present on error simulation responses
+- CORS headers present on no-match fallback responses
+
+**Delay tests:**
+- Response delayed by configured duration (measure with time.Since)
+- Zero delay is a no-op (fast response)
+- Per-fixture delay overrides global delay
+- Context cancellation during delay returns immediately
+- Delay not applied to no-match fallback responses
+
+**Error simulation tests:**
+- Error rate 0: no errors (randFloat always returns 0.5)
+- Error rate 1: all errors (randFloat always returns 0.5)
+- Error rate 0.5 with randFloat returning 0.3: error
+- Error rate 0.5 with randFloat returning 0.7: no error
+- X-Httptape-Error header present on simulated errors
+- Per-fixture error always fires regardless of error rate
+- Per-fixture error with custom status and body
+- WithErrorRate panics on rate < 0 or rate > 1
+
+**Integration tests:**
+- All three features combined: CORS + delay + error rate
+- CORS headers present on simulated error responses
+
+#### Consequences
+
+- **Frontend-ready mock server**: httptape becomes usable for frontend
+  development out of the box with `--cors --delay 200ms`.
+- **Realistic testing**: developers can test loading states and error
+  handling without modifying fixtures.
+- **No breaking changes**: all features are opt-in via new ServerOption
+  functions. Existing behavior is unchanged when no options are set.
+- **stdlib only**: `math/rand`, `time`, `net/http` are all stdlib.
+- **Metadata field**: adding `Metadata` to Tape is a minor schema change.
+  Existing fixtures without the field will unmarshal correctly (nil map).
+  New fixtures with metadata will have `"metadata": {...}` in JSON.
+- **Per-fixture features require manual JSON editing**: there is no DSL
+  or CLI for setting per-fixture metadata. This is acceptable for v1 --
+  users edit fixture JSON directly.
