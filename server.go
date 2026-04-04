@@ -1,7 +1,9 @@
 package httptape
 
 import (
+	"math/rand"
 	"net/http"
+	"time"
 )
 
 // Server is an http.Handler that replays recorded HTTP interactions.
@@ -17,6 +19,10 @@ type Server struct {
 	fallbackStatus int              // HTTP status when no tape matches
 	fallbackBody   []byte           // response body when no tape matches
 	onNoMatch      func(*http.Request) // optional callback when no tape matches
+	cors           bool             // if true, add CORS headers to all responses
+	delay          time.Duration    // fixed delay before every response; zero means no delay
+	errorRate      float64          // fraction of requests that return 500 (0.0-1.0)
+	randFloat      func() float64   // random number generator (injectable for testing)
 }
 
 // ServerOption configures a Server.
@@ -47,6 +53,52 @@ func WithOnNoMatch(fn func(*http.Request)) ServerOption {
 	return func(s *Server) { s.onNoMatch = fn }
 }
 
+// WithCORS enables CORS headers on all responses. When enabled, the
+// server adds permissive CORS headers (Access-Control-Allow-Origin: *)
+// and handles OPTIONS preflight requests automatically with 204 No Content.
+//
+// This is intended for local development where the frontend dev server
+// (e.g., localhost:3000) calls the mock backend (e.g., localhost:3001).
+// It is opt-in only.
+func WithCORS() ServerOption {
+	return func(s *Server) { s.cors = true }
+}
+
+// WithDelay adds a fixed delay before every response. The delay is
+// applied after matching but before writing the response. If the
+// request context is cancelled during the delay (e.g., client
+// disconnects), ServeHTTP returns immediately without writing.
+//
+// A zero or negative duration is a no-op.
+func WithDelay(d time.Duration) ServerOption {
+	return func(s *Server) { s.delay = d }
+}
+
+// WithErrorRate causes a fraction of requests to return 500 Internal
+// Server Error with an "X-Httptape-Error: simulated" header instead of
+// the recorded response. The rate must be between 0.0 and 1.0 inclusive.
+//
+// A rate of 0.0 disables error simulation (default). A rate of 1.0
+// causes all requests to fail.
+//
+// Panics if rate is outside [0.0, 1.0]. This is a programming error,
+// following the constructor-guard convention.
+func WithErrorRate(rate float64) ServerOption {
+	return func(s *Server) {
+		if rate < 0 || rate > 1 {
+			panic("httptape: WithErrorRate rate must be between 0.0 and 1.0")
+		}
+		s.errorRate = rate
+	}
+}
+
+// withRandFloat overrides the random number generator for testing.
+// This is unexported -- only used in tests to make error simulation
+// deterministic.
+func withRandFloat(fn func() float64) ServerOption {
+	return func(s *Server) { s.randFloat = fn }
+}
+
 // NewServer creates a new Server that replays tapes from the given store.
 //
 // By default:
@@ -54,6 +106,9 @@ func WithOnNoMatch(fn func(*http.Request)) ServerOption {
 //   - fallback status is 404 Not Found
 //   - fallback body is "httptape: no matching tape found"
 //   - no onNoMatch callback
+//   - CORS disabled
+//   - no delay
+//   - no error simulation
 //
 // The store must not be nil. Passing a nil store is a programming error and
 // will panic.
@@ -71,6 +126,12 @@ func NewServer(store Store, opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	// Default random number generator for error simulation.
+	if s.randFloat == nil {
+		s.randFloat = rand.Float64
+	}
+
 	return s
 }
 
@@ -78,27 +139,54 @@ func NewServer(store Store, opts ...ServerOption) *Server {
 // and writing the recorded response. If no tape matches, it writes the
 // configured fallback response.
 //
+// When multiple features are enabled, they execute in this order:
+//  1. CORS -- add CORS headers and handle OPTIONS preflight
+//  2. Error simulation -- short-circuit with 500 before any work
+//  3. Normal replay -- existing match-and-respond logic
+//  4. Per-fixture error override -- after matching, before writing
+//  5. Delay -- sleep before writing the real response
+//  6. Write response
+//
 // Performance note: ServeHTTP calls Store.List with an empty filter on every
 // request, resulting in an O(n) scan over all tapes. This is acceptable for
-// v1 test usage with small fixture sets. For large fixture sets (500+ tapes),
-// consider adding a WithFilter option to scope the list call, or caching
-// tapes with a configurable TTL.
-//
-// TODO: add optional tape caching or scoped filtering for large fixture sets.
+// v1 test usage with small fixture sets.
 //
 // The method is safe for concurrent use.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Step 2: retrieve all tapes from store.
+	// 1. CORS headers (if enabled).
+	if s.cors {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods",
+			"GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+		w.Header().Set("Access-Control-Allow-Headers",
+			"Content-Type, Authorization, X-Requested-With, Accept")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Handle OPTIONS preflight: return 204 with CORS headers, no body.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// 2. Random error simulation (if enabled).
+	if s.errorRate > 0 && s.randFloat() < s.errorRate {
+		w.Header().Set("X-Httptape-Error", "simulated")
+		http.Error(w, "httptape: simulated error", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Retrieve all tapes from store.
 	tapes, err := s.store.List(r.Context(), Filter{})
 	if err != nil {
 		http.Error(w, "httptape: store error", http.StatusInternalServerError)
 		return
 	}
 
-	// Step 4: find a matching tape.
+	// 4. Find a matching tape.
 	tape, ok := s.matcher.Match(r, tapes)
 
-	// Step 5: no match.
+	// 5. No match.
 	if !ok {
 		if s.onNoMatch != nil {
 			s.onNoMatch(r)
@@ -108,16 +196,58 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 6: write the matched tape's response.
-	// 6a: copy response headers (clone slices to prevent aliasing with tape data).
+	// 6. Per-fixture error override.
+	if tape.Metadata != nil {
+		if raw, ok := tape.Metadata["error"]; ok {
+			if errMap, ok := raw.(map[string]any); ok {
+				status := http.StatusInternalServerError
+				body := "httptape: fixture error"
+				if s, ok := errMap["status"].(float64); ok {
+					status = int(s)
+				}
+				if b, ok := errMap["body"].(string); ok {
+					body = b
+				}
+				w.Header().Set("X-Httptape-Error", "simulated")
+				http.Error(w, body, status)
+				return
+			}
+		}
+	}
+
+	// 7. Delay (global or per-fixture override).
+	effectiveDelay := s.delay
+	if tape.Metadata != nil {
+		if raw, ok := tape.Metadata["delay"]; ok {
+			if ds, ok := raw.(string); ok {
+				if parsed, err := time.ParseDuration(ds); err == nil {
+					effectiveDelay = parsed
+				}
+			}
+		}
+	}
+	if effectiveDelay > 0 {
+		timer := time.NewTimer(effectiveDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			// delay elapsed, proceed to write response
+		case <-r.Context().Done():
+			// client disconnected during delay, bail out
+			return
+		}
+	}
+
+	// 8. Write the matched tape's response.
+	// 8a: copy response headers (clone slices to prevent aliasing with tape data).
 	for key, values := range tape.Response.Headers {
 		w.Header()[key] = append([]string(nil), values...)
 	}
-	// 6b: remove Content-Length — the recorded value may be stale if the body
+	// 8b: remove Content-Length — the recorded value may be stale if the body
 	// was modified by sanitization. Let net/http set it from the actual body.
 	w.Header().Del("Content-Length")
-	// 6c: write status code.
+	// 8c: write status code.
 	w.WriteHeader(tape.Response.StatusCode)
-	// 6d: write body.
+	// 8d: write body.
 	w.Write(tape.Response.Body) //nolint:errcheck // response write failure is not actionable
 }

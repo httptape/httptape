@@ -43,6 +43,11 @@ type Tape struct {
 
 	// Response is the recorded HTTP response.
 	Response RecordedResp `json:"response"`
+
+	// Metadata holds optional key-value pairs for fixture-level
+	// configuration (e.g., delay, error simulation). Not used for
+	// matching. Values are preserved through JSON round-trip.
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // RecordedReq captures the essential parts of an HTTP request for matching and replay.
