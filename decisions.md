@@ -5741,3 +5741,166 @@ func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
   nested directories, matching `FileStore`'s existing behavior. Users who
   need recursive loading from the real filesystem can use
   `LoadFixturesFS(os.DirFS(dir), ".")` as a workaround.
+
+---
+
+### ADR-23: Go DSL for mock definitions
+
+**Date**: 2026-03-30
+**Issue**: #92
+**Status**: Accepted
+
+#### Context
+
+Creating a mock HTTP server for tests currently requires constructing Tapes
+manually, populating a MemoryStore, and wiring up a Server with httptest.
+This boilerplate is repetitive and obscures the intent of the test setup.
+Issue #92 requests a fluent Go DSL that lets users declare request/response
+stubs inline, similar to WireMock's stubFor() API but idiomatic Go.
+
+The DSL should be a thin convenience layer over existing types (Tape,
+MemoryStore, Server, httptest.Server). It must not introduce new matching
+semantics or bypass the existing architecture.
+
+#### Decision
+
+Add a fluent mock DSL in a new file `mock.go` with tests in `mock_test.go`.
+
+##### API surface
+
+```go
+// MockServer wraps an httptest.Server configured with stub-based tapes.
+// It embeds *httptest.Server so callers get URL, Client, and Close for free.
+type MockServer struct {
+    *httptest.Server
+}
+
+// Mock creates an httptest.Server backed by a MemoryStore populated with
+// the given stubs. Each Stub is converted to a Tape internally.
+// The returned MockServer must be closed by the caller (defer srv.Close()).
+func Mock(stubs ...Stub) *MockServer
+
+// Stub represents a single request-response pair for the mock DSL.
+type Stub struct {
+    method      string
+    path        string
+    status      int
+    body        []byte
+    headers     http.Header
+}
+
+// Method is a request matcher that captures HTTP method and path.
+type Method struct {
+    method string
+    path   string
+}
+
+// Method helpers — each returns a Method value:
+func GET(path string) Method
+func POST(path string) Method
+func PUT(path string) Method
+func DELETE(path string) Method
+func PATCH(path string) Method
+func HEAD(path string) Method
+
+// When starts building a Stub from a Method.
+func When(m Method) *StubBuilder
+
+// StubBuilder provides a fluent API for constructing a Stub.
+type StubBuilder struct {
+    stub Stub
+}
+
+// Respond sets the response status code and optional body.
+// If no body is provided, the response has an empty body.
+func (b *StubBuilder) Respond(status int, body ...Body) *StubBuilder
+
+// WithHeader adds a response header to the stub.
+// Can be called multiple times for multiple headers.
+func (b *StubBuilder) WithHeader(key, value string) *StubBuilder
+
+// Build finalizes and returns the Stub. Called implicitly by Mock.
+func (b *StubBuilder) Build() Stub
+
+// Body represents a response body with optional content type.
+type Body struct {
+    data        []byte
+    contentType string  // auto-set for JSON/Text helpers; empty for Binary
+}
+
+// Body helpers:
+func JSON(s string) Body    // sets content type to application/json
+func Text(s string) Body    // sets content type to text/plain; charset=utf-8
+func Binary(b []byte) Body  // no auto content type
+```
+
+##### Internal conversion
+
+`Mock` converts each `Stub` to a `Tape` by:
+1. Generating a UUID via `newUUID()` for the tape ID.
+2. Setting `RecordedAt` to `time.Now().UTC()`.
+3. Setting `Request.Method` and `Request.URL` from the Method.
+4. Setting `Response.StatusCode`, `Response.Body`, and `Response.Headers`.
+5. If a Body helper provides a content type and no explicit Content-Type
+   header was set via `WithHeader`, the content type is added automatically.
+6. Saving each tape to a `NewMemoryStore()` via `Save`.
+7. Creating `NewServer(store)` and wrapping it in `httptest.NewServer`.
+
+##### Design choices
+
+1. **Embed `*httptest.Server`**: callers get `URL`, `Client()`, and `Close()`
+   without wrapper methods. This is standard Go practice for test helpers.
+
+2. **`StubBuilder` returns `*StubBuilder`** (pointer receiver): enables
+   method chaining. The `Build()` method returns a value `Stub`.
+
+3. **`Mock` accepts `...Stub`**: variadic for clean multi-stub syntax.
+   `StubBuilder.Build()` is called implicitly — `Mock` also accepts
+   `*StubBuilder` would complicate the API. Instead, `StubBuilder`
+   implements a `Build()` that `Mock` calls, but to keep the API minimal,
+   `When().Respond().Build()` returns a `Stub` directly, and `Mock` accepts
+   `Stub` values.
+
+4. **Body helpers set content type**: `JSON()` auto-adds
+   `Content-Type: application/json` if not explicitly overridden. This
+   eliminates the most common `WithHeader` call.
+
+5. **No query string or header matching in stubs**: the DSL is for
+   defining responses, not for advanced request matching. Stubs use the
+   DefaultMatcher (method + path). Users who need advanced matching should
+   use the full Tape + CompositeMatcher API.
+
+6. **Path stored as full URL**: internally the tape URL is stored as
+   `http://mock<path>` to satisfy the URL parsing that MatchPath performs.
+   The actual test server URL is irrelevant for matching since MatchPath
+   compares only the path component.
+
+7. **stdlib only**: uses `net/http/httptest` which is part of the Go
+   standard library. No new dependencies.
+
+8. **Panics on store errors**: `Mock` panics if `MemoryStore.Save` fails.
+   This follows the constructor-panic convention (L-11 exception for
+   programming errors) and matches `regexp.MustCompile` precedent.
+   `MemoryStore.Save` only fails on context cancellation, which cannot
+   happen with `context.Background()`.
+
+##### File placement
+
+- `mock.go` — all DSL types and functions
+- `mock_test.go` — table-driven tests covering: single stub, multiple
+  stubs, JSON body, text body, binary body, no body (204), custom headers,
+  auto content-type from body helper, method helpers (GET/POST/PUT/DELETE/
+  PATCH/HEAD)
+
+#### Consequences
+
+- **Reduced test boilerplate**: the most common mock setup is now 3-5 lines
+  instead of 15-20.
+- **No breaking changes**: purely additive new exports.
+- **stdlib only**: no new dependencies.
+- **Discoverable**: users searching for "mock" in godoc find `Mock` immediately.
+- **Composable with existing API**: `MockServer` embeds `*httptest.Server`,
+  so all existing httptest patterns work (custom transport, TLS, etc.).
+- **Limited matching**: stubs only support method + path matching. This is
+  intentional — the DSL optimizes for the 80% case. Advanced users compose
+  Tape + CompositeMatcher directly.
