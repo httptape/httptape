@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"time"
 )
 
 // MockServer wraps an httptest.Server configured with stub-based tapes.
@@ -140,19 +139,17 @@ func Mock(stubs ...Stub) *MockServer {
 	ctx := context.Background()
 
 	for _, s := range stubs {
-		tape := Tape{
-			ID:         newUUID(),
-			RecordedAt: time.Now().UTC(),
-			Request: RecordedReq{
+		tape := NewTape("",
+			RecordedReq{
 				Method: s.method,
 				URL:    "http://mock" + s.path,
 			},
-			Response: RecordedResp{
+			RecordedResp{
 				StatusCode: s.status,
 				Body:       s.body,
 				Headers:    s.headers,
 			},
-		}
+		)
 		if err := store.Save(ctx, tape); err != nil {
 			panic("httptape: Mock failed to save stub: " + err.Error())
 		}
