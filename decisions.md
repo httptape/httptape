@@ -6552,3 +6552,443 @@ func WithReplayHeaders(key, value string) ServerOption
   If multi-value support is needed later, the API can be extended with a
   `WithReplayHeaderValues(key string, values ...string)` option without
   breaking the existing API.
+
+---
+
+### ADR-26: Fallback-to-cache proxy mode with L1/L2 caching
+
+**Date**: 2026-03-30
+**Issue**: #108
+**Status**: Accepted
+
+#### Context
+
+During development, engineers need to hit the real backend when it is available
+but seamlessly fall back to recorded fixtures when it is not (backend down,
+offline, CI without credentials). Today httptape forces a binary choice between
+`record` mode (always forwards, always records) and `serve` mode (always replays
+from disk). There is no hybrid.
+
+Issue #108 proposes a proxy mode that forwards to the real backend, records
+successful responses, and falls back to cached tapes on failure. The issue
+comments refine this into a two-tier caching architecture:
+
+- **L1 cache** (MemoryStore) -- raw/unsanitized responses, ephemeral,
+  lost on process restart.
+- **L2 cache** (FileStore) -- sanitized responses, persistent on disk,
+  safe to commit to version control.
+
+On fallback, L1 is checked first (preserves real data within the current
+session), then L2 (sanitized but still functional). This gives the best
+developer experience: during an active session the developer sees consistent
+real data even when the backend goes down; on restart, only sanitized fixtures
+remain, honoring the core "sensitive data never touches disk" promise.
+
+#### Decision
+
+##### New type: `Proxy` (in `proxy.go`)
+
+A new `Proxy` type is introduced rather than extending the existing `Recorder`.
+Rationale:
+
+1. **Single Responsibility**: `Recorder` is a pure recording RoundTripper. Its
+   contract is simple: forward request, capture response, save tape, return
+   response. Adding fallback logic (match from L1, match from L2, synthesize
+   response) would make it do two very different things.
+
+2. **Different dependency set**: `Proxy` needs a `Matcher` (for fallback
+   lookups) that `Recorder` does not need. Adding a matcher dependency to
+   `Recorder` would confuse its API for non-proxy users.
+
+3. **Different lifecycle**: `Proxy` manages two stores (L1 + L2) with different
+   write semantics (raw vs. sanitized). `Recorder` manages one store with one
+   write path.
+
+4. **The existing `Recorder` is a building block**: `Proxy` delegates the
+   actual HTTP forwarding to an inner `http.RoundTripper` (typically
+   `http.DefaultTransport`), not to a `Recorder`. The recording logic in
+   `Proxy.RoundTrip` is specialized (dual-write to L1 and L2 with different
+   sanitization) and cannot reuse `Recorder.RoundTrip` as-is.
+
+```go
+// Proxy is an http.RoundTripper that forwards requests to a real backend,
+// records successful responses to a two-tier cache (L1 in-memory, L2 on disk),
+// and falls back to cached tapes on transport failure.
+//
+// On success:
+//   - Raw (unsanitized) tape saved to L1 (MemoryStore)
+//   - Sanitized tape saved to L2 (FileStore)
+//   - Real response returned to caller
+//
+// On failure:
+//   - Match from L1 (raw, best UX within session)
+//   - Match from L2 (sanitized, persistent)
+//   - If neither matches, return original error
+//
+// Proxy is safe for concurrent use by multiple goroutines.
+type Proxy struct {
+    transport  http.RoundTripper  // real backend transport
+    l1         Store              // raw/ephemeral (typically *MemoryStore)
+    l2         Store              // sanitized/persistent (typically *FileStore)
+    sanitizer  Sanitizer          // applied to L2 writes only
+    matcher    Matcher            // for fallback lookups
+    route      string             // logical route label
+    onError    func(error)        // async error callback
+    isFallback func(error, *http.Response) bool // determines when to fall back
+}
+
+// ProxyOption configures a Proxy.
+type ProxyOption func(*Proxy)
+```
+
+##### Constructor
+
+```go
+// NewProxy creates a new Proxy with the given L1 (ephemeral) and L2 (persistent)
+// stores.
+//
+// Defaults:
+//   - transport: http.DefaultTransport
+//   - sanitizer: NewPipeline() (no-op)
+//   - matcher: DefaultMatcher()
+//   - isFallback: transport errors only (not 5xx)
+//   - route: ""
+//
+// Both l1 and l2 must be non-nil. Panics on nil stores (constructor guard
+// convention per L-11).
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+```
+
+Parameter order is `l1, l2` (not `l2, l1`) because the mental model is
+"fast cache first, persistent cache second" which matches the fallback
+lookup order.
+
+##### ProxyOption functions
+
+```go
+// WithProxyTransport sets the inner http.RoundTripper for real backend calls.
+func WithProxyTransport(rt http.RoundTripper) ProxyOption
+
+// WithProxySanitizer sets the Sanitizer applied to L2 writes.
+// L1 writes are always raw (unsanitized).
+func WithProxySanitizer(s Sanitizer) ProxyOption
+
+// WithProxyMatcher sets the Matcher used for fallback lookups.
+func WithProxyMatcher(m Matcher) ProxyOption
+
+// WithProxyRoute sets the route label for all tapes.
+func WithProxyRoute(route string) ProxyOption
+
+// WithProxyOnError sets the error callback.
+func WithProxyOnError(fn func(error)) ProxyOption
+
+// WithProxyFallbackOn sets a custom function that decides whether a given
+// transport error and/or HTTP response should trigger fallback.
+//
+// The function receives:
+//   - err: the error from transport.RoundTrip (nil if the call succeeded)
+//   - resp: the HTTP response (nil if err is non-nil)
+//
+// It returns true if fallback should be attempted.
+//
+// Default: fall back only on transport errors (err != nil).
+// Common alternative: also fall back on 5xx responses.
+func WithProxyFallbackOn(fn func(err error, resp *http.Response) bool) ProxyOption
+```
+
+The option names are prefixed with `Proxy` (e.g., `WithProxyTransport`) to avoid
+collision with existing `Recorder` options (`WithTransport`, `WithSanitizer`,
+etc.) since all types are in the same package.
+
+##### RoundTrip flow
+
+```go
+func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
+    // 1. Capture request body (same pattern as Recorder).
+    reqBody := captureRequestBody(req)
+
+    // 2. Forward to real backend.
+    resp, err := p.transport.RoundTrip(req)
+
+    // 3. Decide: success or fallback?
+    if p.isFallback(err, resp) {
+        // 3a. Fallback path.
+        return p.fallback(req, err)
+    }
+
+    // 4. Success path: capture response body.
+    respBody := captureResponseBody(resp)
+
+    // 5. Build raw tape.
+    rawTape := p.buildTape(req, reqBody, resp, respBody)
+
+    // 6. Save raw to L1 (synchronous, in-memory, fast).
+    if saveErr := p.l1.Save(req.Context(), rawTape); saveErr != nil {
+        p.onErrorSafe(saveErr)
+    }
+
+    // 7. Sanitize and save to L2 (synchronous).
+    sanitizedTape := p.sanitizer.Sanitize(rawTape)
+    if saveErr := p.l2.Save(req.Context(), sanitizedTape); saveErr != nil {
+        p.onErrorSafe(saveErr)
+    }
+
+    // 8. Return real response (with body restored).
+    return resp, nil
+}
+```
+
+Both L1 and L2 saves are **synchronous** in `RoundTrip`. Rationale:
+- L1 is `MemoryStore` -- a map write under a mutex, sub-microsecond.
+- L2 is `FileStore` -- a file write, but proxy mode is I/O-bound on the
+  upstream call anyway. The file write is negligible relative to network latency.
+- Synchronous writes guarantee the tape is available for immediate fallback if
+  the next request fails (no race between async write and fallback read).
+- This avoids the complexity of a drain goroutine and Close() lifecycle in Proxy.
+
+##### Fallback logic
+
+```go
+func (p *Proxy) fallback(req *http.Request, originalErr error) (*http.Response, error) {
+    ctx := req.Context()
+
+    // Try L1 first (raw, best UX).
+    if tape, ok := p.matchFromStore(ctx, req, p.l1); ok {
+        return p.tapeToResponse(tape, "l1-cache"), nil
+    }
+
+    // Try L2 (sanitized, persistent).
+    if tape, ok := p.matchFromStore(ctx, req, p.l2); ok {
+        return p.tapeToResponse(tape, "l2-cache"), nil
+    }
+
+    // No match in either cache -- return original error.
+    return nil, originalErr
+}
+
+func (p *Proxy) matchFromStore(ctx context.Context, req *http.Request, store Store) (Tape, bool) {
+    tapes, err := store.List(ctx, Filter{})
+    if err != nil {
+        p.onErrorSafe(err)
+        return Tape{}, false
+    }
+    return p.matcher.Match(req, tapes)
+}
+```
+
+This reuses the exact same `Store.List` + `Matcher.Match` pattern as
+`Server.ServeHTTP` (lines 198-205 of server.go). The matching logic is
+not duplicated -- it is delegated to the same `Matcher` interface.
+
+##### Response synthesis from tape
+
+```go
+func (p *Proxy) tapeToResponse(tape Tape, source string) *http.Response {
+    resp := &http.Response{
+        StatusCode: tape.Response.StatusCode,
+        Header:     tape.Response.Headers.Clone(),
+        Body:       io.NopCloser(bytes.NewReader(tape.Response.Body)),
+    }
+    // Indicate fallback source.
+    resp.Header.Set("X-Httptape-Source", source)
+    return resp
+}
+```
+
+The `X-Httptape-Source` header tells the caller where the response came from:
+- `"upstream"` -- not set (absence means upstream; avoids header noise on
+  the happy path)
+- `"l1-cache"` -- raw in-memory fallback
+- `"l2-cache"` -- sanitized on-disk fallback
+
+##### Fallback detection: `isFallback` function
+
+The default `isFallback` triggers only on transport errors (connection refused,
+DNS failure, timeout). This is the conservative default -- 5xx responses from
+a functioning backend are real responses that the caller may want to handle.
+
+A common alternative for dev workflows is to also fall back on 5xx:
+
+```go
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxyFallbackOn(func(err error, resp *http.Response) bool {
+        if err != nil {
+            return true // transport error
+        }
+        return resp != nil && resp.StatusCode >= 500
+    }),
+)
+```
+
+This is a function rather than a bool flag because real-world needs vary:
+some teams want to fall back on specific status codes (502, 503 but not 500),
+on specific error types, or on responses missing certain headers.
+
+##### L1 lifecycle: truly ephemeral
+
+L1 (MemoryStore) is not flushed on shutdown. It is truly ephemeral:
+
+- On graceful shutdown, L1 data is lost. This is intentional -- L1 contains
+  raw/unsanitized data that must not persist.
+- There is no `Close()` method on `Proxy`. The `MemoryStore` has no resources
+  to release (no goroutines, no file handles).
+- If the caller needs cleanup, they manage the `MemoryStore` lifecycle directly.
+
+##### CLI: `httptape proxy` command
+
+A new `proxy` subcommand is added to `cmd/httptape/main.go`:
+
+```
+httptape proxy --upstream URL --fixtures DIR [--config FILE] [--port PORT] [--cors]
+```
+
+Flags:
+- `--upstream` (required): upstream backend URL
+- `--fixtures` (required): directory for L2 (FileStore, sanitized fixtures)
+- `--config`: sanitization config JSON (applied to L2 writes only)
+- `--port`: listen port (default 8081)
+- `--cors`: enable CORS headers
+- `--fallback-on-5xx`: also fall back on 5xx responses (default: transport
+  errors only)
+
+L1 is always an internal `MemoryStore` -- not configurable via CLI. There is
+no reason to persist L1 (it would violate the security model).
+
+Implementation sketch for `runProxy`:
+
+```go
+func runProxy(args []string) error {
+    // Parse flags (same pattern as runRecord).
+    // Create L1 = NewMemoryStore()
+    // Create L2 = NewFileStore(WithDirectory(fixtures))
+    // Load config -> build pipeline (if --config provided)
+    // Create proxy = NewProxy(l1, l2, opts...)
+    // Create httputil.ReverseProxy with Transport: proxy
+    // Listen, serve, graceful shutdown.
+}
+```
+
+The reverse proxy setup mirrors `runRecord` -- `httputil.ReverseProxy` with
+`Rewrite` to set the upstream URL, and `Transport` set to the `Proxy`
+RoundTripper.
+
+##### Go API for embedded use
+
+```go
+// Minimal setup:
+l1 := httptape.NewMemoryStore()
+l2, _ := httptape.NewFileStore(httptape.WithDirectory("fixtures"))
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxyTransport(http.DefaultTransport),
+    httptape.WithProxySanitizer(pipeline),
+)
+client := &http.Client{Transport: proxy}
+
+// Use client normally -- it records on success, falls back on failure.
+resp, err := client.Get("https://api.example.com/users")
+```
+
+##### Request body handling for fallback matching
+
+When `RoundTrip` enters the fallback path, the request body has already been
+captured (step 1 of the flow). The body is restored on `req` via
+`io.NopCloser(bytes.NewReader(reqBody))` before calling `p.fallback(req, err)`,
+so the `Matcher` (specifically `MatchBodyHash` or `MatchBodyFuzzy`) can read
+it. This follows the same body-capture-and-restore pattern used in
+`Recorder.RoundTrip`.
+
+##### Sanitization config guidance
+
+The issue comments note that there should be no `--no-sanitize` flag. Instead,
+the documentation should show two sanitization config profiles:
+
+1. **Full sanitization** (for sharing/CI): redacts headers, body PII, fakes
+   fields. Cached L2 responses may have `[REDACTED]` in auth headers.
+
+2. **Minimal sanitization** (for proxy/dev): skip header redaction, only
+   redact true PII in bodies. Functional headers (Authorization, Content-Type,
+   pagination tokens) stay intact so cached responses work as drop-in
+   replacements.
+
+Both are achievable with the existing `Pipeline` / `Config` system -- no new
+API needed.
+
+#### Alternatives considered
+
+1. **Extend Recorder with `WithFallback(bool)` option**: Rejected. Would
+   require adding `Matcher`, dual-store, and fallback logic to `Recorder`,
+   violating single responsibility. The `Recorder` contract (always forward,
+   always record) would become conditional.
+
+2. **Compose Recorder + Server in a wrapper**: Considered using `Recorder`
+   for the success path and `Server` for the fallback path. Rejected because
+   `Server` is an `http.Handler`, not a `RoundTripper` -- it writes to
+   `http.ResponseWriter`, not returns `*http.Response`. Converting between
+   the two would require `httptest.ResponseRecorder` hacks, adding complexity
+   without benefit.
+
+3. **Single store with raw + sanitized modes**: Rejected. A single store
+   cannot serve both raw (for session-local fallback) and sanitized (for
+   persistent/shareable fixtures) simultaneously. The L1/L2 split maps cleanly
+   to the existing `MemoryStore`/`FileStore` implementations.
+
+4. **Async writes for L2**: Considered making L2 writes async (like Recorder).
+   Rejected for simplicity -- proxy mode is already I/O-bound on upstream
+   calls, and synchronous L2 writes guarantee consistency. Can be revisited
+   if profiling shows L2 write latency is a problem.
+
+#### Consequences
+
+- **New file**: `proxy.go` (+ `proxy_test.go`) containing the `Proxy` type,
+  `ProxyOption` functions, and all proxy logic.
+- **Modified file**: `cmd/httptape/main.go` -- add `proxy` subcommand and
+  `runProxy` function, update usage text.
+- **Non-breaking**: no existing API is modified. `Recorder`, `Server`, and all
+  existing options remain unchanged.
+- **Security model preserved**: L1 (raw) is in-memory only, never touches disk.
+  L2 (sanitized) goes through the full sanitization pipeline before persisting
+  to FileStore. The core promise "sensitive data never touches disk" is intact.
+- **stdlib only**: no new dependencies. `Proxy` uses `net/http`, `io`,
+  `bytes`, `context` -- all stdlib.
+- **Testable**: `Proxy` accepts `Store` interfaces for both L1 and L2, and
+  `http.RoundTripper` for the transport. All dependencies are injectable. Tests
+  can use `MemoryStore` for both tiers and a fake transport.
+- **CLI table updated**:
+
+  | Command | Upstream | L1 (memory) | L2 (disk) | Use case |
+  |---------|----------|-------------|-----------|----------|
+  | `serve` | no | no | read only | Pure replay from sanitized fixtures |
+  | `record` | yes | no | write (sanitized) | Capture fixtures for testing |
+  | `proxy` | yes | read/write (raw) | read/write (sanitized) | Dev workflow with graceful fallback |
+
+##### Test plan
+
+- **Success path**: transport succeeds -> raw tape in L1, sanitized tape in L2,
+  real response returned, no `X-Httptape-Source` header.
+- **Fallback to L1**: transport fails -> pre-populated L1 tape returned,
+  `X-Httptape-Source: l1-cache` header present.
+- **Fallback to L2**: transport fails, L1 empty -> pre-populated L2 tape
+  returned, `X-Httptape-Source: l2-cache` header present.
+- **No match**: transport fails, both caches empty -> original error returned.
+- **L1 before L2**: both caches have a matching tape -> L1 tape is returned
+  (not L2).
+- **Sanitizer applied to L2 only**: on success, L1 tape has raw headers, L2
+  tape has redacted headers.
+- **5xx fallback**: `WithProxyFallbackOn` configured for 5xx -> 503 from
+  upstream triggers fallback.
+- **Custom fallback function**: custom `isFallback` -> only specific error
+  types trigger fallback.
+- **Request body preserved for matching**: POST with body -> transport fails ->
+  `MatchBodyHash` correctly matches against L1/L2 tape.
+- **Concurrent safety**: multiple goroutines calling `RoundTrip` simultaneously
+  with mixed success/failure -> no races, no panics.
+- **CLI integration**: `httptape proxy --upstream ... --fixtures ...` starts
+  and proxies correctly.
+
+##### File placement
+
+- `proxy.go` -- `Proxy` type, `ProxyOption` functions, `RoundTrip`,
+  `fallback`, `matchFromStore`, `tapeToResponse`, `buildTape`
+- `proxy_test.go` -- unit tests for all paths
+- `cmd/httptape/main.go` -- `runProxy` function, `proxy` subcommand routing,
+  updated usage text

@@ -7,6 +7,7 @@
 //
 //	httptape serve    — Replay recorded fixtures as a mock HTTP server
 //	httptape record   — Proxy requests to upstream, record and sanitize responses
+//	httptape proxy    — Forward to upstream with L1/L2 fallback-to-cache
 //	httptape export   — Export fixtures to a tar.gz bundle
 //	httptape import   — Import fixtures from a tar.gz bundle
 package main
@@ -62,6 +63,7 @@ Usage:
 Commands:
   serve    Replay recorded fixtures as a mock HTTP server
   record   Proxy requests to upstream, record and sanitize responses
+  proxy    Forward to upstream with L1/L2 fallback-to-cache
   export   Export fixtures to a tar.gz bundle
   import   Import fixtures from a tar.gz bundle
 
@@ -91,6 +93,8 @@ func run(args []string) int {
 		err = runServe(cmdArgs)
 	case "record":
 		err = runRecord(cmdArgs)
+	case "proxy":
+		err = runProxy(cmdArgs)
 	case "export":
 		err = runExport(cmdArgs)
 	case "import":
@@ -293,6 +297,119 @@ func runRecord(args []string) error {
 	}()
 
 	logger.Printf("record mode: listening on %s, upstream=%s, fixtures=%s", addr, *upstream, *fixtures)
+	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		return fmt.Errorf("server error: %w", err)
+	}
+
+	logger.Println("shutdown complete")
+	return nil
+}
+
+func runProxy(args []string) error {
+	fs := flag.NewFlagSet("httptape proxy", flag.ContinueOnError)
+	upstream := fs.String("upstream", "", "Upstream URL, e.g. https://api.example.com (required)")
+	fixtures := fs.String("fixtures", "", "Path to fixture directory for L2 cache (required)")
+	configPath := fs.String("config", "", "Path to sanitization config JSON (applied to L2 writes only)")
+	port := fs.Int("port", 8081, "Listen port")
+	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
+	fallbackOn5xx := fs.Bool("fallback-on-5xx", false, "Also fall back on 5xx responses from upstream")
+
+	if err := fs.Parse(args); err != nil {
+		return &usageError{err}
+	}
+
+	if *upstream == "" {
+		fs.Usage()
+		return &usageError{fmt.Errorf("--upstream is required")}
+	}
+	if *fixtures == "" {
+		fs.Usage()
+		return &usageError{fmt.Errorf("--fixtures is required")}
+	}
+
+	upstreamURL, err := url.Parse(*upstream)
+	if err != nil {
+		return fmt.Errorf("invalid upstream URL: %w", err)
+	}
+	if upstreamURL.Scheme == "" || upstreamURL.Host == "" {
+		return fmt.Errorf("upstream URL must include scheme and host, got %q", *upstream)
+	}
+
+	l1 := httptape.NewMemoryStore()
+	l2, err := httptape.NewFileStore(httptape.WithDirectory(*fixtures))
+	if err != nil {
+		return fmt.Errorf("create L2 store: %w", err)
+	}
+
+	var proxyOpts []httptape.ProxyOption
+	proxyOpts = append(proxyOpts, httptape.WithProxyOnError(func(err error) {
+		logger.Printf("proxy error: %v", err)
+	}))
+
+	if *configPath != "" {
+		cfg, err := httptape.LoadConfigFile(*configPath)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		pipeline := cfg.BuildPipeline()
+		proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(pipeline))
+	}
+
+	if *fallbackOn5xx {
+		proxyOpts = append(proxyOpts, httptape.WithProxyFallbackOn(func(err error, resp *http.Response) bool {
+			if err != nil {
+				return true
+			}
+			return resp != nil && resp.StatusCode >= 500
+		}))
+	}
+
+	tapeProxy := httptape.NewProxy(l1, l2, proxyOpts...)
+
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(upstreamURL)
+			r.Out.Host = upstreamURL.Host
+		},
+		Transport: tapeProxy,
+	}
+
+	var handler http.Handler = rp
+	if *cors {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			rp.ServeHTTP(w, r)
+		})
+	}
+
+	addr := fmt.Sprintf(":%d", *port)
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		logger.Println("shutdown initiated")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			logger.Printf("graceful shutdown failed: %v, forcing close", err)
+			httpServer.Close()
+		}
+	}()
+
+	logger.Printf("proxy mode: listening on %s, upstream=%s, fixtures=%s", addr, *upstream, *fixtures)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
 	}
