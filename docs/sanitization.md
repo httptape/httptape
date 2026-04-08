@@ -1,10 +1,8 @@
-# Sanitization
+# Redaction
 
-Sanitization is httptape's most distinctive feature. Sensitive data (secrets, PII, credentials) is redacted or replaced with deterministic fakes **before it touches disk**. There is no "raw" recording mode -- sanitization happens on write.
+Redaction is httptape's most distinctive feature. Sensitive data (secrets, PII, credentials) is redacted or replaced with deterministic fakes **before it touches disk**. This is the second R in httptape's **Record, Redact, Replay** pipeline.
 
-## Architecture
-
-Sanitization is implemented as a `Pipeline` of `SanitizeFunc` transformations. Each function receives a `Tape` and returns a (possibly modified) copy. Functions are applied in order.
+The redaction pipeline is implemented in Go as a `Pipeline` of `SanitizeFunc` transformations (the Go types use "sanitize" terminology). Each function receives a `Tape` and returns a (possibly modified) copy. Functions are applied in order.
 
 ```go
 type SanitizeFunc func(Tape) Tape
@@ -22,7 +20,7 @@ type Sanitizer interface {
 }
 ```
 
-## Building a pipeline
+## Building a redaction pipeline
 
 ```go
 sanitizer := httptape.NewPipeline(
@@ -204,9 +202,23 @@ sanitizer := httptape.NewPipeline(
 )
 ```
 
+## CLI and Docker
+
+Redaction is available in all httptape modes (record, proxy) via a JSON config file:
+
+```bash
+# Record with redaction
+httptape record --upstream https://api.example.com --fixtures ./mocks --config redact.json
+
+# Proxy with redaction (applied to L2/disk cache only)
+httptape proxy --upstream https://api.example.com --fixtures ./cache --config redact.json
+```
+
+See [CLI](cli.md) and [Docker](docker.md) for full usage.
+
 ## Declarative configuration
 
-Instead of building pipelines in code, you can define sanitization rules in a JSON config file. See [Config](config.md) for details.
+Instead of building pipelines in code, you can define redaction rules in a JSON config file. See [Config](config.md) for details.
 
 ```json
 {
@@ -241,5 +253,6 @@ sanitizer := httptape.NewPipeline(
 ## See also
 
 - [Config](config.md) -- declarative JSON configuration
-- [Recording](recording.md) -- attaching sanitizers to recorders
+- [Recording](recording.md) -- attaching the redaction pipeline to recorders
+- [Proxy Mode](proxy.md) -- redaction in proxy mode (L2 writes only)
 - [API Reference](api-reference.md) -- full type signatures

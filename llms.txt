@@ -1,0 +1,137 @@
+# httptape
+
+> Record, Redact, Replay -- HTTP traffic recording, redaction, and replay.
+> Embeddable Go library, CLI, and Docker image.
+
+## Overview
+
+httptape captures HTTP request/response pairs ("tapes"), redacts sensitive data
+on write, and replays them as a mock server. Zero dependencies (stdlib only).
+
+## Core Types
+
+- Tape: recorded HTTP request/response pair (JSON-serializable)
+- Recorder: http.RoundTripper that records traffic to a Store
+- Server: http.Handler that replays tapes from a Store
+- Proxy: http.RoundTripper with L1/L2 caching and fallback
+- Pipeline: ordered chain of SanitizeFunc transformations (implements Sanitizer)
+- Store: persistence interface (MemoryStore, FileStore, or custom)
+- Matcher: request-to-tape matching (CompositeMatcher with scored criteria)
+
+## Recording
+
+```go
+store := httptape.NewMemoryStore()
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+defer rec.Close()
+client := &http.Client{Transport: rec}
+```
+
+Options: WithTransport, WithRoute, WithSanitizer, WithAsync, WithBufferSize,
+WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError
+
+## Redaction (Go type: Sanitizer/Pipeline)
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization", "Cookie"),
+    httptape.RedactBodyPaths("$.password", "$.ssn"),
+    httptape.FakeFields("seed", "$.email", "$.user_id"),
+)
+```
+
+- RedactHeaders: replace header values with "[REDACTED]"
+- RedactBodyPaths: type-aware JSON field redaction
+- FakeFields: deterministic HMAC-SHA256 fakes (emails, UUIDs, numbers, strings)
+
+## Replay
+
+```go
+srv := httptape.NewServer(store)
+ts := httptest.NewServer(srv)
+```
+
+Options: WithMatcher, WithFallbackStatus, WithFallbackBody, WithOnNoMatch,
+WithCORS, WithDelay, WithErrorRate, WithReplayHeaders
+
+## Proxy (fallback-to-cache)
+
+```go
+proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+// L1 = MemoryStore (raw, ephemeral), L2 = FileStore (redacted, persistent)
+// Success: cache to both, return real response
+// Failure: fallback L1 -> L2 -> original error
+```
+
+X-Httptape-Source header: "l1-cache" or "l2-cache" when serving from cache.
+
+## Matching
+
+CompositeMatcher with scored criteria:
+- MatchMethod (1), MatchPath (2), MatchHeaders (3), MatchQueryParams (4),
+  MatchBodyFuzzy (6), MatchBodyHash (8), MatchPathRegex (1), MatchRoute (1)
+
+## Storage
+
+- MemoryStore: in-memory, for tests
+- FileStore: one JSON file per tape, atomic writes, WithDirectory option
+- Store interface: Save, Load, List, Delete
+
+## Mock DSL
+
+```go
+srv := httptape.Mock(
+    httptape.When(httptape.GET("/api/users")).Respond(200, httptape.JSON(`[]`)).Build(),
+)
+defer srv.Close()
+```
+
+## CLI Commands
+
+```
+httptape serve   --fixtures <dir> [--port 8081] [--cors] [--delay 200ms]
+httptape record  --upstream <url> --fixtures <dir> [--config redact.json]
+httptape proxy   --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
+httptape export  --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
+httptape import  --fixtures <dir> [--input file.tar.gz]
+```
+
+## Docker
+
+```
+docker pull ghcr.io/vibewarden/httptape:latest
+# ~10 MB scratch image, runs as non-root (65534)
+```
+
+## JSON Config (redaction rules)
+
+```json
+{"version":"1","rules":[
+  {"action":"redact_headers","headers":["Authorization"]},
+  {"action":"redact_body","paths":["$.password"]},
+  {"action":"fake","seed":"s","paths":["$.email"]}
+]}
+```
+
+## Key APIs
+
+```go
+func NewRecorder(store Store, opts ...RecorderOption) *Recorder
+func NewServer(store Store, opts ...ServerOption) *Server
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewPipeline(funcs ...SanitizeFunc) *Pipeline
+func NewMemoryStore() *MemoryStore
+func NewFileStore(opts ...FileStoreOption) (*FileStore, error)
+func LoadFixtures(dir string) (*FileStore, error)
+func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
+func ExportBundle(ctx, store, opts...) (io.Reader, error)
+func ImportBundle(ctx, store, reader) error
+func LoadConfigFile(path string) (*Config, error)
+```
+
+## Links
+
+- Repo: https://github.com/VibeWarden/httptape
+- Docs: https://vibewarden.dev/docs/httptape
+- Go pkg: https://pkg.go.dev/github.com/VibeWarden/httptape
+- Docker: ghcr.io/vibewarden/httptape

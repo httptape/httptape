@@ -161,6 +161,6 @@ Reference it in your config file:
 
 ## See also
 
-- [Sanitization](sanitization.md) -- programmatic pipeline API
+- [Redaction](sanitization.md) -- programmatic redaction pipeline API
 - [CLI](cli.md) -- using config files with the CLI
 - [Docker](docker.md) -- mounting config files into containers

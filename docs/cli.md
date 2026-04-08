@@ -1,6 +1,6 @@
 # CLI Reference
 
-httptape includes a standalone CLI binary for HTTP traffic recording, sanitization, and replay. It is a thin wrapper over the httptape library.
+httptape includes a standalone CLI binary for HTTP traffic recording, redaction, and replay. It is a thin wrapper over the httptape library and works with any language or framework via HTTP.
 
 ## Install
 
@@ -25,6 +25,10 @@ httptape serve --fixtures ./fixtures [flags]
 | `--fixtures` | (required) | Path to fixture directory |
 | `--port` | `8081` | Listen port |
 | `--fallback-status` | `404` | HTTP status when no tape matches |
+| `--cors` | `false` | Enable CORS headers (Access-Control-Allow-Origin: *) |
+| `--delay` | `0` | Fixed delay before every response (e.g., `200ms`, `1s`) |
+| `--error-rate` | `0` | Fraction of requests that return 500 (0.0-1.0) |
+| `--replay-header` | (none) | Header to inject into responses (`Key=Value`, repeatable) |
 
 The server uses `DefaultMatcher` (method + path matching) and loads fixtures from the specified directory. It shuts down gracefully on SIGINT/SIGTERM.
 
@@ -36,7 +40,7 @@ httptape serve --fixtures ./testdata/fixtures --port 9090 --fallback-status 502
 
 ### record
 
-Proxy requests to an upstream server, record and sanitize responses.
+Proxy requests to an upstream server, record and redact responses.
 
 ```bash
 httptape record --upstream <url> --fixtures <dir> [flags]
@@ -46,10 +50,11 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory |
-| `--config` | (none) | Path to sanitization config JSON |
+| `--config` | (none) | Path to redaction config JSON |
 | `--port` | `8081` | Listen port |
+| `--cors` | `false` | Enable CORS headers |
 
-The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional sanitization) to the fixtures directory.
+The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
 
 The upstream URL must include the scheme and host (e.g., `https://api.example.com`).
 
@@ -59,11 +64,47 @@ The upstream URL must include the scheme and host (e.g., `https://api.example.co
 httptape record \
   --upstream https://api.github.com \
   --fixtures ./fixtures \
-  --config sanitize.json \
+  --config redact.json \
   --port 8081
 ```
 
-Then point your application at `http://localhost:8081` instead of the real API. All traffic is recorded and sanitized.
+Then point your application at `http://localhost:8081` instead of the real API. All traffic is recorded and redacted.
+
+### proxy
+
+Forward requests to an upstream server with two-tier caching and automatic fallback. See [Proxy Mode](proxy.md) for a full guide.
+
+```bash
+httptape proxy --upstream <url> --fixtures <dir> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
+| `--fixtures` | (required) | Path to fixture directory for L2 (persistent) cache |
+| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--port` | `8081` | Listen port |
+| `--cors` | `false` | Enable CORS headers |
+| `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
+
+When the upstream is reachable, requests are forwarded and responses are cached:
+
+- **L1 (memory):** raw, unsanitized responses for best within-session fidelity
+- **L2 (disk):** redacted responses that persist across restarts
+
+When the upstream is unreachable (or returns 5xx with `--fallback-on-5xx`), the proxy serves cached responses. The `X-Httptape-Source` header indicates whether a response came from `l1-cache`, `l2-cache`, or the real upstream (header absent).
+
+**Example:**
+
+```bash
+httptape proxy \
+  --upstream https://api.staging.example.com \
+  --fixtures ./cache \
+  --config redact.json \
+  --port 3001 \
+  --cors \
+  --fallback-on-5xx
+```
 
 ### export
 
@@ -134,7 +175,7 @@ cat bundle.tar.gz | httptape import --fixtures ./fixtures
 
 ## Signal handling
 
-The `serve` and `record` commands handle SIGINT and SIGTERM for graceful shutdown:
+The `serve`, `record`, and `proxy` commands handle SIGINT and SIGTERM for graceful shutdown:
 
 1. Stop accepting new connections
 2. Wait up to 5 seconds for in-flight requests
@@ -144,11 +185,11 @@ The `serve` and `record` commands handle SIGINT and SIGTERM for graceful shutdow
 ## Typical workflow
 
 ```bash
-# 1. Record traffic from a real API
+# 1. Record traffic from a real API (with redaction)
 httptape record \
   --upstream https://api.example.com \
   --fixtures ./fixtures \
-  --config sanitize.json
+  --config redact.json
 
 # 2. Export the fixtures
 httptape export --fixtures ./fixtures --output fixtures.tar.gz
@@ -162,6 +203,7 @@ httptape serve --fixtures ./ci-fixtures --port 8081
 
 ## See also
 
-- [Config](config.md) -- sanitization config file format
+- [Proxy Mode](proxy.md) -- full guide to proxy mode with L1/L2 caching
+- [Config](config.md) -- redaction config file format
 - [Docker](docker.md) -- running httptape in containers
 - [Import/Export](import-export.md) -- programmatic API

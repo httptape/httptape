@@ -156,6 +156,6 @@ client := &http.Client{Transport: rec}
 
 ## See also
 
-- [Sanitization](sanitization.md) -- configure what gets redacted
+- [Redaction](sanitization.md) -- configure what gets redacted
 - [Storage](storage.md) -- where tapes are stored
 - [Config](config.md) -- declarative sanitizer configuration

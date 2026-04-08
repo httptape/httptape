@@ -1,0 +1,4120 @@
+# httptape
+
+> Record, Redact, Replay -- HTTP traffic recording, redaction, and replay.
+> Embeddable Go library, CLI, and Docker image.
+
+## Overview
+
+httptape captures HTTP request/response pairs ("tapes"), redacts sensitive data
+on write, and replays them as a mock server. Zero dependencies (stdlib only).
+
+## Core Types
+
+- Tape: recorded HTTP request/response pair (JSON-serializable)
+- Recorder: http.RoundTripper that records traffic to a Store
+- Server: http.Handler that replays tapes from a Store
+- Proxy: http.RoundTripper with L1/L2 caching and fallback
+- Pipeline: ordered chain of SanitizeFunc transformations (implements Sanitizer)
+- Store: persistence interface (MemoryStore, FileStore, or custom)
+- Matcher: request-to-tape matching (CompositeMatcher with scored criteria)
+
+## Recording
+
+```go
+store := httptape.NewMemoryStore()
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+defer rec.Close()
+client := &http.Client{Transport: rec}
+```
+
+Options: WithTransport, WithRoute, WithSanitizer, WithAsync, WithBufferSize,
+WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError
+
+## Redaction (Go type: Sanitizer/Pipeline)
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization", "Cookie"),
+    httptape.RedactBodyPaths("$.password", "$.ssn"),
+    httptape.FakeFields("seed", "$.email", "$.user_id"),
+)
+```
+
+- RedactHeaders: replace header values with "[REDACTED]"
+- RedactBodyPaths: type-aware JSON field redaction
+- FakeFields: deterministic HMAC-SHA256 fakes (emails, UUIDs, numbers, strings)
+
+## Replay
+
+```go
+srv := httptape.NewServer(store)
+ts := httptest.NewServer(srv)
+```
+
+Options: WithMatcher, WithFallbackStatus, WithFallbackBody, WithOnNoMatch,
+WithCORS, WithDelay, WithErrorRate, WithReplayHeaders
+
+## Proxy (fallback-to-cache)
+
+```go
+proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+// L1 = MemoryStore (raw, ephemeral), L2 = FileStore (redacted, persistent)
+// Success: cache to both, return real response
+// Failure: fallback L1 -> L2 -> original error
+```
+
+X-Httptape-Source header: "l1-cache" or "l2-cache" when serving from cache.
+
+## Matching
+
+CompositeMatcher with scored criteria:
+- MatchMethod (1), MatchPath (2), MatchHeaders (3), MatchQueryParams (4),
+  MatchBodyFuzzy (6), MatchBodyHash (8), MatchPathRegex (1), MatchRoute (1)
+
+## Storage
+
+- MemoryStore: in-memory, for tests
+- FileStore: one JSON file per tape, atomic writes, WithDirectory option
+- Store interface: Save, Load, List, Delete
+
+## Mock DSL
+
+```go
+srv := httptape.Mock(
+    httptape.When(httptape.GET("/api/users")).Respond(200, httptape.JSON(`[]`)).Build(),
+)
+defer srv.Close()
+```
+
+## CLI Commands
+
+```
+httptape serve   --fixtures <dir> [--port 8081] [--cors] [--delay 200ms]
+httptape record  --upstream <url> --fixtures <dir> [--config redact.json]
+httptape proxy   --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
+httptape export  --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
+httptape import  --fixtures <dir> [--input file.tar.gz]
+```
+
+## Docker
+
+```
+docker pull ghcr.io/vibewarden/httptape:latest
+# ~10 MB scratch image, runs as non-root (65534)
+```
+
+## JSON Config (redaction rules)
+
+```json
+{"version":"1","rules":[
+  {"action":"redact_headers","headers":["Authorization"]},
+  {"action":"redact_body","paths":["$.password"]},
+  {"action":"fake","seed":"s","paths":["$.email"]}
+]}
+```
+
+## Key APIs
+
+```go
+func NewRecorder(store Store, opts ...RecorderOption) *Recorder
+func NewServer(store Store, opts ...ServerOption) *Server
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewPipeline(funcs ...SanitizeFunc) *Pipeline
+func NewMemoryStore() *MemoryStore
+func NewFileStore(opts ...FileStoreOption) (*FileStore, error)
+func LoadFixtures(dir string) (*FileStore, error)
+func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
+func ExportBundle(ctx, store, opts...) (io.Reader, error)
+func ImportBundle(ctx, store, reader) error
+func LoadConfigFile(path string) (*Config, error)
+```
+
+## Links
+
+- Repo: https://github.com/VibeWarden/httptape
+- Docs: https://vibewarden.dev/docs/httptape
+- Go pkg: https://pkg.go.dev/github.com/VibeWarden/httptape
+- Docker: ghcr.io/vibewarden/httptape
+# httptape
+
+**Record, Redact, Replay** -- HTTP traffic recording, redaction, and replay.
+
+httptape captures HTTP request/response pairs, redacts sensitive data on write, and replays them as a mock server. It ships as an embeddable Go library, a standalone CLI, and a minimal Docker image.
+
+## The 3 Rs
+
+1. **Record** -- wrap any `http.RoundTripper` to capture real HTTP traffic, or use the CLI/Docker to record from an upstream API
+2. **Redact** -- strip secrets, PII, and credentials on write via a configurable redaction pipeline, before anything touches disk
+3. **Replay** -- serve recorded fixtures as a deterministic mock `http.Handler`, or run a standalone mock server via CLI/Docker
+
+## Why httptape?
+
+**WireMock requires Java.** Separate process, 200 MB+ memory, can't embed in a Go binary.
+
+**Go mocking libraries** (`gock`, `httpmock`) only work inside test code. No standalone server, no recording, no fixture management.
+
+**Nobody does redaction.** Existing tools record raw traffic including secrets and PII. Redaction is always an afterthought. httptape redacts on write -- sensitive data never hits disk.
+
+## Key features
+
+- **Record** -- wrap any `http.RoundTripper` to capture real HTTP traffic
+- **Redact on write** -- strip headers, body fields, or replace values with deterministic fakes before storage
+- **Replay** -- serve recorded fixtures as a mock `http.Handler`
+- **Proxy with fallback** -- forward to upstream with automatic fallback to cached responses when the backend is down
+- **Composable matching** -- match requests by method, path, query params, headers, body hash, or fuzzy body fields
+- **Pluggable storage** -- in-memory for tests, filesystem for fixtures, or implement your own `Store`
+- **Import/export** -- share fixture bundles as `tar.gz` archives between environments
+- **Zero dependencies** -- stdlib only, no transitive deps for embedders
+- **CLI and Docker** -- use as a standalone proxy for recording, replaying, and caching
+
+## Install
+
+=== "Go library"
+
+    ```bash
+    go get github.com/VibeWarden/httptape
+    ```
+
+=== "CLI"
+
+    ```bash
+    go install github.com/VibeWarden/httptape/cmd/httptape@latest
+    ```
+
+=== "Docker"
+
+    ```bash
+    docker pull ghcr.io/vibewarden/httptape:latest
+    ```
+
+Requires Go 1.22 or later for the library/CLI. Docker works with any platform.
+
+## Quick example
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "net/http/httptest"
+
+    "github.com/VibeWarden/httptape"
+)
+
+func main() {
+    store := httptape.NewMemoryStore()
+
+    // Record
+    rec := httptape.NewRecorder(store, httptape.WithRoute("github"))
+    client := &http.Client{Transport: rec}
+    client.Get("https://api.github.com/users/octocat")
+    rec.Close()
+
+    // Replay
+    srv := httptape.NewServer(store)
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    resp, _ := http.Get(ts.URL + "/users/octocat")
+    fmt.Println(resp.StatusCode) // 200
+}
+```
+
+Or using the CLI:
+
+```bash
+# Record from a real API (with redaction)
+httptape record --upstream https://api.github.com --fixtures ./mocks --config redact.json
+
+# Replay as a mock server
+httptape serve --fixtures ./mocks --port 8081
+
+# Proxy with automatic fallback
+httptape proxy --upstream https://api.github.com --fixtures ./cache
+```
+
+## Documentation
+
+| Page | Description |
+|------|-------------|
+| [Getting Started](getting-started.md) | Record, redact, and replay in 5 minutes |
+| [Recording](recording.md) | Recorder options, async/sync, sampling, body limits |
+| [Replay](replay.md) | Server options, fallback behavior, request handling |
+| [Redaction](sanitization.md) | RedactHeaders, RedactBodyPaths, FakeFields, Pipeline |
+| [Proxy Mode](proxy.md) | L1/L2 caching, fallback behavior, frontend dev |
+| [Matching](matching.md) | All matchers, CompositeMatcher, score weights |
+| [Storage](storage.md) | MemoryStore, FileStore, custom Store implementations |
+| [Import/Export](import-export.md) | ExportBundle, ImportBundle, selective filters |
+| [Config](config.md) | Declarative JSON configuration for redaction |
+| [CLI](cli.md) | serve, record, proxy, export, import commands |
+| [Docker](docker.md) | Container usage, docker-compose, volumes |
+| [Testcontainers](testcontainers.md) | Go Testcontainers module for integration tests |
+| [API Reference](api-reference.md) | All exported types, functions, and options |
+
+## License
+
+[Apache 2.0](https://github.com/VibeWarden/httptape/blob/main/LICENSE)
+# Getting Started
+
+Record, Redact, and Replay HTTP traffic in 5 minutes.
+
+## Prerequisites
+
+- Go 1.22 or later (for the Go library)
+- Or: Docker (for CLI/Docker usage with any language)
+- `go get github.com/VibeWarden/httptape`
+
+## Step 1: Record HTTP traffic
+
+Wrap any `http.RoundTripper` with a `Recorder` to capture traffic:
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+
+    "github.com/VibeWarden/httptape"
+)
+
+func main() {
+    // Create a file-backed store for persistent fixtures
+    store, err := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+    if err != nil {
+        panic(err)
+    }
+
+    // Create a recorder that wraps http.DefaultTransport
+    rec := httptape.NewRecorder(store,
+        httptape.WithRoute("github-api"),
+    )
+    defer rec.Close() // Always close to flush pending recordings
+
+    // Use it as a normal http.Client
+    client := &http.Client{Transport: rec}
+    resp, err := client.Get("https://api.github.com/users/octocat")
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    fmt.Println("Recorded:", resp.StatusCode)
+    // A JSON fixture file is now saved in ./fixtures/
+}
+```
+
+After running this, check `./fixtures/` -- you will see a JSON file containing the full request and response.
+
+## Step 2: Replay recorded traffic
+
+Serve the recorded fixtures as a mock HTTP server:
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "net/http/httptest"
+
+    "github.com/VibeWarden/httptape"
+)
+
+func main() {
+    store, err := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+    if err != nil {
+        panic(err)
+    }
+
+    srv := httptape.NewServer(store)
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    // Requests are matched against recorded tapes by method + path
+    resp, err := http.Get(ts.URL + "/users/octocat")
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    fmt.Println("Replayed:", resp.StatusCode) // 200
+}
+```
+
+## Step 3: Redact sensitive data
+
+Strip secrets and PII before anything touches disk:
+
+```go
+package main
+
+import (
+    "net/http"
+
+    "github.com/VibeWarden/httptape"
+)
+
+func main() {
+    store, err := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+    if err != nil {
+        panic(err)
+    }
+
+    // Build a sanitization pipeline
+    sanitizer := httptape.NewPipeline(
+        httptape.RedactHeaders(),                              // redact Authorization, Cookie, etc.
+        httptape.RedactBodyPaths("$.password", "$.ssn"),       // redact specific body fields
+        httptape.FakeFields("my-project-seed", "$.user.email", "$.user.id"), // deterministic fakes
+    )
+
+    rec := httptape.NewRecorder(store,
+        httptape.WithRoute("users-api"),
+        httptape.WithSanitizer(sanitizer),
+    )
+    defer rec.Close()
+
+    client := &http.Client{Transport: rec}
+    client.Post("https://api.example.com/users", "application/json",
+        nil, // your request body here
+    )
+
+    // The fixture file now has:
+    // - Authorization header replaced with "[REDACTED]"
+    // - $.password replaced with "[REDACTED]"
+    // - $.user.email replaced with "user_a1b2c3d4@example.com" (deterministic)
+    // - $.user.id replaced with a deterministic number
+}
+```
+
+## Step 4: Use in tests
+
+The most common pattern -- record once, replay in every test run:
+
+```go
+package myapi_test
+
+import (
+    "net/http"
+    "net/http/httptest"
+    "testing"
+
+    "github.com/VibeWarden/httptape"
+)
+
+func TestUserAPI(t *testing.T) {
+    store, err := httptape.NewFileStore(
+        httptape.WithDirectory("testdata/fixtures"),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    srv := httptape.NewServer(store)
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    // Point your API client at the mock server
+    resp, err := http.Get(ts.URL + "/users/octocat")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if resp.StatusCode != 200 {
+        t.Errorf("expected 200, got %d", resp.StatusCode)
+    }
+}
+```
+
+## Using in-memory store for tests
+
+For tests that don't need persistent fixtures:
+
+```go
+func TestWithMemoryStore(t *testing.T) {
+    store := httptape.NewMemoryStore()
+
+    // Record
+    rec := httptape.NewRecorder(store, httptape.WithRoute("test"))
+    client := &http.Client{Transport: rec}
+    client.Get("https://api.example.com/data")
+    rec.Close()
+
+    // Replay
+    srv := httptape.NewServer(store)
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    resp, _ := http.Get(ts.URL + "/data")
+    // assert on resp...
+    _ = resp
+}
+```
+
+## Next steps
+
+- [Recording](recording.md) -- async/sync modes, sampling, body size limits
+- [Redaction](sanitization.md) -- full guide to redaction and faking
+- [Proxy Mode](proxy.md) -- forward to upstream with fallback-to-cache
+- [Matching](matching.md) -- control how requests match recorded tapes
+- [CLI](cli.md) -- use httptape as a standalone tool (any language)
+# Recording
+
+The `Recorder` is an `http.RoundTripper` that wraps an inner transport and captures every HTTP request/response pair as a `Tape`. It is the entry point for all recording in httptape.
+
+## Basic usage
+
+```go
+store := httptape.NewMemoryStore()
+rec := httptape.NewRecorder(store)
+defer rec.Close()
+
+client := &http.Client{Transport: rec}
+resp, err := client.Get("https://api.example.com/users")
+// resp is the real response -- recording is transparent
+```
+
+The `Recorder` never modifies the response returned to the caller. The only observable side effect is that `resp.Body` is fully read into memory and replaced with a new reader (so both the caller and the recorder can access the body).
+
+## Constructor
+
+```go
+func NewRecorder(store Store, opts ...RecorderOption) *Recorder
+```
+
+The `store` parameter is required and must not be nil (panics if nil). All other behavior is configured via options.
+
+## Options
+
+### WithTransport
+
+```go
+httptape.WithTransport(rt http.RoundTripper)
+```
+
+Sets the inner transport. Defaults to `http.DefaultTransport`. Use this to wrap a custom transport or chain with other middleware.
+
+### WithRoute
+
+```go
+httptape.WithRoute("users-api")
+```
+
+Labels all tapes produced by this recorder with a route name. Routes are used for:
+- Logical grouping of fixtures
+- Filtering during [export](import-export.md)
+- Scoped matching with [MatchRoute](matching.md#matchroute)
+
+### WithSanitizer
+
+```go
+httptape.WithSanitizer(sanitizer)
+```
+
+Sets a `Sanitizer` to transform tapes before persistence. If nil, a no-op pipeline is used. See [Sanitization](sanitization.md) for details.
+
+### WithAsync
+
+```go
+httptape.WithAsync(true)  // default
+httptape.WithAsync(false) // synchronous writes
+```
+
+Controls whether tapes are written asynchronously (via a buffered channel and background goroutine) or synchronously (inline during `RoundTrip`).
+
+**Async mode (default):** Tapes are sent to a buffered channel. A background goroutine drains the channel and writes to the store. `RoundTrip` returns immediately after sending to the channel. If the channel is full, the tape is dropped and `OnError` is called.
+
+**Sync mode:** Tapes are written to the store directly inside `RoundTrip`. Store errors are reported via `OnError` but never affect the HTTP response.
+
+### WithBufferSize
+
+```go
+httptape.WithBufferSize(2048)
+```
+
+Sets the channel buffer size for async mode. Defaults to 1024. Ignored in sync mode. Values less than 1 are set to 1.
+
+### WithSampling
+
+```go
+httptape.WithSampling(0.01) // record 1% of requests
+httptape.WithSampling(1.0)  // record everything (default)
+httptape.WithSampling(0.0)  // record nothing
+```
+
+Sets a probabilistic sampling rate. Values are clamped to [0.0, 1.0]. When a request is not sampled, it is passed through to the inner transport without recording.
+
+This is useful for production traffic capture where recording every request would be too expensive.
+
+### WithMaxBodySize
+
+```go
+httptape.WithMaxBodySize(1 << 20) // 1 MB limit
+```
+
+Sets the maximum body size in bytes for both request and response bodies. Bodies exceeding this limit are truncated, and the `Truncated` flag is set on the recorded request/response. The `OriginalBodySize` field records the pre-truncation size. A value of 0 (default) means no limit.
+
+### WithSkipRedirects
+
+```go
+httptape.WithSkipRedirects(true)
+```
+
+When enabled, intermediate 3xx redirect responses are not recorded. Only the final non-redirect response is stored. This is useful when the `http.Client` follows redirects automatically -- each redirect hop produces a separate `RoundTrip` call, and recording all of them clutters the fixture set.
+
+### WithOnError
+
+```go
+httptape.WithOnError(func(err error) {
+    log.Printf("recording error: %v", err)
+})
+```
+
+Sets a callback for async write errors, body truncation warnings, and other non-fatal errors. The callback is invoked from the background goroutine (async mode) or inline (sync mode), so it must be safe for concurrent use. Defaults to a no-op.
+
+## Closing the recorder
+
+```go
+rec.Close()
+```
+
+Always call `Close` when recording is complete. In async mode, `Close` flushes all pending tapes from the channel and waits for the background goroutine to finish. In sync mode, `Close` is a no-op. `Close` is idempotent -- safe to call multiple times.
+
+After `Close` returns, any further `RoundTrip` calls pass through to the inner transport without recording.
+
+## Thread safety
+
+`Recorder` is safe for concurrent use. Multiple goroutines can call `RoundTrip` simultaneously. `Close` must be called exactly once when recording is complete (though calling it multiple times is safe due to `sync.Once`).
+
+## Full example
+
+```go
+store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders(),
+    httptape.RedactBodyPaths("$.password"),
+)
+
+rec := httptape.NewRecorder(store,
+    httptape.WithRoute("payments-api"),
+    httptape.WithSanitizer(sanitizer),
+    httptape.WithAsync(true),
+    httptape.WithBufferSize(2048),
+    httptape.WithSampling(0.1),       // 10% sampling
+    httptape.WithMaxBodySize(5<<20),   // 5 MB body limit
+    httptape.WithSkipRedirects(true),
+    httptape.WithOnError(func(err error) {
+        log.Printf("recorder: %v", err)
+    }),
+)
+defer rec.Close()
+
+client := &http.Client{Transport: rec}
+// Use client normally...
+```
+
+## See also
+
+- [Redaction](sanitization.md) -- configure what gets redacted
+- [Storage](storage.md) -- where tapes are stored
+- [Config](config.md) -- declarative sanitizer configuration
+# Replay
+
+The `Server` is an `http.Handler` that replays recorded HTTP interactions. It receives incoming requests, finds a matching `Tape` via a `Matcher`, and writes the recorded response.
+
+## Basic usage
+
+```go
+store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+
+srv := httptape.NewServer(store)
+ts := httptest.NewServer(srv)
+defer ts.Close()
+
+// Requests to ts.URL are matched against recorded tapes
+resp, _ := http.Get(ts.URL + "/users/octocat")
+```
+
+## Constructor
+
+```go
+func NewServer(store Store, opts ...ServerOption) *Server
+```
+
+The `store` parameter is required and must not be nil (panics if nil).
+
+## Options
+
+### WithMatcher
+
+```go
+httptape.WithMatcher(matcher)
+```
+
+Sets the `Matcher` used to find tapes for incoming requests. If not set, `DefaultMatcher()` is used, which matches by HTTP method and URL path.
+
+See [Matching](matching.md) for all available matchers.
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithMatcher(httptape.NewCompositeMatcher(
+        httptape.MatchMethod(),
+        httptape.MatchPath(),
+        httptape.MatchQueryParams(),
+    )),
+)
+```
+
+### WithFallbackStatus
+
+```go
+httptape.WithFallbackStatus(502)
+```
+
+Sets the HTTP status code returned when no tape matches the incoming request. Defaults to 404.
+
+### WithFallbackBody
+
+```go
+httptape.WithFallbackBody([]byte(`{"error": "no mock found"}`))
+```
+
+Sets the response body returned when no tape matches. Defaults to `"httptape: no matching tape found"`.
+
+### WithOnNoMatch
+
+```go
+httptape.WithOnNoMatch(func(r *http.Request) {
+    log.Printf("unmatched request: %s %s", r.Method, r.URL.Path)
+})
+```
+
+Sets a callback invoked when no tape matches an incoming request. The callback runs before the fallback response is written. Must be safe for concurrent use.
+
+This is useful for debugging which requests are not being matched during test development.
+
+## How replay works
+
+For each incoming request, the `Server`:
+
+1. Calls `Store.List` with an empty filter to retrieve all tapes
+2. Passes the request and all tapes to the `Matcher`
+3. If a match is found, writes the tape's response headers, status code, and body
+4. If no match is found, calls `OnNoMatch` (if set) and writes the fallback response
+
+The `Content-Length` header from the recorded response is removed and re-calculated by `net/http` to ensure it matches the actual body (which may have been modified by sanitization).
+
+## Using with httptest
+
+The most common pattern for tests:
+
+```go
+func TestMyAPI(t *testing.T) {
+    store, err := httptape.NewFileStore(
+        httptape.WithDirectory("testdata/fixtures"),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    srv := httptape.NewServer(store,
+        httptape.WithOnNoMatch(func(r *http.Request) {
+            t.Errorf("unmatched: %s %s", r.Method, r.URL.Path)
+        }),
+    )
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    // Point your code at ts.URL instead of the real API
+    client := NewAPIClient(ts.URL)
+    user, err := client.GetUser("octocat")
+    if err != nil {
+        t.Fatal(err)
+    }
+    // assert on user...
+}
+```
+
+## Using as a standalone server
+
+The `Server` implements `http.Handler`, so it can be used with any HTTP server:
+
+```go
+store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+srv := httptape.NewServer(store)
+
+log.Println("Mock server on :8081")
+http.ListenAndServe(":8081", srv)
+```
+
+For standalone use, consider the [CLI](cli.md) which wraps this pattern.
+
+## Thread safety
+
+`Server` is safe for concurrent use. All fields are immutable after construction. `ServeHTTP` can be called from multiple goroutines simultaneously.
+
+## Performance note
+
+The server calls `Store.List` on every request, resulting in an O(n) scan over all tapes. This is acceptable for test usage with small fixture sets (up to a few hundred tapes). For large fixture sets, consider scoping fixtures by route.
+
+## See also
+
+- [Matching](matching.md) -- control how requests are matched to tapes
+- [Storage](storage.md) -- where tapes are loaded from
+- [CLI](cli.md) -- standalone serve mode
+# Redaction
+
+Redaction is httptape's most distinctive feature. Sensitive data (secrets, PII, credentials) is redacted or replaced with deterministic fakes **before it touches disk**. This is the second R in httptape's **Record, Redact, Replay** pipeline.
+
+The redaction pipeline is implemented in Go as a `Pipeline` of `SanitizeFunc` transformations (the Go types use "sanitize" terminology). Each function receives a `Tape` and returns a (possibly modified) copy. Functions are applied in order.
+
+```go
+type SanitizeFunc func(Tape) Tape
+
+type Pipeline struct { /* ... */ }
+func NewPipeline(funcs ...SanitizeFunc) *Pipeline
+func (p *Pipeline) Sanitize(t Tape) Tape
+```
+
+The `Pipeline` implements the `Sanitizer` interface, which the `Recorder` accepts:
+
+```go
+type Sanitizer interface {
+    Sanitize(Tape) Tape
+}
+```
+
+## Building a redaction pipeline
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders(),
+    httptape.RedactBodyPaths("$.password", "$.ssn"),
+    httptape.FakeFields("my-seed", "$.email", "$.user_id"),
+)
+
+rec := httptape.NewRecorder(store,
+    httptape.WithSanitizer(sanitizer),
+)
+```
+
+Functions are applied in order. In this example: headers are redacted first, then body fields are redacted, then remaining fields get deterministic fakes.
+
+## RedactHeaders
+
+Replaces header values with `"[REDACTED]"` in both request and response headers.
+
+```go
+// Redact the default sensitive headers:
+httptape.RedactHeaders()
+```
+
+Default sensitive headers:
+- `Authorization` -- bearer tokens, basic auth
+- `Cookie` -- session tokens
+- `Set-Cookie` -- server-set sessions
+- `X-Api-Key` -- API key auth
+- `Proxy-Authorization` -- proxy auth
+- `X-Forwarded-For` -- client IPs (PII)
+
+To redact specific headers:
+
+```go
+httptape.RedactHeaders("Authorization", "X-Custom-Secret", "X-Internal-Token")
+```
+
+Header matching is case-insensitive per the HTTP spec.
+
+You can retrieve the default list programmatically:
+
+```go
+defaults := httptape.DefaultSensitiveHeaders()
+// ["Authorization", "Cookie", "Set-Cookie", "X-Api-Key", "Proxy-Authorization", "X-Forwarded-For"]
+```
+
+## RedactBodyPaths
+
+Redacts fields within JSON request and response bodies at specified paths.
+
+```go
+httptape.RedactBodyPaths("$.password", "$.user.ssn", "$.tokens[*].value")
+```
+
+### Path syntax
+
+Paths use a JSONPath-like syntax:
+
+| Pattern | Description |
+|---------|-------------|
+| `$.field` | Top-level field |
+| `$.nested.field` | Nested field access |
+| `$.array[*].field` | Field within each element of an array |
+
+### Redaction behavior
+
+Redacted values are type-aware:
+
+| JSON type | Redacted value |
+|-----------|---------------|
+| string | `"[REDACTED]"` |
+| number | `0` |
+| boolean | `false` |
+| null, object, array | Unchanged |
+
+If the body is not valid JSON, it is left unchanged (no error). Missing paths are silently skipped.
+
+### Example
+
+Input body:
+```json
+{
+  "username": "alice",
+  "password": "s3cret",
+  "profile": {
+    "ssn": "123-45-6789"
+  }
+}
+```
+
+With `RedactBodyPaths("$.password", "$.profile.ssn")`:
+
+```json
+{
+  "username": "alice",
+  "password": "[REDACTED]",
+  "profile": {
+    "ssn": "[REDACTED]"
+  }
+}
+```
+
+## FakeFields
+
+Replaces field values with deterministic fakes derived from HMAC-SHA256. The same seed and input value always produce the same fake output, preserving cross-fixture consistency.
+
+```go
+httptape.FakeFields("my-project-seed",
+    "$.user.email",
+    "$.user.id",
+    "$.tokens[*].value",
+)
+```
+
+### The seed parameter
+
+The first argument is a project-level seed used as the HMAC key. Different seeds produce different fakes. The same seed and input always produce the same output.
+
+Choose a seed that is unique to your project. It does not need to be secret -- it is used for determinism, not security.
+
+### Faking strategies
+
+The fake value depends on the detected type of the original value:
+
+| Detected type | Fake format | Example |
+|--------------|-------------|---------|
+| Email (contains `@`) | `user_<hash>@example.com` | `user_a1b2c3d4@example.com` |
+| UUID (8-4-4-4-12 hex) | Deterministic UUID v5 | `a1b2c3d4-e5f6-5789-abcd-0123456789ab` |
+| Number (float64) | Positive integer [1, 2^31-1] | `1234567890` |
+| Other string | `fake_<hash>` | `fake_a1b2c3d4` |
+| Boolean, null, object, array | Unchanged | -- |
+
+### Example
+
+Input body:
+```json
+{
+  "user": {
+    "email": "alice@company.com",
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "Alice Smith"
+  }
+}
+```
+
+With `FakeFields("my-seed", "$.user.email", "$.user.id", "$.user.name")`:
+
+```json
+{
+  "user": {
+    "email": "user_7f3a2b1c@example.com",
+    "id": "7f3a2b1c-4d5e-5f60-8a9b-c0d1e2f3a4b5",
+    "name": "fake_7f3a2b1c"
+  }
+}
+```
+
+The key property: if `alice@company.com` appears in another fixture, it will be faked to the same value. This preserves relational consistency across your fixture set.
+
+## Combining redaction and faking
+
+Order matters. Typically, redact first (remove things that should be gone entirely), then fake (replace things that need consistent stand-in values):
+
+```go
+sanitizer := httptape.NewPipeline(
+    // Step 1: Remove sensitive headers entirely
+    httptape.RedactHeaders(),
+
+    // Step 2: Redact body fields that should be blank
+    httptape.RedactBodyPaths("$.password", "$.credit_card.number"),
+
+    // Step 3: Replace PII with deterministic fakes
+    httptape.FakeFields("my-seed",
+        "$.user.email",
+        "$.user.phone",
+        "$.user.id",
+    ),
+)
+```
+
+## CLI and Docker
+
+Redaction is available in all httptape modes (record, proxy) via a JSON config file:
+
+```bash
+# Record with redaction
+httptape record --upstream https://api.example.com --fixtures ./mocks --config redact.json
+
+# Proxy with redaction (applied to L2/disk cache only)
+httptape proxy --upstream https://api.example.com --fixtures ./cache --config redact.json
+```
+
+See [CLI](cli.md) and [Docker](docker.md) for full usage.
+
+## Declarative configuration
+
+Instead of building pipelines in code, you can define redaction rules in a JSON config file. See [Config](config.md) for details.
+
+```json
+{
+  "version": "1",
+  "rules": [
+    { "action": "redact_headers" },
+    { "action": "redact_body", "paths": ["$.password"] },
+    { "action": "fake", "seed": "my-seed", "paths": ["$.user.email"] }
+  ]
+}
+```
+
+## Custom sanitize functions
+
+You can write your own `SanitizeFunc` and add it to the pipeline:
+
+```go
+func maskIPAddresses() httptape.SanitizeFunc {
+    return func(t httptape.Tape) httptape.Tape {
+        // Your custom transformation logic
+        // Remember: do not mutate the input tape -- copy fields you modify
+        return t
+    }
+}
+
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders(),
+    maskIPAddresses(),
+)
+```
+
+## See also
+
+- [Config](config.md) -- declarative JSON configuration
+- [Recording](recording.md) -- attaching the redaction pipeline to recorders
+- [Proxy Mode](proxy.md) -- redaction in proxy mode (L2 writes only)
+- [API Reference](api-reference.md) -- full type signatures
+# Proxy Mode
+
+Proxy mode forwards requests to a real upstream, caches responses in a two-tier system, and falls back to cached responses when the upstream is unavailable. It combines recording and replay into a single transparent `http.RoundTripper`.
+
+## When to use proxy vs record vs serve
+
+| Mode | Use case |
+|------|----------|
+| **`record`** | Capture a fixed set of fixtures from an upstream API. Stop recording, then switch to `serve`. |
+| **`serve`** | Replay a known set of fixtures. No upstream needed. Deterministic and offline. |
+| **`proxy`** | Develop against a live upstream with automatic fallback. Best for frontend dev where the backend may be flaky, slow, or occasionally offline. |
+
+Use `proxy` when you want the benefits of a live upstream (fresh data, real behavior) with the safety net of cached responses. Use `record` + `serve` when you want fully deterministic, offline replay.
+
+## How it works
+
+The `Proxy` is an `http.RoundTripper` that implements a two-tier caching strategy:
+
+```
+Request
+  |
+  v
+Forward to upstream
+  |
+  +-- Success --> Save raw tape to L1 (memory)
+  |                Save redacted tape to L2 (disk)
+  |                Return real response
+  |
+  +-- Failure --> Look up L1 (raw, in-session cache)
+                   |
+                   +-- L1 hit --> Return cached response (X-Httptape-Source: l1-cache)
+                   |
+                   +-- L1 miss --> Look up L2 (redacted, persistent cache)
+                                   |
+                                   +-- L2 hit --> Return cached response (X-Httptape-Source: l2-cache)
+                                   |
+                                   +-- L2 miss --> Return original error
+```
+
+### L1: In-memory cache (raw)
+
+- Backed by a `MemoryStore`
+- Contains unsanitized (raw) responses -- best fidelity within a session
+- Lost when the process exits
+- Checked first during fallback (lowest latency, best data quality)
+
+### L2: Disk cache (redacted)
+
+- Backed by a `FileStore`
+- Contains redacted responses (secrets stripped, PII faked)
+- Persists across restarts
+- Safe to commit to version control
+- Checked second during fallback
+
+### X-Httptape-Source header
+
+When a response comes from cache, the proxy adds an `X-Httptape-Source` header:
+
+| Value | Meaning |
+|-------|---------|
+| `l1-cache` | Response came from in-memory cache (raw, current session) |
+| `l2-cache` | Response came from disk cache (redacted, persistent) |
+| (absent) | Response came from the real upstream |
+
+This makes it easy to see in browser dev tools or logs whether a response is live or cached.
+
+## Go API
+
+### Basic usage
+
+```go
+l1 := httptape.NewMemoryStore()
+l2, _ := httptape.NewFileStore(httptape.WithDirectory("./cache"))
+
+proxy := httptape.NewProxy(l1, l2)
+
+client := &http.Client{Transport: proxy}
+resp, err := client.Get("https://api.example.com/users")
+// If upstream is reachable: real response, cached to L1 + L2
+// If upstream is down: cached response from L1 or L2
+```
+
+### With redaction
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization", "Cookie"),
+    httptape.RedactBodyPaths("$.password"),
+    httptape.FakeFields("my-seed", "$.user.email"),
+)
+
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxySanitizer(sanitizer),
+)
+```
+
+The redaction pipeline is applied only to L2 writes. L1 always stores raw responses for best within-session fidelity.
+
+### Constructor
+
+```go
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+```
+
+Both `l1` and `l2` must be non-nil. Panics on nil stores.
+
+### Options
+
+| Option | Signature | Default |
+|--------|-----------|---------|
+| `WithProxyTransport` | `WithProxyTransport(rt http.RoundTripper)` | `http.DefaultTransport` |
+| `WithProxySanitizer` | `WithProxySanitizer(s Sanitizer)` | no-op Pipeline |
+| `WithProxyMatcher` | `WithProxyMatcher(m Matcher)` | `DefaultMatcher()` |
+| `WithProxyRoute` | `WithProxyRoute(route string)` | `""` |
+| `WithProxyOnError` | `WithProxyOnError(fn func(error))` | nil |
+| `WithProxyFallbackOn` | `WithProxyFallbackOn(fn func(error, *http.Response) bool)` | transport errors only |
+
+### Fallback on 5xx
+
+By default, the proxy only falls back on transport errors (connection refused, DNS failure, timeout). To also fall back on 5xx responses from the upstream:
+
+```go
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxyFallbackOn(func(err error, resp *http.Response) bool {
+        if err != nil {
+            return true
+        }
+        return resp != nil && resp.StatusCode >= 500
+    }),
+)
+```
+
+## CLI
+
+```bash
+httptape proxy --upstream https://api.example.com \
+    --fixtures ./cache \
+    --config redact.json \
+    --port 8081
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
+| `--fixtures` | (required) | Path to fixture directory for L2 cache |
+| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--port` | `8081` | Listen port |
+| `--cors` | `false` | Enable CORS headers |
+| `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
+
+The L1 cache is always an in-memory store managed internally. The `--fixtures` directory is the L2 (persistent, redacted) cache.
+
+## Docker
+
+```bash
+docker run --rm \
+  -v ./cache:/fixtures \
+  -v ./redact.json:/config/config.json:ro \
+  -p 8081:8081 \
+  ghcr.io/vibewarden/httptape:latest \
+  proxy --upstream https://api.example.com \
+        --fixtures /fixtures \
+        --config /config/config.json \
+        --port 8081
+```
+
+### Docker Compose: frontend + proxy
+
+```yaml
+services:
+  api-proxy:
+    image: ghcr.io/vibewarden/httptape:latest
+    command:
+      - proxy
+      - --upstream
+      - https://api.staging.example.com
+      - --fixtures
+      - /fixtures
+      - --config
+      - /config/config.json
+      - --port
+      - "3001"
+      - --cors
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./cache:/fixtures
+      - ./redact.json:/config/config.json:ro
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+    depends_on:
+      - api-proxy
+```
+
+When the staging API is up, the frontend gets live data. When it is down, the proxy serves cached responses transparently.
+
+## Example: frontend development with fallback
+
+A typical frontend development workflow using proxy mode:
+
+1. Start the proxy pointing at your staging/development API
+2. Build your UI -- all requests go through the proxy to the real API
+3. Responses are cached to disk (L2) with secrets redacted
+4. If the API goes down (network issue, deployment, VPN disconnect), the proxy serves cached responses
+5. When the API comes back, fresh responses are served and the cache is updated
+
+```bash
+# Start proxy with redaction
+httptape proxy \
+    --upstream https://staging-api.example.com \
+    --fixtures ./api-cache \
+    --config redact.json \
+    --port 3001 \
+    --cors
+
+# In another terminal, start your frontend
+cd frontend && npm run dev
+# Frontend at localhost:3000 calls proxy at localhost:3001
+```
+
+Check the `X-Httptape-Source` response header in browser dev tools to see whether each response is live or cached.
+
+## Thread safety
+
+`Proxy` is safe for concurrent use by multiple goroutines. `RoundTrip` may be called from multiple goroutines simultaneously.
+
+## See also
+
+- [Recording](recording.md) -- one-shot recording without fallback
+- [Replay](replay.md) -- offline replay from fixtures
+- [Redaction](sanitization.md) -- configuring the redaction pipeline
+- [CLI](cli.md) -- all CLI commands and flags
+- [Docker](docker.md) -- container usage
+- [API Reference](api-reference.md) -- full type signatures
+# Matching
+
+Matchers control how incoming requests are paired with recorded tapes during [replay](replay.md). httptape uses a composable scoring system: each criterion evaluates one dimension of the request, and the highest-scoring tape wins.
+
+## The Matcher interface
+
+```go
+type Matcher interface {
+    Match(req *http.Request, candidates []Tape) (Tape, bool)
+}
+```
+
+A `Matcher` receives the incoming request and a list of candidate tapes. It returns the best match, or `(Tape{}, false)` if nothing matches.
+
+## DefaultMatcher
+
+```go
+matcher := httptape.DefaultMatcher()
+```
+
+Matches by HTTP method and URL path. Equivalent to:
+
+```go
+httptape.NewCompositeMatcher(httptape.MatchMethod(), httptape.MatchPath())
+```
+
+This is the default for `NewServer` if no matcher is specified.
+
+## ExactMatcher
+
+```go
+matcher := httptape.ExactMatcher()
+```
+
+A simple matcher that returns the first tape whose HTTP method and URL path exactly match the request. Unlike `CompositeMatcher`, it does not score candidates -- it returns the first match.
+
+## CompositeMatcher
+
+The `CompositeMatcher` evaluates multiple criteria and returns the highest-scoring tape.
+
+```go
+matcher := httptape.NewCompositeMatcher(
+    httptape.MatchMethod(),
+    httptape.MatchPath(),
+    httptape.MatchQueryParams(),
+    httptape.MatchBodyHash(),
+)
+```
+
+### How scoring works
+
+Each `MatchCriterion` returns a score for a candidate tape:
+
+- **Score 0** -- the candidate does not match on this dimension. It is **eliminated**.
+- **Positive score** -- the candidate matches, with higher values indicating stronger matches.
+
+A candidate must pass **all** criteria (non-zero score from each) to survive. The candidate with the highest total score wins. Ties are broken by order in the candidate list (first wins).
+
+## Built-in criteria
+
+### MatchMethod
+
+```go
+httptape.MatchMethod()
+```
+
+Requires the HTTP method (GET, POST, etc.) to match exactly. **Score: 1**
+
+### MatchPath
+
+```go
+httptape.MatchPath()
+```
+
+Requires the URL path to match exactly. The tape's stored URL is parsed to extract only the path component. **Score: 2**
+
+### MatchPathRegex
+
+```go
+criterion, err := httptape.MatchPathRegex(`^/users/\d+/orders$`)
+if err != nil {
+    log.Fatal(err)
+}
+matcher := httptape.NewCompositeMatcher(httptape.MatchMethod(), criterion)
+```
+
+Matches the URL path against a regular expression. Both the incoming request path and the tape's stored path must match the pattern. Returns an error if the pattern is invalid.
+
+Use `MatchPathRegex` as a **replacement** for `MatchPath`, not alongside it. If both are present, `MatchPath` will eliminate candidates that don't exact-match, regardless of the regex result.
+
+**Score: 1**
+
+### MatchRoute
+
+```go
+httptape.MatchRoute("users-api")
+```
+
+Requires the tape's `Route` field to equal the given value. If the route is empty string, the criterion always matches (any tape). **Score: 1**
+
+### MatchHeaders
+
+```go
+httptape.MatchHeaders("Accept", "application/json")
+httptape.MatchHeaders("X-Feature-Flag", "new-checkout")
+```
+
+Requires a specific header to be present in both the request and the tape with an exact value match. Header names are case-insensitive. If the header has multiple values, the criterion checks if the specified value appears among them (any-of semantics).
+
+To require multiple headers, add multiple `MatchHeaders` criteria -- they are AND-ed together naturally. **Score: 3**
+
+### MatchQueryParams
+
+```go
+httptape.MatchQueryParams()
+```
+
+Requires all query parameters from the incoming request to be present in the tape's URL with the same values. Extra parameters in the tape are allowed (subset match). If the request has no query parameters, this criterion always matches (vacuously true). **Score: 4**
+
+### MatchBodyHash
+
+```go
+httptape.MatchBodyHash()
+```
+
+Computes the SHA-256 hash of the incoming request body and compares it with the tape's stored `BodyHash`. This is an exact body match.
+
+If both the tape and request have no body, it matches. If one has a body and the other doesn't, it doesn't match. **Score: 8**
+
+### MatchBodyFuzzy
+
+```go
+httptape.MatchBodyFuzzy("$.action", "$.user.id", "$.items[*].sku")
+```
+
+Compares specific fields in the JSON request body between the incoming request and the tape. Only the fields at the specified paths are compared; all other fields are ignored. This is useful when request bodies contain volatile fields (timestamps, nonces) that vary per invocation.
+
+Paths use the same JSONPath-like syntax as [RedactBodyPaths](sanitization.md#redactbodypaths).
+
+Matching rules:
+- Both bodies must be valid JSON (otherwise score 0)
+- Paths that don't exist in either body are skipped (not a mismatch)
+- Paths that exist in both must have deeply equal values
+- At least one path must match for the criterion to return a positive score
+
+Using both `MatchBodyFuzzy` and `MatchBodyHash` in the same matcher is safe but redundant. Choose one or the other.
+
+**Score: 6**
+
+## Score weight table
+
+| Criterion | Score | Purpose |
+|-----------|-------|---------|
+| MatchMethod | 1 | HTTP method |
+| MatchPath | 2 | Exact URL path |
+| MatchPathRegex | 1 | Regex URL path |
+| MatchRoute | 1 | Route label |
+| MatchHeaders | 3 | Header key-value |
+| MatchQueryParams | 4 | Query parameters |
+| MatchBodyFuzzy | 6 | Partial body fields |
+| MatchBodyHash | 8 | Exact body hash |
+
+Higher-specificity criteria have higher scores, so a body-hash match dominates a path-only match. The weights are designed so that more specific criteria generally outweigh combinations of less specific ones.
+
+## MatcherFunc
+
+You can use any function as a `Matcher`:
+
+```go
+matcher := httptape.MatcherFunc(func(req *http.Request, candidates []httptape.Tape) (httptape.Tape, bool) {
+    for _, t := range candidates {
+        if t.Route == "special" {
+            return t, true
+        }
+    }
+    return httptape.Tape{}, false
+})
+```
+
+## Common patterns
+
+### Method + path + query (recommended for most APIs)
+
+```go
+matcher := httptape.NewCompositeMatcher(
+    httptape.MatchMethod(),
+    httptape.MatchPath(),
+    httptape.MatchQueryParams(),
+)
+```
+
+### Method + path + specific header (API versioning)
+
+```go
+matcher := httptape.NewCompositeMatcher(
+    httptape.MatchMethod(),
+    httptape.MatchPath(),
+    httptape.MatchHeaders("Accept", "application/vnd.api.v2+json"),
+)
+```
+
+### Method + regex path + fuzzy body (complex POST APIs)
+
+```go
+pathCriterion, _ := httptape.MatchPathRegex(`^/api/v\d+/orders`)
+matcher := httptape.NewCompositeMatcher(
+    httptape.MatchMethod(),
+    pathCriterion,
+    httptape.MatchBodyFuzzy("$.action", "$.order.type"),
+)
+```
+
+## See also
+
+- [Replay](replay.md) -- using matchers with the Server
+- [API Reference](api-reference.md) -- full type signatures
+# Storage
+
+The `Store` interface is httptape's persistence abstraction. All recording and replay goes through this interface, making it easy to swap implementations or write your own.
+
+## The Store interface
+
+```go
+type Store interface {
+    Save(ctx context.Context, tape Tape) error
+    Load(ctx context.Context, id string) (Tape, error)
+    List(ctx context.Context, filter Filter) ([]Tape, error)
+    Delete(ctx context.Context, id string) error
+}
+```
+
+All methods accept a `context.Context` for cancellation and deadline support.
+
+### Filter
+
+```go
+type Filter struct {
+    Route  string // empty = no filter
+    Method string // empty = no filter
+}
+```
+
+An empty `Filter{}` returns all tapes. Filters are AND-ed: setting both `Route` and `Method` returns only tapes matching both.
+
+### ErrNotFound
+
+```go
+var ErrNotFound = errors.New("httptape: tape not found")
+```
+
+`Load` and `Delete` return an error wrapping `ErrNotFound` when the tape does not exist. Use `errors.Is(err, httptape.ErrNotFound)` to check.
+
+## MemoryStore
+
+In-memory storage, ideal for tests and ephemeral recordings.
+
+```go
+store := httptape.NewMemoryStore()
+```
+
+Characteristics:
+- All data lives in memory (map keyed by tape ID)
+- Safe for concurrent use by multiple goroutines
+- Deep-copies tapes on save and load to prevent aliasing
+- No persistence -- data is lost when the process exits
+
+### When to use
+
+- Unit and integration tests
+- Short-lived recording sessions
+- Anywhere you don't need fixtures on disk
+
+## FileStore
+
+Filesystem-backed storage. Each tape is persisted as a JSON file.
+
+```go
+store, err := httptape.NewFileStore(
+    httptape.WithDirectory("./fixtures"),
+)
+if err != nil {
+    // handle error (e.g., permission denied)
+}
+```
+
+Characteristics:
+- One JSON file per tape, named `<tape-id>.json`
+- Atomic writes via temp file + rename
+- Base directory is created automatically (mode 0755) if it doesn't exist
+- Safe for concurrent use within a single process
+- **Not** safe for multi-process concurrent access to the same directory
+- Default directory: `"fixtures"` in the current working directory
+
+### WithDirectory
+
+```go
+httptape.WithDirectory("./testdata/fixtures")
+```
+
+Sets the base directory for fixture storage.
+
+### Fixture file format
+
+Each tape is stored as pretty-printed JSON with a trailing newline:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
+  "route": "users-api",
+  "recorded_at": "2024-01-15T10:30:00Z",
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/users/42",
+    "headers": {
+      "Accept": ["application/json"]
+    },
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJ1c2VyIjoib2N0b2NhdCJ9"
+  }
+}
+```
+
+Fixtures are human-readable and safe to commit to version control (especially when sanitized).
+
+### ID validation
+
+The `FileStore` validates tape IDs to prevent path traversal attacks. IDs containing path separators (`/`, `\`) or directory traversal components (`..`) are rejected with `ErrInvalidID`.
+
+## Custom Store implementations
+
+Implement the `Store` interface to back httptape with any storage system:
+
+```go
+type RedisStore struct {
+    client *redis.Client
+    prefix string
+}
+
+func (s *RedisStore) Save(ctx context.Context, tape httptape.Tape) error {
+    data, err := json.Marshal(tape)
+    if err != nil {
+        return fmt.Errorf("redis store save: %w", err)
+    }
+    return s.client.Set(ctx, s.prefix+tape.ID, data, 0).Err()
+}
+
+func (s *RedisStore) Load(ctx context.Context, id string) (httptape.Tape, error) {
+    data, err := s.client.Get(ctx, s.prefix+id).Bytes()
+    if err != nil {
+        if errors.Is(err, redis.Nil) {
+            return httptape.Tape{}, fmt.Errorf("redis store load %s: %w", id, httptape.ErrNotFound)
+        }
+        return httptape.Tape{}, fmt.Errorf("redis store load %s: %w", id, err)
+    }
+    var tape httptape.Tape
+    if err := json.Unmarshal(data, &tape); err != nil {
+        return httptape.Tape{}, fmt.Errorf("redis store load %s: %w", id, err)
+    }
+    return tape, nil
+}
+
+// Implement List and Delete similarly...
+```
+
+### Implementation guidelines
+
+- All methods must respect `context.Context` cancellation
+- `Load` and `Delete` must return errors wrapping `ErrNotFound` for missing tapes
+- `List` must return an empty slice (not nil) when no tapes match
+- `Save` uses upsert semantics -- overwrite if the ID already exists
+- Implementations should be safe for concurrent use
+
+## See also
+
+- [Recording](recording.md) -- using stores with the Recorder
+- [Replay](replay.md) -- using stores with the Server
+- [Import/Export](import-export.md) -- moving fixtures between stores
+# Fixture Authoring Guide
+
+Hand-write Tape JSON files for static mocking without recording from a live API.
+
+## When to author fixtures by hand
+
+- The upstream API does not exist yet (contract-first development)
+- You need specific edge cases (empty arrays, 204 No Content, error responses)
+- You want deterministic test data without a recording step
+- You are building a mock backend for frontend development (see [UI-First Dev](ui-first-dev.md))
+
+## Tape JSON structure
+
+Every fixture file is a single JSON object with these fields:
+
+```json
+{
+  "id": "get-users-list",
+  "route": "users-api",
+  "recorded_at": "2025-01-15T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/users",
+    "headers": {
+      "Accept": ["application/json"]
+    },
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XX0="
+  },
+  "metadata": {}
+}
+```
+
+### Field reference
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Unique identifier. Used as the filename (`<id>.json`). Must not contain `/`, `\`, or `..`. |
+| `route` | string | No | Logical grouping label (e.g., `"users-api"`). Used by `Filter.Route` and `MatchRoute`. |
+| `recorded_at` | string (RFC 3339) | No | UTC timestamp. Informational only -- not used for matching. |
+| `request.method` | string | Yes | HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`). |
+| `request.url` | string | Yes | Full URL. The path component is used for matching (e.g., `http://mock/api/users`). |
+| `request.headers` | object | No | Request headers. Each key maps to an array of strings. |
+| `request.body` | string/null | No | Base64-encoded request body, or `null` for bodiless requests. |
+| `request.body_hash` | string | No | Hex-encoded SHA-256 hash of the original request body. Required for `MatchBodyHash`. |
+| `request.body_encoding` | string | No | `"identity"` for UTF-8 text, `"base64"` for binary. Defaults to identity if omitted. |
+| `response.status_code` | int | Yes | HTTP status code (200, 201, 204, 404, 500, etc.). |
+| `response.headers` | object | No | Response headers. Each key maps to an array of strings. |
+| `response.body` | string/null | No | Base64-encoded response body. |
+| `response.body_encoding` | string | No | Same as request body encoding. |
+| `metadata` | object | No | Key-value pairs for delay/error simulation. Not used for matching. |
+
+### Body encoding
+
+Go's `encoding/json` handles `[]byte` fields as base64 automatically. When authoring by hand:
+
+- **JSON response bodies**: base64-encode the JSON string and set the body field
+- **Text responses**: base64-encode the text
+- **No body** (e.g., 204): set body to `null`
+
+To base64-encode on the command line:
+
+```bash
+echo -n '{"users":[{"id":1,"name":"Alice"}]}' | base64
+# eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XX0=
+```
+
+### URL format and matching
+
+The `request.url` field stores a full URL, but the `DefaultMatcher` (used by the Server) only compares the **path** component. This means:
+
+- `http://mock/api/users` and `https://production.example.com/api/users` match the same `GET /api/users` request
+- Use `http://mock` as the host for hand-written fixtures -- it is a convention, not a requirement
+- Query parameters are ignored by the default matcher. Use `MatchQueryParams` in a `CompositeMatcher` if you need them.
+
+## Example fixtures
+
+### GET returning JSON (200)
+
+**File:** `fixtures/get-users.json`
+
+```json
+{
+  "id": "get-users",
+  "route": "users-api",
+  "recorded_at": "2025-01-15T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/users",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "X-Total-Count": ["42"]
+    },
+    "body": "eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9LHsiaWQiOjIsIm5hbWUiOiJCb2IifV19"
+  }
+}
+```
+
+The response body decodes to:
+
+```json
+{"users":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]}
+```
+
+### POST returning created resource (201)
+
+**File:** `fixtures/create-user.json`
+
+```json
+{
+  "id": "create-user",
+  "route": "users-api",
+  "recorded_at": "2025-01-15T10:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "http://mock/api/users",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 201,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Location": ["/api/users/3"]
+    },
+    "body": "eyJpZCI6MywibmFtZSI6IkNoYXJsaWUiLCJjcmVhdGVkX2F0IjoiMjAyNS0wMS0xNVQxMDowMDowMFoifQ=="
+  }
+}
+```
+
+The response body decodes to:
+
+```json
+{"id":3,"name":"Charlie","created_at":"2025-01-15T10:00:00Z"}
+```
+
+### DELETE returning 204 No Content
+
+**File:** `fixtures/delete-user.json`
+
+```json
+{
+  "id": "delete-user",
+  "route": "users-api",
+  "recorded_at": "2025-01-15T10:00:00Z",
+  "request": {
+    "method": "DELETE",
+    "url": "http://mock/api/users/1",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 204,
+    "headers": {},
+    "body": null
+  }
+}
+```
+
+### GET with custom headers (paginated response)
+
+**File:** `fixtures/get-users-page2.json`
+
+```json
+{
+  "id": "get-users-page2",
+  "route": "users-api",
+  "recorded_at": "2025-01-15T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/users?page=2&per_page=10",
+    "headers": {
+      "Accept": ["application/json"],
+      "Authorization": ["Bearer [REDACTED]"]
+    },
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "X-Total-Count": ["42"],
+      "X-Page": ["2"],
+      "X-Per-Page": ["10"],
+      "Link": ["<http://mock/api/users?page=3&per_page=10>; rel=\"next\""]
+    },
+    "body": "eyJ1c2VycyI6W3siaWQiOjExLCJuYW1lIjoiS2FyZW4ifV19"
+  }
+}
+```
+
+## Metadata: delay and error simulation
+
+The `metadata` field holds per-fixture configuration that the Server reads at replay time. It is not used for matching.
+
+### Simulating latency
+
+Add a `delay` key with a Go duration string:
+
+```json
+{
+  "id": "slow-endpoint",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/reports",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJzdGF0dXMiOiJjb21wbGV0ZSJ9"
+  },
+  "metadata": {
+    "delay": "2s"
+  }
+}
+```
+
+Supported duration formats: `100ms`, `1.5s`, `2s`, `500ms`. The server sleeps for the specified duration before writing the response. If the client disconnects during the delay, the server returns immediately.
+
+The per-fixture delay overrides the global `WithDelay` server option.
+
+### Simulating errors
+
+Add an `error` key with a `status` code and optional `body`:
+
+```json
+{
+  "id": "failing-endpoint",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/flaky",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJvayI6dHJ1ZX0="
+  },
+  "metadata": {
+    "error": {
+      "status": 503,
+      "body": "Service Unavailable"
+    }
+  }
+}
+```
+
+When the Server matches this fixture, it returns a `503` with the body `"Service Unavailable"` and sets the header `X-Httptape-Error: simulated`. The `response` section is ignored when `metadata.error` is present.
+
+### Combining delay and error
+
+```json
+{
+  "metadata": {
+    "delay": "3s",
+    "error": {
+      "status": 504,
+      "body": "Gateway Timeout"
+    }
+  }
+}
+```
+
+The error check runs before the delay, so in practice the error response is returned immediately (the delay applies only to successful responses).
+
+## FileStore directory structure
+
+`FileStore` stores all fixture files in a single flat directory. Each file is named `<id>.json`:
+
+```
+fixtures/
+  get-users.json
+  create-user.json
+  delete-user.json
+  get-users-page2.json
+  slow-endpoint.json
+  failing-endpoint.json
+```
+
+Rules:
+- The filename is derived from the `id` field: `id + ".json"`
+- IDs must not contain path separators (`/`, `\`) or traversal components (`..`)
+- Only `.json` files are loaded -- other files are ignored
+- There is no subdirectory nesting. Use the `route` field for logical grouping instead.
+- The default directory is `fixtures/` relative to the working directory. Override with `WithDirectory`:
+
+```go
+store, err := httptape.NewFileStore(httptape.WithDirectory("./testdata/api-fixtures"))
+```
+
+## Tips for hand-authored fixtures
+
+**Use descriptive IDs.** The ID is the filename, so `get-users` is easier to find than a UUID. Recorded tapes use UUIDs, but hand-authored ones can use any valid string.
+
+**Keep the `route` consistent.** If you plan to filter fixtures by route (e.g., to run tests against a subset), use the same route string across related fixtures.
+
+**Omit optional fields.** Fields like `body_hash`, `body_encoding`, `recorded_at`, and `metadata` can be omitted entirely:
+
+```json
+{
+  "id": "minimal-fixture",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/health",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJzdGF0dXMiOiJvayJ9"
+  }
+}
+```
+
+**Base64 helper script.** Create a shell alias for encoding response bodies:
+
+```bash
+alias b64='python3 -c "import sys,base64; print(base64.b64encode(sys.stdin.buffer.read()).decode())"'
+
+# Usage:
+echo -n '{"status":"ok"}' | b64
+# eyJzdGF0dXMiOiJvayJ9
+```
+
+**Validate your fixtures.** Load fixtures with `FileStore` and check for JSON parse errors:
+
+```go
+store, err := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+if err != nil {
+    log.Fatal(err)
+}
+tapes, err := store.List(context.Background(), httptape.Filter{})
+if err != nil {
+    log.Fatal("fixture load error:", err)
+}
+fmt.Printf("Loaded %d fixtures\n", len(tapes))
+```
+
+## Reference: sanitization config
+
+If your fixtures were recorded with sanitization enabled, the values in headers and body fields will already be redacted or faked. When authoring fixtures by hand, you can use the same redacted placeholders for consistency:
+
+- Redacted header: `"[REDACTED]"`
+- Redacted body field: `"[REDACTED]"`
+- Faked field: deterministic HMAC-based value (varies by seed)
+
+See [Declarative Configuration](config.md) for the config file format and [Sanitization](sanitization.md) for the programmatic API.
+
+## See also
+
+- [Storage](storage.md) -- FileStore and MemoryStore details
+- [Replay](replay.md) -- how the Server matches and serves fixtures
+- [Matching](matching.md) -- customizing request-to-tape matching
+- [UI-First Dev](ui-first-dev.md) -- using hand-authored fixtures for frontend development
+- [Config](config.md) -- sanitization configuration reference
+# Import/Export
+
+httptape supports exporting fixtures to `tar.gz` bundles and importing them back. This enables sharing fixture sets between environments (record in production, replay in CI) and between team members.
+
+## ExportBundle
+
+```go
+func ExportBundle(ctx context.Context, s Store, opts ...ExportOption) (io.Reader, error)
+```
+
+Exports all tapes from a store as a streaming `tar.gz` archive. The returned `io.Reader` streams the archive -- it is not buffered entirely in memory.
+
+### Basic export
+
+```go
+store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+
+reader, err := httptape.ExportBundle(context.Background(), store)
+if err != nil {
+    log.Fatal(err)
+}
+
+f, _ := os.Create("fixtures.tar.gz")
+io.Copy(f, reader)
+f.Close()
+```
+
+### Bundle layout
+
+```
+manifest.json          -- bundle metadata
+fixtures/<id>.json     -- one file per tape
+```
+
+The `manifest.json` contains:
+
+```go
+type Manifest struct {
+    ExportedAt      time.Time `json:"exported_at"`
+    FixtureCount    int       `json:"fixture_count"`
+    Routes          []string  `json:"routes"`
+    SanitizerConfig string    `json:"sanitizer_config,omitempty"`
+}
+```
+
+### Export options
+
+#### WithRoutes
+
+```go
+httptape.WithRoutes("users-api", "payments-api")
+```
+
+Filters the export to include only tapes with matching route labels. Route matching is exact and case-sensitive.
+
+#### WithMethods
+
+```go
+httptape.WithMethods("GET", "POST")
+```
+
+Filters the export to include only tapes with matching HTTP methods. Methods are compared case-insensitively.
+
+#### WithSince
+
+```go
+cutoff, _ := time.Parse(time.RFC3339, "2024-01-01T00:00:00Z")
+httptape.WithSince(cutoff)
+```
+
+Filters the export to include only tapes recorded at or after the given timestamp.
+
+#### WithSanitizerConfig
+
+```go
+httptape.WithSanitizerConfig("RedactHeaders + FakeFields(email, user_id)")
+```
+
+Attaches a human-readable summary of the sanitizer configuration to the bundle manifest. This is purely informational -- it does not affect import behavior.
+
+### Combining filters
+
+All filters are AND-ed. A tape must pass every active filter to be included:
+
+```go
+reader, err := httptape.ExportBundle(ctx, store,
+    httptape.WithRoutes("payments-api"),
+    httptape.WithMethods("POST"),
+    httptape.WithSince(lastWeek),
+)
+```
+
+This exports only POST requests to the "payments-api" route recorded in the last week.
+
+## ImportBundle
+
+```go
+func ImportBundle(ctx context.Context, s Store, r io.Reader) error
+```
+
+Imports tapes from a `tar.gz` bundle into the given store.
+
+### Basic import
+
+```go
+store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
+
+f, _ := os.Open("fixtures.tar.gz")
+defer f.Close()
+
+err := httptape.ImportBundle(context.Background(), store, f)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+### Merge strategy
+
+- Fixtures in the bundle **overwrite** any existing fixtures with the same ID in the store.
+- Fixtures already in the store whose IDs are not in the bundle are **left untouched**.
+
+This is an additive merge, not a replacement.
+
+### Validation
+
+The entire bundle is validated before any fixtures are persisted:
+
+1. The `manifest.json` must exist and be valid JSON
+2. The manifest's `fixture_count` must match the actual number of fixture files
+3. Each fixture must have a non-empty `ID`, `Method`, and `URL`
+4. All fixture files must be valid JSON
+
+If validation fails, the store is not modified.
+
+### Size limits
+
+Individual tar entries are limited to 50 MB to prevent zip-bomb-style attacks.
+
+## Workflow example
+
+### Record in staging, replay in CI
+
+**Staging server:**
+```bash
+httptape record \
+  --upstream https://api.staging.example.com \
+  --fixtures ./recorded \
+  --config sanitize.json
+
+# After recording, export:
+httptape export --fixtures ./recorded --output fixtures.tar.gz
+```
+
+**CI pipeline:**
+```bash
+httptape import --fixtures ./fixtures --input fixtures.tar.gz
+httptape serve --fixtures ./fixtures --port 8081
+# Run tests against localhost:8081
+```
+
+### Programmatic transfer
+
+```go
+// Export from source
+reader, _ := httptape.ExportBundle(ctx, sourceStore,
+    httptape.WithRoutes("api-v2"),
+)
+
+// Import to destination
+httptape.ImportBundle(ctx, destStore, reader)
+```
+
+## See also
+
+- [Storage](storage.md) -- the Store interface
+- [CLI](cli.md) -- export and import commands
+- [Docker](docker.md) -- sharing fixtures via volumes
+# UI-First Development Guide
+
+Use httptape as a mock backend for frontend development. Build your UI against fixture data without waiting for the real API to be ready, stable, or accessible.
+
+## Why use httptape for frontend dev
+
+- **No backend dependency.** Start building UI before the API exists (contract-first).
+- **Deterministic data.** Same fixtures, same responses, every time.
+- **Offline development.** No network access needed once fixtures are written.
+- **Edge case testing.** Simulate errors, slow responses, and empty states with fixture metadata.
+- **Team sharing.** Commit fixtures to version control. Every developer gets the same mock data.
+
+## Workflow overview
+
+There are two paths to get fixtures:
+
+### Path A: Write fixtures by hand
+
+Best when the API does not exist yet or you want full control over the mock data.
+
+1. Define the API contract (endpoints, request/response shapes)
+2. Author fixture JSON files -- see [Fixture Authoring Guide](fixtures-authoring.md)
+3. Start httptape in serve mode
+4. Point your frontend at httptape
+
+### Path B: Record from a real or staging API
+
+Best when the API already exists and you want realistic data.
+
+1. Start httptape in record mode, pointing at the upstream API
+2. Exercise the API endpoints your frontend needs (manually or via a script)
+3. Stop the recorder -- fixtures are now on disk
+4. Start httptape in serve mode
+5. Point your frontend at httptape
+
+Record mode with the CLI:
+
+```bash
+# Record from staging
+httptape record \
+  --upstream https://staging-api.example.com \
+  --fixtures ./fixtures \
+  --config sanitize.json \
+  --port 3001
+
+# Exercise your endpoints
+curl http://localhost:3001/api/users
+curl http://localhost:3001/api/users/1
+curl -X POST http://localhost:3001/api/users -d '{"name":"Alice"}'
+
+# Stop with Ctrl+C, then serve the recorded fixtures
+httptape serve --fixtures ./fixtures --port 3001
+```
+
+## Docker Compose: frontend + httptape
+
+A typical setup with a React/Vue/Svelte dev server calling httptape as the API backend:
+
+```yaml
+# docker-compose.yml
+services:
+  mock-api:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+    depends_on:
+      - mock-api
+```
+
+Start everything with:
+
+```bash
+docker compose up
+```
+
+Your frontend at `http://localhost:3000` calls the mock API at `http://localhost:3001`. Fixtures are read from the `./fixtures` directory on the host.
+
+### Without Docker
+
+Run httptape directly:
+
+```bash
+httptape serve --fixtures ./fixtures --port 3001 --cors
+```
+
+In another terminal, start your frontend dev server:
+
+```bash
+cd frontend && npm run dev
+# Vite/Next/CRA dev server on localhost:3000
+```
+
+Configure your frontend to use `http://localhost:3001` as the API base URL.
+
+## CORS setup
+
+When the frontend dev server (e.g., `localhost:3000`) calls the mock backend (e.g., `localhost:3001`), the browser enforces the same-origin policy. httptape has built-in CORS support.
+
+### CLI flag
+
+```bash
+httptape serve --fixtures ./fixtures --port 3001 --cors
+```
+
+### Go API
+
+```go
+srv := httptape.NewServer(store, httptape.WithCORS())
+```
+
+When CORS is enabled, the server:
+
+- Adds `Access-Control-Allow-Origin: *` to all responses
+- Adds `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD`
+- Adds `Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept`
+- Adds `Access-Control-Max-Age: 86400` (24 hours)
+- Handles `OPTIONS` preflight requests automatically with `204 No Content`
+
+This is a permissive CORS configuration intended for local development only.
+
+## Hot-reload: edit fixtures, see changes immediately
+
+`FileStore` reads fixture files from disk on every request. There is no in-memory cache. This means:
+
+- Edit a fixture JSON file, save it, and the next request picks up the change
+- Add a new fixture file to the directory, and it is immediately available
+- Delete a fixture file, and the next request to that endpoint returns the fallback (404 by default)
+
+No server restart is needed. This makes the edit-refresh cycle fast:
+
+1. Frontend shows wrong data or you need a new endpoint
+2. Edit or create a fixture file in `./fixtures/`
+3. Refresh the browser
+4. New response is served
+
+### Example: adding an endpoint on the fly
+
+Your frontend needs `GET /api/notifications`, which does not have a fixture yet. Create the file:
+
+**File:** `fixtures/get-notifications.json`
+
+```json
+{
+  "id": "get-notifications",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/notifications",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "W3siaWQiOjEsIm1lc3NhZ2UiOiJXZWxjb21lISIsInJlYWQiOmZhbHNlfV0="
+  }
+}
+```
+
+The body decodes to:
+
+```json
+[{"id":1,"message":"Welcome!","read":false}]
+```
+
+Save the file. Refresh the frontend. The notification badge appears.
+
+## Latency simulation for loading states
+
+Frontend loading states (spinners, skeletons, progress bars) are hard to test against a local mock that responds instantly. Use the `metadata.delay` field to slow specific endpoints:
+
+```json
+{
+  "id": "slow-dashboard",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/api/dashboard",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJ3aWRnZXRzIjpbXX0="
+  },
+  "metadata": {
+    "delay": "2s"
+  }
+}
+```
+
+The server waits 2 seconds before sending the response. Your frontend loading spinner is now visible during development.
+
+### Global delay
+
+Apply a delay to every endpoint via the Go API:
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithCORS(),
+    httptape.WithDelay(500 * time.Millisecond),
+)
+```
+
+Per-fixture delays in `metadata.delay` override the global delay for that specific endpoint.
+
+### Supported duration values
+
+| Value | Duration |
+|-------|----------|
+| `"100ms"` | 100 milliseconds |
+| `"500ms"` | Half a second |
+| `"1s"` | One second |
+| `"1.5s"` | 1.5 seconds |
+| `"2s"` | Two seconds |
+| `"5s"` | Five seconds |
+
+## Error simulation for error handling in UI
+
+Test your error boundaries, retry logic, toast notifications, and fallback UI by simulating server errors.
+
+### Per-fixture errors
+
+Return a specific error for a specific endpoint:
+
+```json
+{
+  "id": "payment-failure",
+  "request": {
+    "method": "POST",
+    "url": "http://mock/api/payments",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 201,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJpZCI6MX0="
+  },
+  "metadata": {
+    "error": {
+      "status": 422,
+      "body": "{\"errors\":{\"card_number\":[\"is invalid\"]}}"
+    }
+  }
+}
+```
+
+The server returns 422 with the validation error body. The `response` section is ignored when `metadata.error` is present. To switch back to the success response, remove the `metadata.error` block and save the file.
+
+### Random error rate
+
+Simulate flaky APIs where some percentage of requests fail with 500:
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithCORS(),
+    httptape.WithErrorRate(0.3), // 30% of requests return 500
+)
+```
+
+Failed responses include the header `X-Httptape-Error: simulated` so you can distinguish simulated errors from real ones in your frontend code or browser dev tools.
+
+### Common error scenarios for frontend testing
+
+| Scenario | Fixture setup |
+|----------|--------------|
+| Validation error (422) | `metadata.error.status: 422`, body with field errors |
+| Unauthorized (401) | `metadata.error.status: 401`, body with auth error message |
+| Not found (404) | `metadata.error.status: 404` |
+| Rate limited (429) | `metadata.error.status: 429`, body with retry-after info |
+| Server error (500) | `metadata.error.status: 500` |
+| Service unavailable (503) | `metadata.error.status: 503` |
+| Gateway timeout (504) | `metadata.error.status: 504` combined with `metadata.delay: "30s"` |
+
+### Toggle between success and error
+
+A practical workflow for testing both happy and error paths:
+
+1. Start with the fixture returning the success response (no `metadata.error`)
+2. Test the happy path in the UI
+3. Add `metadata.error` to the fixture file and save
+4. Refresh the browser -- error UI is now shown
+5. Remove `metadata.error` and save to go back to the happy path
+
+No server restart needed. Hot-reload picks up changes immediately.
+
+## Full example: e-commerce frontend
+
+A complete fixture set for a simple e-commerce frontend:
+
+```
+fixtures/
+  get-products.json          # GET /api/products -> 200, product list
+  get-product-detail.json    # GET /api/products/1 -> 200, single product
+  get-cart.json              # GET /api/cart -> 200, cart contents
+  add-to-cart.json           # POST /api/cart/items -> 201, added item
+  checkout.json              # POST /api/checkout -> 201, order confirmation
+  checkout-error.json        # POST /api/checkout -> 422, validation error (via metadata.error)
+  slow-search.json           # GET /api/search -> 200, delayed 1.5s (via metadata.delay)
+```
+
+Note: since the default matcher uses method + path, having both `checkout.json` and `checkout-error.json` match the same `POST /api/checkout` means the first file loaded wins. To toggle between them, use a single fixture and swap the `metadata.error` block in and out, or delete one file and keep the other.
+
+Docker Compose for this setup:
+
+```yaml
+services:
+  mock-api:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: ["npm", "run", "dev"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    environment:
+      VITE_API_URL: http://localhost:3001
+    depends_on:
+      - mock-api
+```
+
+## Comparison with alternatives
+
+### json-server
+
+[json-server](https://github.com/typicode/json-server) generates REST endpoints from a single JSON file with a database-like structure.
+
+| Aspect | httptape | json-server |
+|--------|----------|-------------|
+| Data model | One JSON file per endpoint (request + response pair) | Single `db.json` file with resource collections |
+| CRUD support | Read-only replay (records exact responses) | Full CRUD with auto-generated routes |
+| Response fidelity | Exact headers, status codes, body from fixtures | Generated responses with limited header control |
+| Recording | Built-in -- record from a real API | None -- hand-author only |
+| Sanitization | Built-in redaction and deterministic faking | None |
+| Error simulation | Per-fixture `metadata.error` and global `WithErrorRate` | Custom middleware required |
+| Latency simulation | Per-fixture `metadata.delay` and global `WithDelay` | `--delay` flag (global only) |
+| Language | Go (single binary, Docker image) | Node.js |
+
+**Choose httptape when** you need exact replay of recorded API interactions, per-endpoint error/delay simulation, or sanitized fixtures safe for version control.
+
+**Choose json-server when** you need full CRUD semantics with auto-generated routes and a database-like data model.
+
+### Mockoon
+
+[Mockoon](https://mockoon.com/) is a desktop application and CLI for creating mock APIs with a GUI.
+
+| Aspect | httptape | Mockoon |
+|--------|----------|---------|
+| Configuration | JSON fixture files (text editor) | GUI application or JSON environment files |
+| Version control | Individual fixture files, easy diffs | Single large environment JSON file |
+| Recording | Built-in proxy recording with sanitization | Built-in proxy recording |
+| Error simulation | `metadata.error` per fixture, `WithErrorRate` global | Per-route rules in GUI |
+| Latency simulation | `metadata.delay` per fixture, `WithDelay` global | Per-route latency in GUI |
+| Go integration | Native -- embeddable in Go tests | None (separate process) |
+| Docker | Minimal scratch image (~10 MB) | Node.js-based image |
+| CORS | `--cors` flag | Built-in toggle |
+
+**Choose httptape when** you want text-file-based fixtures, Git-friendly diffs, Go test integration, or sanitization.
+
+**Choose Mockoon when** you prefer a GUI for designing mock APIs or need features like response templating and dynamic generation.
+
+## See also
+
+- [Fixture Authoring Guide](fixtures-authoring.md) -- JSON fixture format and field reference
+- [CLI](cli.md) -- `serve` and `record` commands
+- [Docker](docker.md) -- container setup and Docker Compose examples
+- [Replay](replay.md) -- how the Server matches requests to fixtures
+- [Matching](matching.md) -- customizing request-to-tape matching
+# Using httptape with Other Languages
+
+httptape ships as a Docker image (`ghcr.io/vibewarden/httptape:latest`), so any language with Docker or Testcontainers support can use it as a mock server. This guide shows how to start an httptape container, mount fixture files, make requests, and clean up in several popular languages.
+
+All examples assume you have a directory of recorded fixtures at `./testdata/fixtures` relative to the project root. The container exposes port **8081** by default.
+
+---
+
+## Java (Testcontainers)
+
+```java
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.utility.MountableFile;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class HttptapeTest {
+
+    static GenericContainer<?> httptape;
+    static String baseUrl;
+
+    @BeforeAll
+    static void startContainer() {
+        httptape = new GenericContainer<>("ghcr.io/vibewarden/httptape:latest")
+            .withCommand("serve", "--fixtures", "/fixtures")
+            .withExposedPorts(8081)
+            .withFileSystemBind("./testdata/fixtures", "/fixtures")
+            .waitingFor(Wait.forHttp("/").forStatusCode(404));
+        httptape.start();
+
+        baseUrl = "http://" + httptape.getHost()
+            + ":" + httptape.getMappedPort(8081);
+    }
+
+    @AfterAll
+    static void stopContainer() {
+        if (httptape != null) {
+            httptape.stop();
+        }
+    }
+
+    @Test
+    void replayFixture() throws Exception {
+        var client = HttpClient.newHttpClient();
+        var request = HttpRequest.newBuilder()
+            .uri(URI.create(baseUrl + "/api/users"))
+            .GET()
+            .build();
+
+        var response = client.send(request,
+            HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(200, response.statusCode());
+    }
+}
+```
+
+---
+
+## Kotlin (Testcontainers)
+
+```kotlin
+import org.testcontainers.containers.GenericContainer
+import org.testcontainers.containers.wait.strategy.Wait
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.Test
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import kotlin.test.assertEquals
+
+class HttptapeTest {
+
+    companion object {
+        private lateinit var httptape: GenericContainer<*>
+        lateinit var baseUrl: String
+
+        @BeforeAll
+        @JvmStatic
+        fun startContainer() {
+            httptape = GenericContainer("ghcr.io/vibewarden/httptape:latest")
+                .withCommand("serve", "--fixtures", "/fixtures")
+                .withExposedPorts(8081)
+                .withFileSystemBind("./testdata/fixtures", "/fixtures")
+                .waitingFor(Wait.forHttp("/").forStatusCode(404))
+            httptape.start()
+
+            baseUrl = "http://${httptape.host}:${httptape.getMappedPort(8081)}"
+        }
+
+        @AfterAll
+        @JvmStatic
+        fun stopContainer() {
+            httptape.stop()
+        }
+    }
+
+    @Test
+    fun `replay fixture`() {
+        val client = HttpClient.newHttpClient()
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("$baseUrl/api/users"))
+            .GET()
+            .build()
+
+        val response = client.send(request,
+            HttpResponse.BodyHandlers.ofString())
+
+        assertEquals(200, response.statusCode())
+    }
+}
+```
+
+---
+
+## Python (testcontainers-python)
+
+```python
+import requests
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.waiting_utils import wait_for_logs
+
+
+def test_replay_fixture():
+    with DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+        .with_command("serve --fixtures /fixtures") \
+        .with_exposed_ports(8081) \
+        .with_volume_mapping("./testdata/fixtures", "/fixtures") as container:
+
+        wait_for_logs(container, "listening on")
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(8081)
+        base_url = f"http://{host}:{port}"
+
+        resp = requests.get(f"{base_url}/api/users")
+
+        assert resp.status_code == 200
+```
+
+You can also use `pytest` fixtures for shared setup:
+
+```python
+import pytest
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.waiting_utils import wait_for_logs
+
+
+@pytest.fixture(scope="module")
+def httptape_url():
+    container = DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+        .with_command("serve --fixtures /fixtures") \
+        .with_exposed_ports(8081) \
+        .with_volume_mapping("./testdata/fixtures", "/fixtures")
+    container.start()
+    wait_for_logs(container, "listening on")
+
+    host = container.get_container_host_ip()
+    port = container.get_exposed_port(8081)
+    yield f"http://{host}:{port}"
+
+    container.stop()
+
+
+def test_users(httptape_url):
+    resp = requests.get(f"{httptape_url}/api/users")
+    assert resp.status_code == 200
+
+
+def test_health(httptape_url):
+    resp = requests.get(f"{httptape_url}/health")
+    assert resp.status_code == 404  # no fixture recorded for /health
+```
+
+---
+
+## Node.js (testcontainers-node)
+
+```javascript
+const { GenericContainer, Wait } = require("testcontainers");
+const { describe, it, before, after } = require("node:test");
+const assert = require("node:assert");
+
+describe("httptape replay", () => {
+  let container;
+  let baseUrl;
+
+  before(async () => {
+    container = await new GenericContainer(
+      "ghcr.io/vibewarden/httptape:latest"
+    )
+      .withCommand(["serve", "--fixtures", "/fixtures"])
+      .withExposedPorts(8081)
+      .withBindMounts([
+        { source: "./testdata/fixtures", target: "/fixtures" },
+      ])
+      .withWaitStrategy(Wait.forLogMessage("listening on"))
+      .start();
+
+    const host = container.getHost();
+    const port = container.getMappedPort(8081);
+    baseUrl = `http://${host}:${port}`;
+  });
+
+  after(async () => {
+    if (container) {
+      await container.stop();
+    }
+  });
+
+  it("replays a recorded fixture", async () => {
+    const response = await fetch(`${baseUrl}/api/users`);
+    assert.strictEqual(response.status, 200);
+  });
+});
+```
+
+Or with ES modules and a test framework like Vitest:
+
+```typescript
+import { GenericContainer, Wait } from "testcontainers";
+import { describe, it, beforeAll, afterAll, expect } from "vitest";
+
+describe("httptape replay", () => {
+  let container: any;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    container = await new GenericContainer(
+      "ghcr.io/vibewarden/httptape:latest"
+    )
+      .withCommand(["serve", "--fixtures", "/fixtures"])
+      .withExposedPorts(8081)
+      .withBindMounts([
+        { source: "./testdata/fixtures", target: "/fixtures" },
+      ])
+      .withWaitStrategy(Wait.forLogMessage("listening on"))
+      .start();
+
+    const host = container.getHost();
+    const port = container.getMappedPort(8081);
+    baseUrl = `http://${host}:${port}`;
+  });
+
+  afterAll(async () => {
+    await container?.stop();
+  });
+
+  it("replays a recorded fixture", async () => {
+    const response = await fetch(`${baseUrl}/api/users`);
+    expect(response.status).toBe(200);
+  });
+});
+```
+
+---
+
+## Generic Docker CLI
+
+If your language or test framework does not have a Testcontainers library, you can use the Docker CLI directly. This works from any language via shell commands or a Docker SDK.
+
+### Start the container
+
+```bash
+docker run -d \
+  --name httptape-mock \
+  -p 8081:8081 \
+  -v "$PWD/testdata/fixtures:/fixtures" \
+  ghcr.io/vibewarden/httptape:latest \
+  serve --fixtures /fixtures
+```
+
+### Verify it is running
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/api/users
+# 200 (if a fixture exists for GET /api/users)
+```
+
+### Use replay headers
+
+```bash
+docker run -d \
+  --name httptape-mock \
+  -p 8081:8081 \
+  -v "$PWD/testdata/fixtures:/fixtures" \
+  ghcr.io/vibewarden/httptape:latest \
+  serve --fixtures /fixtures \
+  --replay-header "Authorization=Bearer test-token" \
+  --replay-header "X-Request-Id=integration-test-001"
+```
+
+### Stop and remove
+
+```bash
+docker stop httptape-mock && docker rm httptape-mock
+```
+
+### Docker Compose
+
+```yaml
+# docker-compose.test.yml
+services:
+  httptape:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["serve", "--fixtures", "/fixtures"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./testdata/fixtures:/fixtures:ro
+```
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+# run your tests against http://localhost:8081
+docker compose -f docker-compose.test.yml down
+```
+
+---
+
+## Tips
+
+- **Fixture directory**: always mount it read-only (`:ro`) in serve mode to prevent accidental writes.
+- **Port conflicts**: use `--port` inside the container and map to a random host port (`-p 0:8081`) to avoid conflicts in CI.
+- **Wait strategies**: prefer waiting for the `"listening on"` log line rather than a fixed sleep.
+- **Replay headers**: use `--replay-header` to inject environment-specific headers (tokens, trace IDs) without editing fixtures.
+- **CORS**: pass `--cors` if your frontend tests make requests from a browser context.
+
+## See also
+
+- [Docker](docker.md) -- Dockerfile reference and Docker Compose examples
+- [Testcontainers (Go)](testcontainers.md) -- native Go Testcontainers module
+- [CLI](cli.md) -- full CLI flag reference
+- [Replay](replay.md) -- server options and replay behavior
+# Declarative Configuration
+
+Instead of building sanitization pipelines in Go code, httptape supports a JSON configuration format. This is useful for the [CLI](cli.md), [Docker](docker.md), and [Testcontainers](testcontainers.md) workflows where you want to define sanitization rules outside your Go code.
+
+## Config format
+
+```json
+{
+  "version": "1",
+  "rules": [
+    { "action": "redact_headers" },
+    { "action": "redact_body", "paths": ["$.password", "$.ssn"] },
+    { "action": "fake", "seed": "my-project-seed", "paths": ["$.user.email", "$.user.id"] }
+  ]
+}
+```
+
+### Version
+
+Must be `"1"`. This field is required.
+
+### Rules
+
+An ordered array of sanitization rules. Rules are applied sequentially, matching the Pipeline's semantics. At least one rule is required.
+
+## Actions
+
+### redact_headers
+
+Maps to `RedactHeaders()`. Replaces header values with `"[REDACTED]"`.
+
+```json
+{ "action": "redact_headers" }
+```
+
+Optionally specify which headers to redact (default: `DefaultSensitiveHeaders`):
+
+```json
+{ "action": "redact_headers", "headers": ["Authorization", "X-Custom-Secret"] }
+```
+
+### redact_body
+
+Maps to `RedactBodyPaths()`. Redacts specific fields in JSON bodies.
+
+```json
+{ "action": "redact_body", "paths": ["$.password", "$.credit_card.number", "$.tokens[*].secret"] }
+```
+
+The `paths` field is required and must be non-empty.
+
+### fake
+
+Maps to `FakeFields()`. Replaces values with deterministic HMAC-based fakes.
+
+```json
+{ "action": "fake", "seed": "my-project-seed", "paths": ["$.user.email", "$.user.id", "$.user.name"] }
+```
+
+Both `seed` and `paths` are required and must be non-empty.
+
+## Loading config in Go
+
+### From a reader
+
+```go
+f, _ := os.Open("sanitize.json")
+cfg, err := httptape.LoadConfig(f)
+if err != nil {
+    log.Fatal(err) // JSON parse error or validation error
+}
+```
+
+### From a file path
+
+```go
+cfg, err := httptape.LoadConfigFile("sanitize.json")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+### Building the pipeline
+
+```go
+pipeline := cfg.BuildPipeline()
+
+rec := httptape.NewRecorder(store,
+    httptape.WithSanitizer(pipeline),
+)
+```
+
+## Validation
+
+`LoadConfig` and `LoadConfigFile` validate the config automatically. You can also validate manually:
+
+```go
+cfg := &httptape.Config{
+    Version: "1",
+    Rules: []httptape.Rule{
+        {Action: "redact_headers"},
+    },
+}
+err := cfg.Validate()
+```
+
+Validation checks:
+- Version must be `"1"`
+- Rules must be non-empty
+- Each rule must have a known action (`redact_headers`, `redact_body`, `fake`)
+- Action-specific required fields must be present
+- All paths must use valid JSONPath-like syntax (`$.field`, `$.nested.field`, `$.array[*].field`)
+- Fields irrelevant to an action are rejected (e.g., `paths` on `redact_headers`)
+- Unknown JSON fields are rejected
+
+## JSON Schema
+
+A JSON Schema is available at [`config.schema.json`](https://github.com/VibeWarden/httptape/blob/main/config.schema.json) for IDE autocompletion and CI validation.
+
+Reference it in your config file:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/VibeWarden/httptape/main/config.schema.json",
+  "version": "1",
+  "rules": [...]
+}
+```
+
+## Complete example
+
+```json
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "redact_headers",
+      "headers": ["Authorization", "Cookie", "X-Api-Key"]
+    },
+    {
+      "action": "redact_body",
+      "paths": [
+        "$.password",
+        "$.credit_card.number",
+        "$.credit_card.cvv"
+      ]
+    },
+    {
+      "action": "fake",
+      "seed": "my-project-2024",
+      "paths": [
+        "$.user.email",
+        "$.user.phone",
+        "$.user.id",
+        "$.orders[*].customer_id"
+      ]
+    }
+  ]
+}
+```
+
+## See also
+
+- [Redaction](sanitization.md) -- programmatic redaction pipeline API
+- [CLI](cli.md) -- using config files with the CLI
+- [Docker](docker.md) -- mounting config files into containers
+# CLI Reference
+
+httptape includes a standalone CLI binary for HTTP traffic recording, redaction, and replay. It is a thin wrapper over the httptape library and works with any language or framework via HTTP.
+
+## Install
+
+```bash
+go install github.com/VibeWarden/httptape/cmd/httptape@latest
+```
+
+Or use the [Docker image](docker.md).
+
+## Commands
+
+### serve
+
+Replay recorded fixtures as a mock HTTP server.
+
+```bash
+httptape serve --fixtures ./fixtures [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fixtures` | (required) | Path to fixture directory |
+| `--port` | `8081` | Listen port |
+| `--fallback-status` | `404` | HTTP status when no tape matches |
+| `--cors` | `false` | Enable CORS headers (Access-Control-Allow-Origin: *) |
+| `--delay` | `0` | Fixed delay before every response (e.g., `200ms`, `1s`) |
+| `--error-rate` | `0` | Fraction of requests that return 500 (0.0-1.0) |
+| `--replay-header` | (none) | Header to inject into responses (`Key=Value`, repeatable) |
+
+The server uses `DefaultMatcher` (method + path matching) and loads fixtures from the specified directory. It shuts down gracefully on SIGINT/SIGTERM.
+
+**Example:**
+
+```bash
+httptape serve --fixtures ./testdata/fixtures --port 9090 --fallback-status 502
+```
+
+### record
+
+Proxy requests to an upstream server, record and redact responses.
+
+```bash
+httptape record --upstream <url> --fixtures <dir> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
+| `--fixtures` | (required) | Path to fixture directory |
+| `--config` | (none) | Path to redaction config JSON |
+| `--port` | `8081` | Listen port |
+| `--cors` | `false` | Enable CORS headers |
+
+The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
+
+The upstream URL must include the scheme and host (e.g., `https://api.example.com`).
+
+**Example:**
+
+```bash
+httptape record \
+  --upstream https://api.github.com \
+  --fixtures ./fixtures \
+  --config redact.json \
+  --port 8081
+```
+
+Then point your application at `http://localhost:8081` instead of the real API. All traffic is recorded and redacted.
+
+### proxy
+
+Forward requests to an upstream server with two-tier caching and automatic fallback. See [Proxy Mode](proxy.md) for a full guide.
+
+```bash
+httptape proxy --upstream <url> --fixtures <dir> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
+| `--fixtures` | (required) | Path to fixture directory for L2 (persistent) cache |
+| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--port` | `8081` | Listen port |
+| `--cors` | `false` | Enable CORS headers |
+| `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
+
+When the upstream is reachable, requests are forwarded and responses are cached:
+
+- **L1 (memory):** raw, unsanitized responses for best within-session fidelity
+- **L2 (disk):** redacted responses that persist across restarts
+
+When the upstream is unreachable (or returns 5xx with `--fallback-on-5xx`), the proxy serves cached responses. The `X-Httptape-Source` header indicates whether a response came from `l1-cache`, `l2-cache`, or the real upstream (header absent).
+
+**Example:**
+
+```bash
+httptape proxy \
+  --upstream https://api.staging.example.com \
+  --fixtures ./cache \
+  --config redact.json \
+  --port 3001 \
+  --cors \
+  --fallback-on-5xx
+```
+
+### export
+
+Export fixtures to a `tar.gz` bundle.
+
+```bash
+httptape export --fixtures <dir> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fixtures` | (required) | Path to fixture directory |
+| `--output` | stdout | Output file path |
+| `--routes` | (none) | Comma-separated route filter |
+| `--methods` | (none) | Comma-separated HTTP method filter |
+| `--since` | (none) | RFC 3339 timestamp filter |
+
+**Examples:**
+
+```bash
+# Export all fixtures to a file
+httptape export --fixtures ./fixtures --output bundle.tar.gz
+
+# Export only GET requests to the users-api route
+httptape export --fixtures ./fixtures --output users.tar.gz \
+  --routes users-api --methods GET
+
+# Export fixtures recorded after a specific date
+httptape export --fixtures ./fixtures --output recent.tar.gz \
+  --since 2024-01-01T00:00:00Z
+
+# Export to stdout (pipe to another tool)
+httptape export --fixtures ./fixtures | gzip -d | tar -tf -
+```
+
+### import
+
+Import fixtures from a `tar.gz` bundle.
+
+```bash
+httptape import --fixtures <dir> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fixtures` | (required) | Path to fixture directory |
+| `--input` | stdin | Input file path |
+
+Existing fixtures with the same ID are overwritten. Fixtures not in the bundle are left untouched.
+
+**Examples:**
+
+```bash
+# Import from a file
+httptape import --fixtures ./fixtures --input bundle.tar.gz
+
+# Import from stdin
+cat bundle.tar.gz | httptape import --fixtures ./fixtures
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Usage error (bad flags, missing required args) |
+| 2 | Runtime error (server failure, store error) |
+
+## Signal handling
+
+The `serve`, `record`, and `proxy` commands handle SIGINT and SIGTERM for graceful shutdown:
+
+1. Stop accepting new connections
+2. Wait up to 5 seconds for in-flight requests
+3. In record mode, flush pending recordings
+4. Exit
+
+## Typical workflow
+
+```bash
+# 1. Record traffic from a real API (with redaction)
+httptape record \
+  --upstream https://api.example.com \
+  --fixtures ./fixtures \
+  --config redact.json
+
+# 2. Export the fixtures
+httptape export --fixtures ./fixtures --output fixtures.tar.gz
+
+# 3. Import on another machine / in CI
+httptape import --fixtures ./ci-fixtures --input fixtures.tar.gz
+
+# 4. Serve the fixtures as a mock
+httptape serve --fixtures ./ci-fixtures --port 8081
+```
+
+## See also
+
+- [Proxy Mode](proxy.md) -- full guide to proxy mode with L1/L2 caching
+- [Config](config.md) -- redaction config file format
+- [Docker](docker.md) -- running httptape in containers
+- [Import/Export](import-export.md) -- programmatic API
+# Docker
+
+httptape is available as a minimal Docker image built from scratch (no OS, no shell). The image contains only the httptape binary and CA certificates.
+
+## Pull
+
+```bash
+docker pull ghcr.io/vibewarden/httptape:latest
+```
+
+## Serve mode
+
+Replay recorded fixtures:
+
+```bash
+docker run --rm \
+  -v ./fixtures:/fixtures:ro \
+  -p 8081:8081 \
+  ghcr.io/vibewarden/httptape:latest \
+  serve --fixtures /fixtures --port 8081
+```
+
+The `--fixtures` flag inside the container always points to `/fixtures` (the mount target).
+
+## Record mode
+
+Proxy and record traffic from an upstream (with redaction):
+
+```bash
+docker run --rm \
+  -v ./fixtures:/fixtures \
+  -v ./redact.json:/config/config.json:ro \
+  -p 8081:8081 \
+  ghcr.io/vibewarden/httptape:latest \
+  record --upstream https://api.example.com \
+         --fixtures /fixtures \
+         --config /config/config.json \
+         --port 8081
+```
+
+Note: the fixtures volume is mounted read-write (no `:ro`) so the recorder can write fixture files.
+
+## Proxy mode
+
+Forward to upstream with automatic fallback to cached responses:
+
+```bash
+docker run --rm \
+  -v ./cache:/fixtures \
+  -v ./redact.json:/config/config.json:ro \
+  -p 8081:8081 \
+  ghcr.io/vibewarden/httptape:latest \
+  proxy --upstream https://api.example.com \
+        --fixtures /fixtures \
+        --config /config/config.json \
+        --port 8081 \
+        --cors
+```
+
+The `--fixtures` volume stores the L2 (persistent, redacted) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
+
+See [Proxy Mode](proxy.md) for a full guide.
+
+## Volumes
+
+| Mount point | Purpose |
+|-------------|---------|
+| `/fixtures` | Fixture directory (read-write for record/proxy, read-only for serve) |
+| `/config` | Configuration directory (read-only) |
+
+Both are declared as `VOLUME` in the Dockerfile and pre-exist in the image.
+
+## Image details
+
+- **Base:** `scratch` (no OS, no shell, no package manager)
+- **Size:** ~10 MB (static Go binary + CA certs)
+- **User:** `65534` (nobody) -- runs as non-root
+- **Exposed port:** `8081`
+- **Entrypoint:** `httptape`
+
+## Docker Compose
+
+### Serve mode
+
+```yaml
+services:
+  mock-api:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["serve", "--fixtures", "/fixtures", "--port", "8081"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  my-app:
+    build: .
+    environment:
+      API_URL: http://mock-api:8081
+    depends_on:
+      - mock-api
+```
+
+### Record mode
+
+```yaml
+services:
+  recorder:
+    image: ghcr.io/vibewarden/httptape:latest
+    command:
+      - record
+      - --upstream
+      - https://api.example.com
+      - --fixtures
+      - /fixtures
+      - --config
+      - /config/config.json
+      - --port
+      - "8081"
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./fixtures:/fixtures
+      - ./redact.json:/config/config.json:ro
+```
+
+### Proxy mode (frontend dev with fallback)
+
+```yaml
+services:
+  api-proxy:
+    image: ghcr.io/vibewarden/httptape:latest
+    command:
+      - proxy
+      - --upstream
+      - https://api.staging.example.com
+      - --fixtures
+      - /fixtures
+      - --config
+      - /config/config.json
+      - --port
+      - "3001"
+      - --cors
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./cache:/fixtures
+      - ./redact.json:/config/config.json:ro
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+    depends_on:
+      - api-proxy
+```
+
+### Record then export
+
+```yaml
+services:
+  recorder:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["record", "--upstream", "https://api.example.com", "--fixtures", "/fixtures", "--port", "8081"]
+    volumes:
+      - fixture-data:/fixtures
+
+  exporter:
+    image: ghcr.io/vibewarden/httptape:latest
+    command: ["export", "--fixtures", "/fixtures", "--output", "/output/bundle.tar.gz"]
+    volumes:
+      - fixture-data:/fixtures:ro
+      - ./output:/output
+    depends_on:
+      recorder:
+        condition: service_completed_successfully
+
+volumes:
+  fixture-data:
+```
+
+## CI example
+
+Use httptape as a service container in GitHub Actions:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mock-api:
+        image: ghcr.io/vibewarden/httptape:latest
+        options: >-
+          -v ${{ github.workspace }}/fixtures:/fixtures:ro
+        ports:
+          - 8081:8081
+        # Serve mode is implied by the entrypoint + command
+        env: {}
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test ./... -count=1
+        env:
+          API_URL: http://localhost:8081
+```
+
+## Building locally
+
+```bash
+docker build -t httptape:local .
+```
+
+The Dockerfile uses a multi-stage build:
+1. **Builder stage:** Compiles the Go binary with `CGO_ENABLED=0` for a static binary
+2. **Final stage:** Copies the binary into a `scratch` image with CA certificates
+
+## See also
+
+- [CLI](cli.md) -- all commands and flags
+- [Proxy Mode](proxy.md) -- proxy mode with L1/L2 caching
+- [Config](config.md) -- redaction config file format
+- [Testcontainers](testcontainers.md) -- programmatic Docker usage in Go tests
+# Testcontainers
+
+httptape provides a Go [Testcontainers](https://golang.testcontainers.org/) module for running httptape in Docker containers during integration tests. This is useful when you want an isolated mock server without managing container lifecycle manually.
+
+## Install
+
+```bash
+go get github.com/VibeWarden/httptape/testcontainers
+```
+
+This module has external dependencies (testcontainers-go, Docker client libraries) unlike the core httptape library which is stdlib-only.
+
+## Import
+
+```go
+import httptapecontainer "github.com/VibeWarden/httptape/testcontainers"
+```
+
+The package name is `httptape` (under the `testcontainers` directory), so most users alias it to avoid collision with the main `httptape` package.
+
+## Serve mode
+
+Start a container that replays recorded fixtures:
+
+```go
+func TestWithContainer(t *testing.T) {
+    ctx := context.Background()
+
+    container, err := httptapecontainer.RunContainer(ctx,
+        httptapecontainer.WithFixturesDir("./testdata/fixtures"),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer container.Terminate(ctx)
+
+    // Use the container's URL
+    baseURL := container.BaseURL() // e.g., "http://localhost:32789"
+
+    resp, err := http.Get(baseURL + "/users/octocat")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        t.Errorf("expected 200, got %d", resp.StatusCode)
+    }
+}
+```
+
+## Record mode
+
+Start a container that proxies to an upstream and records:
+
+```go
+container, err := httptapecontainer.RunContainer(ctx,
+    httptapecontainer.WithMode(httptapecontainer.ModeRecord),
+    httptapecontainer.WithTarget("https://api.example.com"),
+    httptapecontainer.WithFixturesDir("./testdata/fixtures"),
+)
+```
+
+## Options
+
+### WithFixturesDir
+
+```go
+httptapecontainer.WithFixturesDir("./testdata/fixtures")
+```
+
+Bind-mounts a host directory to `/fixtures` in the container. Required for serve mode.
+
+### WithMode
+
+```go
+httptapecontainer.WithMode(httptapecontainer.ModeServe)   // default
+httptapecontainer.WithMode(httptapecontainer.ModeRecord)
+```
+
+Sets the CLI subcommand. `ModeServe` replays fixtures; `ModeRecord` proxies to an upstream and records.
+
+### WithTarget
+
+```go
+httptapecontainer.WithTarget("https://api.example.com")
+```
+
+Sets the upstream URL for record mode (maps to `--upstream`). Required when mode is `ModeRecord`.
+
+### WithConfig
+
+```go
+cfg := httptape.Config{
+    Version: "1",
+    Rules: []httptape.Rule{
+        {Action: "redact_headers"},
+    },
+}
+httptapecontainer.WithConfig(cfg)
+```
+
+Serializes a config struct to JSON and makes it available inside the container at `/config/config.json`. The config value must be JSON-serializable. Mutually exclusive with `WithConfigFile`.
+
+### WithConfigFile
+
+```go
+httptapecontainer.WithConfigFile("./sanitize.json")
+```
+
+Bind-mounts a host JSON config file to `/config/config.json`. Mutually exclusive with `WithConfig`.
+
+### WithImage
+
+```go
+httptapecontainer.WithImage("ghcr.io/vibewarden/httptape:v1.0.0")
+```
+
+Overrides the Docker image. Defaults to `ghcr.io/vibewarden/httptape:latest`.
+
+### WithPort
+
+```go
+httptapecontainer.WithPort("9090/tcp")
+```
+
+Sets the container's exposed port. Defaults to `8081/tcp`.
+
+## Container methods
+
+### BaseURL
+
+```go
+url := container.BaseURL() // "http://localhost:32789"
+```
+
+Returns the mapped HTTP base URL. Resolved once during startup and cached.
+
+### Endpoint
+
+```go
+endpoint, err := container.Endpoint(ctx) // "localhost:32789"
+```
+
+Returns the `host:port` string for the mapped container port.
+
+### Terminate
+
+```go
+container.Terminate(ctx)
+```
+
+Stops and removes the container. Always call this in cleanup (typically via `defer`).
+
+## Validation
+
+`RunContainer` validates options before starting the container:
+
+- `WithConfig` and `WithConfigFile` are mutually exclusive
+- Record mode requires `WithTarget`
+- Serve mode requires `WithFixturesDir`
+- Mode must be `"serve"` or `"record"`
+
+Invalid options return an error without starting a container.
+
+## Full example with sanitization
+
+```go
+func TestRecordWithSanitization(t *testing.T) {
+    ctx := context.Background()
+
+    container, err := httptapecontainer.RunContainer(ctx,
+        httptapecontainer.WithMode(httptapecontainer.ModeRecord),
+        httptapecontainer.WithTarget("https://api.example.com"),
+        httptapecontainer.WithFixturesDir("./testdata/fixtures"),
+        httptapecontainer.WithConfig(httptape.Config{
+            Version: "1",
+            Rules: []httptape.Rule{
+                {Action: "redact_headers"},
+                {Action: "fake", Seed: "test-seed", Paths: []string{"$.user.email"}},
+            },
+        }),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer container.Terminate(ctx)
+
+    // Requests through the container are proxied, recorded, and sanitized
+    client := &http.Client{}
+    resp, err := client.Get(container.BaseURL() + "/users/42")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    // Fixtures in ./testdata/fixtures/ now contain sanitized recordings
+}
+```
+
+## See also
+
+- [Docker](docker.md) -- manual Docker usage and compose files
+- [Config](config.md) -- sanitization config format
+- [CLI](cli.md) -- the commands that run inside the container
+# API Reference
+
+Quick reference of all exported types, functions, and options in the `httptape` package. httptape follows the 3 Rs: **Record, Redact, Replay**.
+
+## Core types
+
+### Tape
+
+```go
+type Tape struct {
+    ID         string       `json:"id"`
+    Route      string       `json:"route"`
+    RecordedAt time.Time    `json:"recorded_at"`
+    Request    RecordedReq  `json:"request"`
+    Response   RecordedResp `json:"response"`
+}
+
+func NewTape(route string, req RecordedReq, resp RecordedResp) Tape
+```
+
+### RecordedReq
+
+```go
+type RecordedReq struct {
+    Method           string       `json:"method"`
+    URL              string       `json:"url"`
+    Headers          http.Header  `json:"headers"`
+    Body             []byte       `json:"body"`
+    BodyHash         string       `json:"body_hash"`
+    BodyEncoding     BodyEncoding `json:"body_encoding,omitempty"`
+    Truncated        bool         `json:"truncated,omitempty"`
+    OriginalBodySize int64        `json:"original_body_size,omitempty"`
+}
+```
+
+### RecordedResp
+
+```go
+type RecordedResp struct {
+    StatusCode       int          `json:"status_code"`
+    Headers          http.Header  `json:"headers"`
+    Body             []byte       `json:"body"`
+    BodyEncoding     BodyEncoding `json:"body_encoding,omitempty"`
+    Truncated        bool         `json:"truncated,omitempty"`
+    OriginalBodySize int64        `json:"original_body_size,omitempty"`
+}
+```
+
+### BodyEncoding
+
+```go
+type BodyEncoding string
+
+const (
+    BodyEncodingIdentity BodyEncoding = "identity" // UTF-8 text
+    BodyEncodingBase64   BodyEncoding = "base64"   // binary content
+)
+```
+
+### Utility
+
+```go
+func BodyHashFromBytes(b []byte) string // SHA-256 hex hash, empty for nil/empty input
+```
+
+---
+
+## Recorder
+
+```go
+type Recorder struct { /* unexported */ }
+
+func NewRecorder(store Store, opts ...RecorderOption) *Recorder
+func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
+func (r *Recorder) Close() error
+```
+
+### RecorderOption
+
+| Option | Signature | Default |
+|--------|-----------|---------|
+| WithTransport | `WithTransport(rt http.RoundTripper)` | `http.DefaultTransport` |
+| WithRoute | `WithRoute(route string)` | `""` |
+| WithSanitizer | `WithSanitizer(s Sanitizer)` | no-op Pipeline |
+| WithAsync | `WithAsync(enabled bool)` | `true` |
+| WithBufferSize | `WithBufferSize(size int)` | `1024` |
+| WithSampling | `WithSampling(rate float64)` | `1.0` |
+| WithMaxBodySize | `WithMaxBodySize(n int)` | `0` (no limit) |
+| WithSkipRedirects | `WithSkipRedirects(skip bool)` | `false` |
+| WithOnError | `WithOnError(fn func(error))` | no-op |
+
+**Details:** [Recording](recording.md)
+
+---
+
+## Proxy
+
+```go
+type Proxy struct { /* unexported */ }
+
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
+```
+
+### ProxyOption
+
+| Option | Signature | Default |
+|--------|-----------|---------|
+| WithProxyTransport | `WithProxyTransport(rt http.RoundTripper)` | `http.DefaultTransport` |
+| WithProxySanitizer | `WithProxySanitizer(s Sanitizer)` | no-op Pipeline |
+| WithProxyMatcher | `WithProxyMatcher(m Matcher)` | `DefaultMatcher()` |
+| WithProxyRoute | `WithProxyRoute(route string)` | `""` |
+| WithProxyOnError | `WithProxyOnError(fn func(error))` | nil |
+| WithProxyFallbackOn | `WithProxyFallbackOn(fn func(error, *http.Response) bool)` | transport errors only |
+
+**Details:** [Proxy Mode](proxy.md)
+
+---
+
+## Server
+
+```go
+type Server struct { /* unexported */ }
+
+func NewServer(store Store, opts ...ServerOption) *Server
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements http.Handler
+```
+
+### ServerOption
+
+| Option | Signature | Default |
+|--------|-----------|---------|
+| WithMatcher | `WithMatcher(m Matcher)` | `DefaultMatcher()` |
+| WithFallbackStatus | `WithFallbackStatus(code int)` | `404` |
+| WithFallbackBody | `WithFallbackBody(body []byte)` | `"httptape: no matching tape found"` |
+| WithOnNoMatch | `WithOnNoMatch(fn func(*http.Request))` | nil |
+| WithCORS | `WithCORS()` | disabled |
+| WithDelay | `WithDelay(d time.Duration)` | `0` |
+| WithErrorRate | `WithErrorRate(rate float64)` | `0.0` |
+| WithReplayHeaders | `WithReplayHeaders(key, value string)` | none |
+
+**Details:** [Replay](replay.md)
+
+---
+
+## Redaction (Sanitization)
+
+### Interfaces
+
+```go
+type Sanitizer interface {
+    Sanitize(Tape) Tape
+}
+
+type SanitizeFunc func(Tape) Tape
+```
+
+### Pipeline
+
+```go
+type Pipeline struct { /* unexported */ }
+
+func NewPipeline(funcs ...SanitizeFunc) *Pipeline
+func (p *Pipeline) Sanitize(t Tape) Tape // implements Sanitizer
+```
+
+### Built-in sanitize functions
+
+| Function | Signature |
+|----------|-----------|
+| RedactHeaders | `RedactHeaders(names ...string) SanitizeFunc` |
+| RedactBodyPaths | `RedactBodyPaths(paths ...string) SanitizeFunc` |
+| FakeFields | `FakeFields(seed string, paths ...string) SanitizeFunc` |
+
+### Constants and helpers
+
+```go
+const Redacted = "[REDACTED]"
+
+func DefaultSensitiveHeaders() []string
+```
+
+**Details:** [Redaction](sanitization.md)
+
+---
+
+## Matching
+
+### Interfaces
+
+```go
+type Matcher interface {
+    Match(req *http.Request, candidates []Tape) (Tape, bool)
+}
+
+type MatcherFunc func(req *http.Request, candidates []Tape) (Tape, bool)
+func (f MatcherFunc) Match(req *http.Request, candidates []Tape) (Tape, bool)
+
+type MatchCriterion func(req *http.Request, candidate Tape) int
+```
+
+### Matchers
+
+```go
+func DefaultMatcher() *CompositeMatcher          // MatchMethod + MatchPath
+func ExactMatcher() Matcher                       // first method+path match
+func NewCompositeMatcher(criteria ...MatchCriterion) *CompositeMatcher
+```
+
+### Built-in criteria
+
+| Function | Signature | Score |
+|----------|-----------|-------|
+| MatchMethod | `MatchMethod() MatchCriterion` | 1 |
+| MatchPath | `MatchPath() MatchCriterion` | 2 |
+| MatchPathRegex | `MatchPathRegex(pattern string) (MatchCriterion, error)` | 1 |
+| MatchRoute | `MatchRoute(route string) MatchCriterion` | 1 |
+| MatchHeaders | `MatchHeaders(key, value string) MatchCriterion` | 3 |
+| MatchQueryParams | `MatchQueryParams() MatchCriterion` | 4 |
+| MatchBodyFuzzy | `MatchBodyFuzzy(paths ...string) MatchCriterion` | 6 |
+| MatchBodyHash | `MatchBodyHash() MatchCriterion` | 8 |
+
+**Details:** [Matching](matching.md)
+
+---
+
+## Storage
+
+### Interface
+
+```go
+type Store interface {
+    Save(ctx context.Context, tape Tape) error
+    Load(ctx context.Context, id string) (Tape, error)
+    List(ctx context.Context, filter Filter) ([]Tape, error)
+    Delete(ctx context.Context, id string) error
+}
+
+type Filter struct {
+    Route  string
+    Method string
+}
+
+var ErrNotFound = errors.New("httptape: tape not found")
+var ErrInvalidID = errors.New("httptape: invalid tape ID")
+```
+
+### MemoryStore
+
+```go
+func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore
+```
+
+### FileStore
+
+```go
+func NewFileStore(opts ...FileStoreOption) (*FileStore, error)
+func WithDirectory(dir string) FileStoreOption  // default: "fixtures"
+```
+
+**Details:** [Storage](storage.md)
+
+---
+
+## Import/Export
+
+```go
+func ExportBundle(ctx context.Context, s Store, opts ...ExportOption) (io.Reader, error)
+func ImportBundle(ctx context.Context, s Store, r io.Reader) error
+```
+
+### ExportOption
+
+| Option | Signature |
+|--------|-----------|
+| WithRoutes | `WithRoutes(routes ...string)` |
+| WithMethods | `WithMethods(methods ...string)` |
+| WithSince | `WithSince(t time.Time)` |
+| WithSanitizerConfig | `WithSanitizerConfig(summary string)` |
+
+### Manifest
+
+```go
+type Manifest struct {
+    ExportedAt      time.Time `json:"exported_at"`
+    FixtureCount    int       `json:"fixture_count"`
+    Routes          []string  `json:"routes"`
+    SanitizerConfig string    `json:"sanitizer_config,omitempty"`
+}
+```
+
+**Details:** [Import/Export](import-export.md)
+
+---
+
+## Configuration
+
+```go
+type Config struct {
+    Version string `json:"version"`
+    Rules   []Rule `json:"rules"`
+}
+
+type Rule struct {
+    Action  string   `json:"action"`
+    Headers []string `json:"headers,omitempty"`
+    Paths   []string `json:"paths,omitempty"`
+    Seed    string   `json:"seed,omitempty"`
+}
+
+func LoadConfig(r io.Reader) (*Config, error)
+func LoadConfigFile(path string) (*Config, error)
+func (c *Config) Validate() error
+func (c *Config) BuildPipeline() *Pipeline
+```
+
+### Action constants
+
+```go
+const (
+    ActionRedactHeaders = "redact_headers"
+    ActionRedactBody    = "redact_body"
+    ActionFake          = "fake"
+)
+```
+
+**Details:** [Config](config.md)
+
+---
+
+## Mock DSL
+
+```go
+type MockServer struct { *httptest.Server }
+
+func Mock(stubs ...Stub) *MockServer
+
+func When(m Method) *StubBuilder
+func (b *StubBuilder) Respond(status int, body ...Body) *StubBuilder
+func (b *StubBuilder) WithHeader(key, value string) *StubBuilder
+func (b *StubBuilder) Build() Stub
+
+// Method helpers
+func GET(path string) Method
+func POST(path string) Method
+func PUT(path string) Method
+func DELETE(path string) Method
+func PATCH(path string) Method
+func HEAD(path string) Method
+
+// Body helpers
+func JSON(s string) Body
+func Text(s string) Body
+func Binary(b []byte) Body
+```
+
+---
+
+## Fixtures
+
+```go
+func LoadFixtures(dir string) (*FileStore, error)
+func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
+```

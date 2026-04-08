@@ -1,10 +1,11 @@
 # Getting Started
 
-Record, replay, and sanitize HTTP traffic in 5 minutes.
+Record, Redact, and Replay HTTP traffic in 5 minutes.
 
 ## Prerequisites
 
-- Go 1.22 or later
+- Go 1.22 or later (for the Go library)
+- Or: Docker (for CLI/Docker usage with any language)
 - `go get github.com/VibeWarden/httptape`
 
 ## Step 1: Record HTTP traffic
@@ -85,9 +86,9 @@ func main() {
 }
 ```
 
-## Step 3: Add sanitization
+## Step 3: Redact sensitive data
 
-Redact sensitive data before it touches disk:
+Strip secrets and PII before anything touches disk:
 
 ```go
 package main
@@ -197,6 +198,7 @@ func TestWithMemoryStore(t *testing.T) {
 ## Next steps
 
 - [Recording](recording.md) -- async/sync modes, sampling, body size limits
-- [Sanitization](sanitization.md) -- full guide to redaction and faking
+- [Redaction](sanitization.md) -- full guide to redaction and faking
+- [Proxy Mode](proxy.md) -- forward to upstream with fallback-to-cache
 - [Matching](matching.md) -- control how requests match recorded tapes
-- [CLI](cli.md) -- use httptape as a standalone proxy
+- [CLI](cli.md) -- use httptape as a standalone tool (any language)

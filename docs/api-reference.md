@@ -1,6 +1,6 @@
 # API Reference
 
-Quick reference of all exported types, functions, and options in the `httptape` package.
+Quick reference of all exported types, functions, and options in the `httptape` package. httptape follows the 3 Rs: **Record, Redact, Replay**.
 
 ## Core types
 
@@ -93,6 +93,30 @@ func (r *Recorder) Close() error
 
 ---
 
+## Proxy
+
+```go
+type Proxy struct { /* unexported */ }
+
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
+```
+
+### ProxyOption
+
+| Option | Signature | Default |
+|--------|-----------|---------|
+| WithProxyTransport | `WithProxyTransport(rt http.RoundTripper)` | `http.DefaultTransport` |
+| WithProxySanitizer | `WithProxySanitizer(s Sanitizer)` | no-op Pipeline |
+| WithProxyMatcher | `WithProxyMatcher(m Matcher)` | `DefaultMatcher()` |
+| WithProxyRoute | `WithProxyRoute(route string)` | `""` |
+| WithProxyOnError | `WithProxyOnError(fn func(error))` | nil |
+| WithProxyFallbackOn | `WithProxyFallbackOn(fn func(error, *http.Response) bool)` | transport errors only |
+
+**Details:** [Proxy Mode](proxy.md)
+
+---
+
 ## Server
 
 ```go
@@ -110,12 +134,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements
 | WithFallbackStatus | `WithFallbackStatus(code int)` | `404` |
 | WithFallbackBody | `WithFallbackBody(body []byte)` | `"httptape: no matching tape found"` |
 | WithOnNoMatch | `WithOnNoMatch(fn func(*http.Request))` | nil |
+| WithCORS | `WithCORS()` | disabled |
+| WithDelay | `WithDelay(d time.Duration)` | `0` |
+| WithErrorRate | `WithErrorRate(rate float64)` | `0.0` |
+| WithReplayHeaders | `WithReplayHeaders(key, value string)` | none |
 
 **Details:** [Replay](replay.md)
 
 ---
 
-## Sanitization
+## Redaction (Sanitization)
 
 ### Interfaces
 
@@ -152,7 +180,7 @@ const Redacted = "[REDACTED]"
 func DefaultSensitiveHeaders() []string
 ```
 
-**Details:** [Sanitization](sanitization.md)
+**Details:** [Redaction](sanitization.md)
 
 ---
 
@@ -297,3 +325,40 @@ const (
 ```
 
 **Details:** [Config](config.md)
+
+---
+
+## Mock DSL
+
+```go
+type MockServer struct { *httptest.Server }
+
+func Mock(stubs ...Stub) *MockServer
+
+func When(m Method) *StubBuilder
+func (b *StubBuilder) Respond(status int, body ...Body) *StubBuilder
+func (b *StubBuilder) WithHeader(key, value string) *StubBuilder
+func (b *StubBuilder) Build() Stub
+
+// Method helpers
+func GET(path string) Method
+func POST(path string) Method
+func PUT(path string) Method
+func DELETE(path string) Method
+func PATCH(path string) Method
+func HEAD(path string) Method
+
+// Body helpers
+func JSON(s string) Body
+func Text(s string) Body
+func Binary(b []byte) Body
+```
+
+---
+
+## Fixtures
+
+```go
+func LoadFixtures(dir string) (*FileStore, error)
+func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
+```

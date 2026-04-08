@@ -24,12 +24,12 @@ The `--fixtures` flag inside the container always points to `/fixtures` (the mou
 
 ## Record mode
 
-Proxy and record traffic from an upstream:
+Proxy and record traffic from an upstream (with redaction):
 
 ```bash
 docker run --rm \
   -v ./fixtures:/fixtures \
-  -v ./sanitize.json:/config/config.json:ro \
+  -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
   ghcr.io/vibewarden/httptape:latest \
   record --upstream https://api.example.com \
@@ -40,11 +40,32 @@ docker run --rm \
 
 Note: the fixtures volume is mounted read-write (no `:ro`) so the recorder can write fixture files.
 
+## Proxy mode
+
+Forward to upstream with automatic fallback to cached responses:
+
+```bash
+docker run --rm \
+  -v ./cache:/fixtures \
+  -v ./redact.json:/config/config.json:ro \
+  -p 8081:8081 \
+  ghcr.io/vibewarden/httptape:latest \
+  proxy --upstream https://api.example.com \
+        --fixtures /fixtures \
+        --config /config/config.json \
+        --port 8081 \
+        --cors
+```
+
+The `--fixtures` volume stores the L2 (persistent, redacted) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
+
+See [Proxy Mode](proxy.md) for a full guide.
+
 ## Volumes
 
 | Mount point | Purpose |
 |-------------|---------|
-| `/fixtures` | Fixture directory (read-write for record, read-only for serve) |
+| `/fixtures` | Fixture directory (read-write for record/proxy, read-only for serve) |
 | `/config` | Configuration directory (read-only) |
 
 Both are declared as `VOLUME` in the Dockerfile and pre-exist in the image.
@@ -99,7 +120,41 @@ services:
       - "8081:8081"
     volumes:
       - ./fixtures:/fixtures
-      - ./sanitize.json:/config/config.json:ro
+      - ./redact.json:/config/config.json:ro
+```
+
+### Proxy mode (frontend dev with fallback)
+
+```yaml
+services:
+  api-proxy:
+    image: ghcr.io/vibewarden/httptape:latest
+    command:
+      - proxy
+      - --upstream
+      - https://api.staging.example.com
+      - --fixtures
+      - /fixtures
+      - --config
+      - /config/config.json
+      - --port
+      - "3001"
+      - --cors
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./cache:/fixtures
+      - ./redact.json:/config/config.json:ro
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+    depends_on:
+      - api-proxy
 ```
 
 ### Record then export
@@ -163,5 +218,6 @@ The Dockerfile uses a multi-stage build:
 ## See also
 
 - [CLI](cli.md) -- all commands and flags
-- [Config](config.md) -- sanitization config file format
+- [Proxy Mode](proxy.md) -- proxy mode with L1/L2 caching
+- [Config](config.md) -- redaction config file format
 - [Testcontainers](testcontainers.md) -- programmatic Docker usage in Go tests

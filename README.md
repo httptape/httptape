@@ -2,11 +2,11 @@
   <img src="assets/logo.png" alt="httptape logo" width="300">
 </p>
 
-<h3 align="center">record, redact, replay</h3>
+<h3 align="center">Record, Redact, Replay</h3>
 
 <p align="center">
-  HTTP traffic recording, sanitization, and replay for Go.<br>
-  <strong>Embeddable library · CLI · Docker · Testcontainers</strong>
+  HTTP traffic recording, redaction, and replay.<br>
+  <strong>Embeddable Go library · CLI · Docker · Testcontainers</strong>
 </p>
 
 <p align="center">
@@ -17,16 +17,22 @@
 
 ---
 
-httptape captures HTTP request/response pairs, sanitizes sensitive data on write,
-and replays them as a mock server. Think WireMock, but native Go, 6 MB Docker image,
-and with sanitization built into the core.
+httptape captures HTTP request/response pairs, redacts sensitive data on write,
+and replays them as a mock server. Think WireMock, but with a 6 MB Docker image,
+an embeddable Go library, and a redaction pipeline built into the core.
+
+**The 3 Rs:**
+
+1. **Record** -- capture real HTTP traffic via a transparent `http.RoundTripper`
+2. **Redact** -- strip secrets and PII on write, before anything touches disk
+3. **Replay** -- serve recorded fixtures as a deterministic mock server
 
 ## Why httptape?
 
-- **WireMock requires Java** — separate process, 200 MB+ memory, can't embed in a Go binary
-- **Go mocking libraries** (`gock`, `httpmock`) only work inside test code — no standalone server, no recording, no fixture management
-- **json-server / Mockoon** — no recording, no sanitization, manual fixture writing only
-- **Nobody does sanitization** — existing tools record raw traffic including secrets and PII. httptape sanitizes on write — sensitive data never hits disk
+- **WireMock requires Java** -- separate process, 200 MB+ memory, can't embed in a Go binary
+- **Go mocking libraries** (`gock`, `httpmock`) only work inside test code -- no standalone server, no recording, no fixture management
+- **json-server / Mockoon** -- no recording, no redaction, manual fixture writing only
+- **Nobody does redaction** -- existing tools record raw traffic including secrets and PII. httptape redacts on write -- sensitive data never hits disk
 
 ## Use cases
 
@@ -39,7 +45,7 @@ rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
 defer rec.Close()
 
 client := &http.Client{Transport: rec}
-// ... hit real APIs, fixtures are recorded and sanitized ...
+// ... hit real APIs, fixtures are recorded and redacted ...
 
 srv := httptape.NewServer(store)
 ts := httptest.NewServer(srv)
@@ -47,18 +53,18 @@ ts := httptest.NewServer(srv)
 ```
 
 ### Frontend-first development
-Use httptape as a mock backend while building your UI — no real backend needed.
+Use httptape as a mock backend while building your UI -- no real backend needed.
 
 ```bash
 # Hand-write fixtures or record from a staging API
 httptape record --upstream https://staging-api.example.com \
-    --fixtures ./mocks --config sanitize.json
+    --fixtures ./mocks --config redact.json
 
 # Serve as a mock backend for your frontend
 httptape serve --fixtures ./mocks --port 3001
 ```
 
-Your frontend on `localhost:3000` hits httptape on `localhost:3001`. Edit JSON fixture files, and the next request picks up the changes — instant hot-reload.
+Your frontend on `localhost:3000` hits httptape on `localhost:3001`. Edit JSON fixture files, and the next request picks up the changes -- instant hot-reload.
 
 ### Production traffic capture
 Record a sample of live traffic, safely redacted:
@@ -70,7 +76,17 @@ docker run -v ./fixtures:/fixtures -v ./config.json:/config/config.json \
     --fixtures /fixtures --config /config/config.json
 ```
 
-Sensitive data (secrets, PII) is redacted before it touches disk. Export sanitized fixtures for dev/CI use.
+Sensitive data (secrets, PII) is redacted before it touches disk. Export redacted fixtures for dev/CI use.
+
+### Fallback proxy
+Use proxy mode for frontend development with automatic fallback to cached responses when the backend is unavailable:
+
+```bash
+httptape proxy --upstream https://api.example.com \
+    --fixtures ./cache --config redact.json
+```
+
+When the upstream is reachable, requests are forwarded and responses are cached in two tiers (L1 in-memory, L2 on disk). When the upstream is down, httptape transparently serves cached responses. See [Proxy Mode](docs/proxy.md) for details.
 
 ## Install
 
@@ -103,9 +119,9 @@ resp, err := client.Get("https://api.github.com/users/octocat")
 // Tape is automatically saved to store
 ```
 
-### Sanitize
+### Redact
 
-Redact secrets and fake PII — on write, before anything hits disk:
+Strip secrets and fake PII -- on write, before anything hits disk:
 
 ```go
 sanitizer := httptape.NewPipeline(
@@ -165,10 +181,24 @@ mem := httptape.NewMemoryStore()
 fs := httptape.NewFileStore(httptape.WithDirectory("./testdata/fixtures"))
 ```
 
+### Proxy (fallback-to-cache)
+
+```go
+l1 := httptape.NewMemoryStore()
+l2, _ := httptape.NewFileStore(httptape.WithDirectory("./cache"))
+
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxySanitizer(sanitizer),
+)
+client := &http.Client{Transport: proxy}
+// Upstream reachable: real response returned, cached in L1 + L2
+// Upstream down: cached response returned transparently
+```
+
 ### Import / Export
 
 ```go
-// Export sanitized fixtures as a portable bundle
+// Export redacted fixtures as a portable bundle
 r, _ := httptape.ExportBundle(ctx, store,
     httptape.WithRoutes("stripe-api"),
     httptape.WithSince(time.Now().Add(-24*time.Hour)),
@@ -182,7 +212,8 @@ httptape.ImportBundle(ctx, store, r)
 
 ```bash
 httptape serve   --fixtures ./mocks --port 8081
-httptape record  --upstream https://api.example.com --fixtures ./mocks --config sanitize.json
+httptape record  --upstream https://api.example.com --fixtures ./mocks --config redact.json
+httptape proxy   --upstream https://api.example.com --fixtures ./cache --config redact.json
 httptape export  --fixtures ./mocks --output bundle.tar.gz
 httptape import  --fixtures ./mocks --input bundle.tar.gz
 ```
@@ -193,9 +224,14 @@ httptape import  --fixtures ./mocks --input bundle.tar.gz
 # Replay mode
 docker run -v ./mocks:/fixtures -p 8081:8081 tibtof/httptape serve --fixtures /fixtures
 
-# Record mode (with sanitization)
+# Record mode (with redaction)
 docker run -v ./mocks:/fixtures -v ./config.json:/config/config.json -p 8081:8081 \
     tibtof/httptape record --upstream https://api.example.com \
+    --fixtures /fixtures --config /config/config.json
+
+# Proxy mode (with fallback-to-cache)
+docker run -v ./cache:/fixtures -v ./config.json:/config/config.json -p 8081:8081 \
+    tibtof/httptape proxy --upstream https://api.example.com \
     --fixtures /fixtures --config /config/config.json
 ```
 
@@ -223,8 +259,9 @@ resp, _ := http.Get(container.BaseURL() + "/api/users")
 | Standalone server | **yes** | yes | yes | no | no |
 | Docker | **6 MB** | 200 MB+ | 50 MB+ | n/a | n/a |
 | Recording | **yes** | yes | no | no | no |
-| Sanitization on write | **yes** | no | no | no | no |
+| Redaction on write | **yes** | no | no | no | no |
 | Deterministic faking | **yes** | no | no | no | no |
+| Proxy with fallback | **yes** | no | no | no | no |
 | Frontend mock backend | **yes** | yes | yes | yes (browser) | no |
 | Fixture import/export | **yes** | partial | no | no | no |
 | Dependencies | **zero** | JVM | npm | npm | 1 |
@@ -234,20 +271,21 @@ resp, _ := http.Get(container.BaseURL() + "/api/users")
 | Decision | Choice | Reason |
 |---|---|---|
 | Dependencies | stdlib only | Zero transitive deps for embedders |
-| Sanitization | On write | Sensitive data never touches disk |
-| Faking | HMAC-SHA256 | Deterministic — same input always produces the same fake |
+| Redaction | On write | Sensitive data never touches disk |
+| Faking | HMAC-SHA256 | Deterministic -- same input always produces the same fake |
 | Fixtures | JSON | Human-readable, easy to inspect and edit |
 | Storage | Pluggable | `MemoryStore` for tests, `FileStore` for persistence |
 | Recording | Async by default | Non-blocking, minimal hot-path overhead |
 | Matching | Composable | Start simple, add specificity as needed |
+| Proxy | L1/L2 caching | Raw in-memory for session, redacted on disk for persistence |
 
 ## Documentation
 
 - [Getting Started](docs/getting-started.md)
-- [Recording](docs/recording.md) · [Replay](docs/replay.md) · [Sanitization](docs/sanitization.md)
-- [Matching](docs/matching.md) · [Storage](docs/storage.md) · [Import/Export](docs/import-export.md)
-- [JSON Config](docs/config.md) · [CLI Reference](docs/cli.md)
-- [Docker](docs/docker.md) · [Testcontainers](docs/testcontainers.md)
+- [Recording](docs/recording.md) · [Replay](docs/replay.md) · [Redaction](docs/sanitization.md)
+- [Proxy Mode](docs/proxy.md) · [Matching](docs/matching.md) · [Storage](docs/storage.md)
+- [Import/Export](docs/import-export.md) · [JSON Config](docs/config.md)
+- [CLI Reference](docs/cli.md) · [Docker](docs/docker.md) · [Testcontainers](docs/testcontainers.md)
 - [API Reference](docs/api-reference.md)
 
 ## License

@@ -1,5 +1,5 @@
 site_name: httptape
-site_description: HTTP traffic recording, sanitization, and replay for Go.
+site_description: "Record, Redact, Replay -- HTTP traffic recording, redaction, and replay."
 site_url: https://vibewarden.dev/docs/httptape
 repo_url: https://github.com/VibeWarden/httptape
 repo_name: VibeWarden/httptape
@@ -64,7 +64,8 @@ nav:
   - Core Concepts:
       - Recording: recording.md
       - Replay: replay.md
-      - Sanitization: sanitization.md
+      - Redaction: sanitization.md
+      - Proxy Mode: proxy.md
       - Matching: matching.md
       - Storage: storage.md
   - Guides:
