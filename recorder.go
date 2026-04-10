@@ -3,6 +3,7 @@ package httptape
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -151,6 +152,25 @@ func WithMaxBodySize(n int) RecorderOption {
 func WithSkipRedirects(skip bool) RecorderOption {
 	return func(r *Recorder) {
 		r.skipRedirects = skip
+	}
+}
+
+// WithRecorderTLSConfig sets the TLS configuration for outbound connections.
+// The provided config is applied to the inner http.Transport's TLSClientConfig.
+// If the current transport is not an *http.Transport, a new *http.Transport is
+// created with the TLS config set.
+//
+// If cfg is nil, this option is a no-op.
+func WithRecorderTLSConfig(cfg *tls.Config) RecorderOption {
+	return func(r *Recorder) {
+		if cfg == nil {
+			return
+		}
+		if t, ok := r.transport.(*http.Transport); ok {
+			t.TLSClientConfig = cfg
+			return
+		}
+		r.transport = &http.Transport{TLSClientConfig: cfg}
 	}
 }
 

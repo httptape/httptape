@@ -76,6 +76,7 @@ nav:
   - Operations:
       - Configuration: config.md
       - CLI: cli.md
+      - TLS / mTLS: tls.md
       - Docker: docker.md
       - Testcontainers: testcontainers.md
   - API Reference: api-reference.md

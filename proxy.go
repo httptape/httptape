@@ -3,6 +3,7 @@ package httptape
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -91,6 +92,25 @@ func WithProxyOnError(fn func(error)) ProxyOption {
 func WithProxyFallbackOn(fn func(err error, resp *http.Response) bool) ProxyOption {
 	return func(p *Proxy) {
 		p.isFallback = fn
+	}
+}
+
+// WithProxyTLSConfig sets the TLS configuration for outbound connections.
+// The provided config is applied to the inner http.Transport's TLSClientConfig.
+// If the current transport is not an *http.Transport, a new *http.Transport is
+// created with the TLS config set.
+//
+// If cfg is nil, this option is a no-op.
+func WithProxyTLSConfig(cfg *tls.Config) ProxyOption {
+	return func(p *Proxy) {
+		if cfg == nil {
+			return
+		}
+		if t, ok := p.transport.(*http.Transport); ok {
+			t.TLSClientConfig = cfg
+			return
+		}
+		p.transport = &http.Transport{TLSClientConfig: cfg}
 	}
 }
 

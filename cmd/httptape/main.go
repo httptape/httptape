@@ -204,6 +204,10 @@ func runRecord(args []string) error {
 	configPath := fs.String("config", "", "Path to sanitization config JSON")
 	port := fs.Int("port", 8081, "Listen port")
 	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
+	tlsCert := fs.String("tls-cert", "", "Path to PEM client certificate for mTLS")
+	tlsKey := fs.String("tls-key", "", "Path to PEM client private key for mTLS")
+	tlsCA := fs.String("tls-ca", "", "Path to PEM CA certificate(s) for upstream verification")
+	tlsInsecure := fs.Bool("tls-insecure", false, "Skip TLS verification (dev only)")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -231,11 +235,24 @@ func runRecord(args []string) error {
 		return fmt.Errorf("create store: %w", err)
 	}
 
+	if *tlsInsecure {
+		logger.Println("WARNING: --tls-insecure disables TLS verification. Do not use in production.")
+	}
+
+	tlsCfg, err := httptape.BuildTLSConfig(*tlsCert, *tlsKey, *tlsCA, *tlsInsecure)
+	if err != nil {
+		return &usageError{err}
+	}
+
 	var recorderOpts []httptape.RecorderOption
 	recorderOpts = append(recorderOpts, httptape.WithAsync(true))
 	recorderOpts = append(recorderOpts, httptape.WithOnError(func(err error) {
 		logger.Printf("recorder error: %v", err)
 	}))
+
+	if tlsCfg != nil {
+		recorderOpts = append(recorderOpts, httptape.WithRecorderTLSConfig(tlsCfg))
+	}
 
 	if *configPath != "" {
 		cfg, err := httptape.LoadConfigFile(*configPath)
@@ -313,6 +330,10 @@ func runProxy(args []string) error {
 	port := fs.Int("port", 8081, "Listen port")
 	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
 	fallbackOn5xx := fs.Bool("fallback-on-5xx", false, "Also fall back on 5xx responses from upstream")
+	tlsCert := fs.String("tls-cert", "", "Path to PEM client certificate for mTLS")
+	tlsKey := fs.String("tls-key", "", "Path to PEM client private key for mTLS")
+	tlsCA := fs.String("tls-ca", "", "Path to PEM CA certificate(s) for upstream verification")
+	tlsInsecure := fs.Bool("tls-insecure", false, "Skip TLS verification (dev only)")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -341,10 +362,23 @@ func runProxy(args []string) error {
 		return fmt.Errorf("create L2 store: %w", err)
 	}
 
+	if *tlsInsecure {
+		logger.Println("WARNING: --tls-insecure disables TLS verification. Do not use in production.")
+	}
+
+	tlsCfg, err := httptape.BuildTLSConfig(*tlsCert, *tlsKey, *tlsCA, *tlsInsecure)
+	if err != nil {
+		return &usageError{err}
+	}
+
 	var proxyOpts []httptape.ProxyOption
 	proxyOpts = append(proxyOpts, httptape.WithProxyOnError(func(err error) {
 		logger.Printf("proxy error: %v", err)
 	}))
+
+	if tlsCfg != nil {
+		proxyOpts = append(proxyOpts, httptape.WithProxyTLSConfig(tlsCfg))
+	}
 
 	if *configPath != "" {
 		cfg, err := httptape.LoadConfigFile(*configPath)
