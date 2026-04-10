@@ -391,11 +391,12 @@ func FakeFieldsWith(seed string, fields map[string]Faker) SanitizeFunc {
 	return func(t Tape) Tape {
 		newReqBody := fakeBodyFieldsWith(t.Request.Body, pfs, seed)
 		if !bytes.Equal(newReqBody, t.Request.Body) {
-			t.Request.Body = newReqBody
 			t.Request.BodyHash = BodyHashFromBytes(newReqBody)
-		} else {
-			t.Request.Body = newReqBody
 		}
+		t.Request.Body = newReqBody
+		// Note: BodyHash is updated for the request but not for the response
+		// because RecordedResp does not have a BodyHash field. If a BodyHash
+		// field is ever added to RecordedResp, it must be updated here too.
 		t.Response.Body = fakeBodyFieldsWith(t.Response.Body, pfs, seed)
 		return t
 	}

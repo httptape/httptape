@@ -234,11 +234,9 @@ func RedactBodyPaths(paths ...string) SanitizeFunc {
 	return func(t Tape) Tape {
 		newReqBody := redactBodyFields(t.Request.Body, parsed)
 		if !bytes.Equal(newReqBody, t.Request.Body) {
-			t.Request.Body = newReqBody
 			t.Request.BodyHash = BodyHashFromBytes(newReqBody)
-		} else {
-			t.Request.Body = newReqBody
 		}
+		t.Request.Body = newReqBody
 		// Note: BodyHash is updated for the request but not for the response
 		// because RecordedResp does not have a BodyHash field. If a BodyHash
 		// field is ever added to RecordedResp, it must be updated here too.
@@ -386,11 +384,9 @@ func FakeFields(seed string, paths ...string) SanitizeFunc {
 	return func(t Tape) Tape {
 		newReqBody := fakeBodyFields(t.Request.Body, parsed, seed)
 		if !bytes.Equal(newReqBody, t.Request.Body) {
-			t.Request.Body = newReqBody
 			t.Request.BodyHash = BodyHashFromBytes(newReqBody)
-		} else {
-			t.Request.Body = newReqBody
 		}
+		t.Request.Body = newReqBody
 		// Note: BodyHash is updated for the request but not for the response
 		// because RecordedResp does not have a BodyHash field. If a BodyHash
 		// field is ever added to RecordedResp, it must be updated here too.

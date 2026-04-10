@@ -7059,13 +7059,13 @@ deterministic output from the HMAC hash bytes.
 | `FixedFaker` | Returns a caller-supplied constant value | `Value any` |
 | `HMACFaker` | `fake_<hex8>` for strings, positive int for numbers (current generic behavior) | None |
 | `EmailFaker` | `user_<hex8>@example.com` (current email behavior) | None |
-| `PhoneFaker` | `+<country>-555-<hex7digits>` preserving original country code prefix | None |
+| `PhoneFaker` | Digit-by-digit HMAC replacement preserving original formatting (dashes, spaces, parens, plus signs) | None |
 | `CreditCardFaker` | Preserves issuer prefix (first 6 digits), fills middle with HMAC-derived digits, computes valid Luhn check digit | None |
 | `NumericFaker` | HMAC-derived decimal digits of specified length | `Length int` |
-| `DateFaker` | Valid date in caller-specified Go `time.Format` layout, derived from HMAC bytes mapped to valid year/month/day ranges | `Format string` |
+| `DateFaker` | Deterministic date from epoch offset (2000-01-01 + HMAC-derived days mod ~100 years), formatted with caller-specified Go `time.Format` layout | `Format string` |
 | `PatternFaker` | Fills `#` with digits (0-9), `?` with lowercase letters (a-z), literal chars preserved | `Pattern string` |
 | `PrefixFaker` | `<prefix><hex8>` | `Prefix string` |
-| `AddressFaker` | `<number> <street>, <city>, ST <zip>` with deterministic number/street/city/state/zip drawn from small built-in lists indexed by HMAC bytes | None |
+| `AddressFaker` | `<number> <street> <suffix>, <city>, <state> <zip>` with deterministic components drawn from small built-in lists (10 entries each) indexed by HMAC bytes | None |
 
 **Determinism guarantee**: every faker derives its output solely from
 `computeHMAC(seed, fmt.Sprintf("%v", original))`. No randomness, no
@@ -7076,18 +7076,20 @@ using the standard Luhn mod-10 algorithm over the first 15 digits
 (6-digit issuer prefix from the original + 9 HMAC-derived digits). This
 is a pure arithmetic function -- no external dependencies.
 
-**`PhoneFaker` country code preservation**: The faker parses the leading
-`+<digits>` from the original value. If no country code is detected, it
-defaults to `+1`. The remaining digits are replaced with HMAC-derived
-digits, formatted as `+<cc>-555-<digits>` where the digit count matches
-the original (minus country code and separator chars).
+**`PhoneFaker` digit-by-digit replacement**: Each digit in the original
+string is replaced with an HMAC-derived digit (0-9). All non-digit
+characters (dashes, spaces, parentheses, plus signs) are preserved in
+their original positions, maintaining the phone number's formatting.
+If the HMAC bytes are exhausted, a new HMAC is computed from the
+current output to chain additional bytes.
 
-**`DateFaker` valid date generation**: HMAC bytes are mapped to ranges:
-year [2020-2029], month [1-12], day [1-28] (always valid). The result is
-formatted using the caller-specified Go `time.Format` layout string.
+**`DateFaker` epoch offset generation**: The first 4 HMAC bytes are
+interpreted as a uint32 days offset from 2000-01-01, modulo 36525
+(~100 years). The resulting date is formatted using the caller-specified
+Go `time.Format` layout string (default: "2006-01-02").
 
-**`AddressFaker` built-in data**: A small hardcoded list of 16 street
-names, 16 city names, and 50 US state abbreviations. The HMAC bytes
+**`AddressFaker` built-in data**: A small hardcoded list of 10 street
+names, 10 street suffixes, 10 city names, and 50 US state abbreviations. The HMAC bytes
 select indices into these lists. The house number is derived from the
 first 2 HMAC bytes (range [1-9999]). The zip code is 5 HMAC-derived
 digits.
