@@ -311,6 +311,9 @@ func (p *Proxy) tapeToResponse(tape Tape, source string) *http.Response {
 		header = tape.Response.Headers.Clone()
 	}
 	header.Set("X-Httptape-Source", source)
+	// Remove stale Content-Length — the body may differ from the original
+	// due to sanitization. Let the HTTP stack set it from actual body size.
+	header.Del("Content-Length")
 
 	body := tape.Response.Body
 	if body == nil {
