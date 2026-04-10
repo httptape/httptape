@@ -690,3 +690,41 @@ func TestFakeFieldsWith_Deterministic(t *testing.T) {
 		t.Errorf("non-deterministic:\n  first:  %s\n  second: %s", r1.Request.Body, r2.Request.Body)
 	}
 }
+
+func TestNameFaker(t *testing.T) {
+	f := NameFaker{}
+
+	// Deterministic: same input = same output.
+	r1 := f.Fake("seed", "Alice Johnson")
+	r2 := f.Fake("seed", "Alice Johnson")
+	if r1 != r2 {
+		t.Errorf("not deterministic: %v vs %v", r1, r2)
+	}
+
+	// Produces a "First Last" format.
+	name, ok := r1.(string)
+	if !ok {
+		t.Fatalf("expected string, got %T", r1)
+	}
+	parts := strings.Fields(name)
+	if len(parts) != 2 {
+		t.Errorf("expected 'First Last', got %q", name)
+	}
+
+	// Different input = different output.
+	r3 := f.Fake("seed", "Bob Smith")
+	if r1 == r3 {
+		t.Errorf("different inputs produced same name: %v", r1)
+	}
+
+	// Different seed = different output.
+	r4 := f.Fake("other-seed", "Alice Johnson")
+	if r1 == r4 {
+		t.Errorf("different seeds produced same name: %v", r1)
+	}
+
+	// Non-string passthrough.
+	if f.Fake("seed", 42.0) != 42.0 {
+		t.Error("non-string should pass through")
+	}
+}

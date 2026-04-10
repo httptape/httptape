@@ -223,6 +223,7 @@ var validShorthands = map[string]func() Faker{
 	"phone":       func() Faker { return PhoneFaker{} },
 	"credit_card": func() Faker { return CreditCardFaker{} },
 	"address":     func() Faker { return AddressFaker{} },
+	"name":        func() Faker { return NameFaker{} },
 }
 
 // parseFakerSpec parses a faker specification from a config value.
