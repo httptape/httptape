@@ -179,6 +179,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Headers",
 			"Content-Type, Authorization, X-Requested-With, Accept")
 		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("Access-Control-Expose-Headers",
+			"X-Httptape-Source, X-Httptape-Error")
 
 		// Handle OPTIONS preflight: return 204 with CORS headers, no body.
 		if r.Method == http.MethodOptions {

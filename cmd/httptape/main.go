@@ -280,6 +280,7 @@ func runRecord(args []string) error {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept")
 			w.Header().Set("Access-Control-Max-Age", "86400")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Httptape-Source, X-Httptape-Error")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -415,6 +416,7 @@ func runProxy(args []string) error {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept")
 			w.Header().Set("Access-Control-Max-Age", "86400")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Httptape-Source, X-Httptape-Error")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
