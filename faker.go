@@ -288,6 +288,39 @@ func (f PrefixFaker) Fake(seed string, original any) any {
 	return f.Prefix + hex.EncodeToString(h[:8])
 }
 
+// NameFaker generates a deterministic full name from HMAC.
+// Picks a first name and last name from fixed lists using HMAC bytes.
+// Non-string values are returned unchanged.
+type NameFaker struct{}
+
+// Fake implements Faker.
+func (f NameFaker) Fake(seed string, original any) any {
+	s, ok := original.(string)
+	if !ok {
+		return original
+	}
+	h := computeHMAC(seed, s)
+	first := firstNames[h[0]%byte(len(firstNames))]
+	last := lastNames[h[1]%byte(len(lastNames))]
+	return first + " " + last
+}
+
+// firstNames is a fixed list of first names for NameFaker.
+var firstNames = []string{
+	"James", "Emma", "Liam", "Olivia", "Noah",
+	"Ava", "Lucas", "Sophia", "Mason", "Isabella",
+	"Ethan", "Mia", "Logan", "Charlotte", "Aiden",
+	"Amelia", "Jackson", "Harper", "Sebastian", "Evelyn",
+}
+
+// lastNames is a fixed list of last names for NameFaker.
+var lastNames = []string{
+	"Smith", "Johnson", "Williams", "Brown", "Jones",
+	"Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+	"Anderson", "Taylor", "Thomas", "Moore", "Jackson",
+	"Martin", "Lee", "Thompson", "White", "Harris",
+}
+
 // streetNames is a fixed list of street names for AddressFaker.
 var streetNames = []string{
 	"Oak", "Maple", "Cedar", "Elm", "Pine",
