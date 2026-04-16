@@ -1,16 +1,12 @@
 services:
   upstream:
-    image: httptape:demo
-    build:
-      context: ../..
+    image: ghcr.io/vibewarden/httptape:0.9.0
     command: ["serve", "--fixtures", "/fixtures"]
     volumes:
       - ./mocks/upstream-fixtures:/fixtures:ro
 
   proxy:
-    image: httptape:demo
-    build:
-      context: ../..
+    image: ghcr.io/vibewarden/httptape:0.9.0
     command:
       - proxy
       - --upstream

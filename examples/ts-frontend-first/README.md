@@ -62,12 +62,14 @@ No polling, no manual refresh. See [`src/useHealthStream.ts`](src/useHealthStrea
 ## Quick start
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
-The first time, this builds `httptape:demo` from this repository's root `Dockerfile` (the version in this example needs the health endpoint, which ships in v0.9.0+). Subsequent runs are fast.
+Pulls `ghcr.io/vibewarden/httptape:v0.9.0` (the version that introduced the health endpoint) and builds the React frontend. No local Go build needed.
 
 Open [http://localhost:3000](http://localhost:3000).
+
+> Pinned to `v0.9.0` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
 
 ## Try it
 
@@ -128,6 +130,6 @@ ts-frontend-first/
     toggle-upstream.sh           # one-liner to flip upstream up/down
   .httptape-cache/               # L2 cache — generated, gitignored
     fixtures/                    # populated on first request, used as L2 fallback
-  docker-compose.yml             # 3 services, builds httptape:demo from ../../
+  docker-compose.yml             # 3 services, pinned to httptape v0.9.0 from GHCR
   Dockerfile                     # multi-stage build for the React frontend
 ```
