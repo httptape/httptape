@@ -8,11 +8,12 @@ Quick reference of all exported types, functions, and options in the `httptape` 
 
 ```go
 type Tape struct {
-    ID         string       `json:"id"`
-    Route      string       `json:"route"`
-    RecordedAt time.Time    `json:"recorded_at"`
-    Request    RecordedReq  `json:"request"`
-    Response   RecordedResp `json:"response"`
+    ID         string         `json:"id"`
+    Route      string         `json:"route"`
+    RecordedAt time.Time      `json:"recorded_at"`
+    Request    RecordedReq    `json:"request"`
+    Response   RecordedResp   `json:"response"`
+    Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
 func NewTape(route string, req RecordedReq, resp RecordedResp) Tape
@@ -88,6 +89,7 @@ func (r *Recorder) Close() error
 | WithMaxBodySize | `WithMaxBodySize(n int)` | `0` (no limit) |
 | WithSkipRedirects | `WithSkipRedirects(skip bool)` | `false` |
 | WithOnError | `WithOnError(fn func(error))` | no-op |
+| WithRecorderTLSConfig | `WithRecorderTLSConfig(cfg *tls.Config)` | nil |
 
 **Details:** [Recording](recording.md)
 
@@ -112,6 +114,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implemen
 | WithProxyRoute | `WithProxyRoute(route string)` | `""` |
 | WithProxyOnError | `WithProxyOnError(fn func(error))` | nil |
 | WithProxyFallbackOn | `WithProxyFallbackOn(fn func(error, *http.Response) bool)` | transport errors only |
+| WithProxyTLSConfig | `WithProxyTLSConfig(cfg *tls.Config)` | nil |
 
 **Details:** [Proxy Mode](proxy.md)
 
@@ -140,6 +143,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements
 | WithReplayHeaders | `WithReplayHeaders(key, value string)` | none |
 
 **Details:** [Replay](replay.md)
+
+---
+
+## TLS helpers
+
+```go
+func BuildTLSConfig(certFile, keyFile, caFile string, insecure bool) (*tls.Config, error)
+```
+
+Constructs a `*tls.Config` from optional PEM file paths and an insecure flag. Returns `(nil, nil)` when all parameters are zero-valued (use Go defaults). `certFile` and `keyFile` must be supplied together for mTLS; `caFile` overrides the system root CAs; `insecure` sets `InsecureSkipVerify`. Used internally by the CLI's `--tls-*` flags and exposed for embedders that build their own `*tls.Config` from the same inputs.
+
+**Details:** [TLS](tls.md)
 
 ---
 
