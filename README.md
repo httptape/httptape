@@ -247,6 +247,17 @@ httptape import  --fixtures ./mocks --input bundle.tar.gz
 
 ## Docker
 
+Pull from either registry — the same image is published to both on every
+release:
+
+```bash
+docker pull tibtof/httptape           # Docker Hub
+docker pull ghcr.io/vibewarden/httptape   # GHCR
+```
+
+Examples below use `tibtof/httptape`; substitute `ghcr.io/vibewarden/httptape`
+freely.
+
 ```bash
 # Replay mode
 docker run -v ./mocks:/fixtures -p 8081:8081 tibtof/httptape serve --fixtures /fixtures
@@ -261,8 +272,6 @@ docker run -v ./cache:/fixtures -v ./config.json:/config/config.json -p 8081:808
     tibtof/httptape proxy --upstream https://api.example.com \
     --fixtures /fixtures --config /config/config.json
 ```
-
-Also available on GHCR: `ghcr.io/vibewarden/httptape`
 
 ## Testcontainers
 
