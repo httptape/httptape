@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a bug in httptape
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much
+        detail as you can - minimal reproductions are very helpful.
+
+        For security issues, do not file here. See SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: httptape version or git SHA
+      placeholder: "v0.8.0 or 3c105cd"
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version`
+      placeholder: "go version go1.26.0 darwin/arm64"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Library (Go embed)
+        - CLI - record
+        - CLI - proxy
+        - CLI - serve
+        - CLI - mock
+        - Docker
+        - Testcontainers
+        - Other (describe in repro)
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Step-by-step instructions, ideally with a minimal code or CLI snippet.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages, stack traces, or relevant log output.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Optional - minimal repro repo link, redacted fixture, screenshots.
+    validations:
+      required: false
