@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="httptape logo" width="300">
+  <img src="https://raw.githubusercontent.com/VibeWarden/httptape/main/assets/logo.png" alt="httptape logo" width="300">
 </p>
 
 <h3 align="center">Record, Redact, Replay</h3>
@@ -20,7 +20,7 @@
 ---
 
 httptape captures HTTP request/response pairs, redacts sensitive data on write,
-and replays them as a mock server. Think WireMock, but with a 6 MB Docker image,
+and replays them as a mock server. Think WireMock, but with a 3 MB Docker image,
 an embeddable Go library, and a redaction pipeline built into the core.
 
 **The 3 Rs:**
@@ -102,7 +102,7 @@ go get github.com/VibeWarden/httptape
 go install github.com/VibeWarden/httptape/cmd/httptape@latest
 ```
 
-**Docker** (6 MB, multi-arch):
+**Docker** (~3 MB, multi-arch):
 ```bash
 docker pull tibtof/httptape
 ```
@@ -293,7 +293,7 @@ resp, _ := http.Get(container.BaseURL() + "/api/users")
 |---|---|---|---|---|---|
 | Embeddable in Go | **yes** | no (Java) | no (Node) | no (browser) | yes |
 | Standalone server | **yes** | yes | yes | no | no |
-| Docker | **6 MB** | 200 MB+ | 50 MB+ | n/a | n/a |
+| Docker | **3 MB** | 200 MB+ | 50 MB+ | n/a | n/a |
 | Recording | **yes** | yes | no | no | no |
 | Redaction on write | **yes** | no | no | no | no |
 | Deterministic faking | **yes** | no | no | no | no |
