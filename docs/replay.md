@@ -73,6 +73,57 @@ Sets a callback invoked when no tape matches an incoming request. The callback r
 
 This is useful for debugging which requests are not being matched during test development.
 
+### WithCORS
+
+```go
+func WithCORS() ServerOption
+```
+
+Enables permissive CORS headers (`Access-Control-Allow-Origin: *`) on every replayed response and short-circuits `OPTIONS` preflight requests with 204. Intended for local development where a frontend dev server (e.g., `localhost:3000`) calls the mock backend (e.g., `localhost:3001`). Opt-in only.
+
+```go
+srv := httptape.NewServer(store, httptape.WithCORS())
+```
+
+### WithDelay
+
+```go
+func WithDelay(d time.Duration) ServerOption
+```
+
+Adds a fixed delay before every response. The delay is applied after matching but before writing the response. If the request context is cancelled during the delay (e.g., the client disconnects), `ServeHTTP` returns immediately without writing. A zero or negative duration is a no-op.
+
+```go
+srv := httptape.NewServer(store, httptape.WithDelay(200*time.Millisecond))
+```
+
+### WithErrorRate
+
+```go
+func WithErrorRate(rate float64) ServerOption
+```
+
+Causes a fraction of requests to return `500 Internal Server Error` with an `X-Httptape-Error: simulated` header instead of the recorded response. `rate` must be between `0.0` and `1.0` inclusive (`0.0` disables error simulation, `1.0` fails every request). Panics if `rate` is outside `[0.0, 1.0]`.
+
+```go
+srv := httptape.NewServer(store, httptape.WithErrorRate(0.1)) // 10% failure rate
+```
+
+### WithReplayHeaders
+
+```go
+func WithReplayHeaders(key, value string) ServerOption
+```
+
+Injects a header into every replayed response, applied after tape matching. Overrides any header with the same key from the recorded tape. May be called multiple times to set multiple headers. Useful for environment-specific tokens, correlation IDs, or cache-control values.
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithReplayHeaders("X-Request-ID", "test-run-1"),
+    httptape.WithReplayHeaders("Cache-Control", "no-store"),
+)
+```
+
 ## How replay works
 
 For each incoming request, the `Server`:
