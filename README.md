@@ -11,6 +11,8 @@
 
 <p align="center">
   <a href="https://pkg.go.dev/github.com/VibeWarden/httptape"><img src="https://pkg.go.dev/badge/github.com/VibeWarden/httptape.svg" alt="Go Reference"></a>
+  <a href="https://github.com/VibeWarden/httptape/actions/workflows/test.yml"><img src="https://github.com/VibeWarden/httptape/actions/workflows/test.yml/badge.svg?branch=main" alt="Tests"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/VibeWarden/httptape"><img src="https://api.scorecard.dev/projects/github.com/VibeWarden/httptape/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
   <a href="https://hub.docker.com/r/tibtof/httptape"><img src="https://img.shields.io/docker/image-size/tibtof/httptape/latest?label=docker" alt="Docker Image Size"></a>
 </p>

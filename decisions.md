@@ -8070,6 +8070,719 @@ The compatibility guarantee is enforced by:
 
 ---
 
+### ADR-29: Repository polish — community-health files, CI badge, OpenSSF Scorecard
+
+**Date**: 2026-04-16
+**Issue**: #129
+**Status**: Accepted
+
+#### Context
+
+The httptape repo on GitHub currently scores 50% on `gh api
+repos/VibeWarden/httptape/community/profile`: missing `CODE_OF_CONDUCT`,
+`CONTRIBUTING`, `SECURITY`, issue templates, and PR template. There is no CI
+status badge in the README, and no OpenSSF Scorecard automation. Each gap is
+small in isolation; together they make the project look unmaintained to
+enterprise reviewers, OSS-list curators, and first-time contributors.
+
+Issue #129 bundles eight related polish deliverables:
+
+1. `SECURITY.md`
+2. `CONTRIBUTING.md`
+3. `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1, verbatim)
+4. `.github/ISSUE_TEMPLATE/bug.yml`
+5. `.github/ISSUE_TEMPLATE/feature.yml`
+6. `.github/ISSUE_TEMPLATE/config.yml`
+7. `.github/PULL_REQUEST_TEMPLATE.md`
+8. README CI badge + OpenSSF Scorecard workflow + Scorecard badge
+
+Pre-flight reality check confirmed by the architect:
+
+- `release.yml` runs tests only on tag push; `docker.yml` runs no tests;
+  `docs.yml` is docs-only. **No workflow runs `go test ./... -race` on every
+  push and PR**, so a CI badge has nothing to point at. A new
+  `.github/workflows/test.yml` is therefore part of this issue.
+- `gh repo edit` (v2.88.1, current) does **not** expose a
+  `--enable-private-vulnerability-reporting` flag (verified via
+  `gh repo edit --help`).
+- The REST endpoint `PUT /repos/{owner}/{repo}/private-vulnerability-reporting`
+  works (architect probed it: `gh api -X PUT
+  /repos/VibeWarden/httptape/private-vulnerability-reporting` returned `204
+  No Content`). A `GET` on the same endpoint currently returns
+  `{"enabled":true}` — PVR is **already enabled** on the repo. This means
+  `SECURITY.md` can rely on PVR as the primary reporting channel today, and
+  the dev needs no extra runbook step to enable it; we just record the
+  REST-API one-liner in `SECURITY.md`'s "How to verify / re-enable" sub-note
+  for future reference.
+
+This ADR pins down: file contents skeletons, the `test.yml` workflow shape,
+the Scorecard workflow shape (publish on, badge clickable), the README badge
+cluster after the change, the chosen reporting mechanism in `SECURITY.md`,
+and the PR strategy.
+
+#### Decision
+
+##### Resolution of open questions
+
+| Question | Decision | Rationale |
+|---|---|---|
+| PR shape (single vs. split) | **Single PR** | All eight deliverables are small, related, and the review surface is mostly templates. PM recommendation; no concrete reason to split. Lets the dev land everything atomically and lets the reviewer verify the community-profile checklist hits 100% in one pass. |
+| Reporting mechanism in `SECURITY.md` | **GitHub Private Vulnerability Reporting (PVR)**, primary; `tibtof@gmail.com` as private fallback | PVR is already enabled on the repo (verified). PVR keeps the entire intake on GitHub with built-in advisory drafting and CVE workflow. The email fallback covers reporters who can't or won't use a GitHub account. |
+| PVR enable mechanism documented in dev runbook | **`gh api -X PUT /repos/VibeWarden/httptape/private-vulnerability-reporting`** (one-liner, idempotent — re-running on an already-enabled repo is a no-op `204`). The PR description should call this out as informational only since PVR is already on. | `gh repo edit` does not have a `--enable-private-vulnerability-reporting` flag in v2.88.1. The REST endpoint is the supported path. UI fallback (Settings -> Code security -> Private vulnerability reporting -> Enable) documented as the manual alternative for anyone without API token scope. |
+| Scorecard publishing | **Publish (`publish_results: true`, `id-token: write`)** | The badge is the deliverable; an unpublished Scorecard run gives a non-clickable badge that points nowhere meaningful. Public repo, Apache 2.0, nothing sensitive in the SARIF — publishing is the standard OSS posture and unlocks `https://scorecard.dev/viewer/?uri=github.com/VibeWarden/httptape` as the badge link. |
+| CI badge label | **"Tests"** | More descriptive than bare "CI" (which doesn't indicate what's being tested) and matches the workflow's actual purpose (`go test ./... -race`). Also visually distinguishes from the future possibility of a separate "Lint" or "Build" badge. |
+| `test.yml` matrix (Go versions) | **Single version: `go-version-file: go.mod` (= 1.26)** | Matches the existing `release.yml` pattern. Library targets a single Go version per `go.mod`; we are not yet supporting a published version range. Adding a matrix is a separate future issue if we ever ship a `go.mod` with a wider compatibility window. |
+| `test.yml` matrix (OS) | **Single OS: `ubuntu-latest`** | Matches `release.yml`. httptape uses only stdlib networking primitives; OS-specific bugs are unlikely. Cross-OS matrix is a separate future issue. |
+| Scorecard cron cadence | **Weekly, Saturday 01:30 UTC** (`30 1 * * 6`) | Matches the canonical `ossf/scorecard` repo's own scheduled cadence — proven, off-peak, unlikely to collide with weekday CI volume. |
+| Scorecard action pinning | **Pin by full commit SHA + version comment**, matching the canonical `ossf/scorecard` workflow exactly | Scorecard's own checks penalise float-tag (`@v2`) usage. Use the canonical pinned SHAs documented below. |
+| Code-scanning SARIF upload step | **Include** (the third step in the canonical example, `github/codeql-action/upload-sarif`) | Adds findings to the repo's Code Scanning dashboard, surfaces failures next to other security alerts. Cost is one extra step per weekly run. |
+
+##### File inventory and content skeletons
+
+The dev writes the full file contents. The skeletons below are normative for
+**structure, headings, key phrasing, and links** — the dev fleshes out the
+prose but must keep the structure intact. All files are ASCII, no decorative
+emoji, hyphens-not-em-dashes (matches the rest of the repo).
+
+###### `SECURITY.md` (repo root)
+
+```markdown
+# Security Policy
+
+## Supported versions
+
+httptape is pre-release. The only supported version is the current `main`
+branch. Once v0.9.0 ships, this table will be updated to list supported
+released versions explicitly.
+
+| Version | Supported          |
+|---------|--------------------|
+| `main`  | Yes (best-effort)  |
+| `v0.x`  | Not yet released   |
+
+## Reporting a vulnerability
+
+**Preferred**: open a GitHub Private Vulnerability Report at
+<https://github.com/VibeWarden/httptape/security/advisories/new>.
+This keeps the report private until a fix is ready and lets us coordinate a
+CVE if applicable.
+
+**Alternative**: email `tibtof@gmail.com` with `[httptape security]` in the
+subject line. Please do not open a public issue for security reports.
+
+## Response time (best-effort SLA)
+
+- Acknowledgement: within 7 days
+- Initial assessment: within 14 days
+- Coordinated disclosure window: typically 90 days from acknowledgement,
+  shorter for actively exploited issues, longer if a coordinated upstream
+  fix is required
+
+These are best-effort targets, not contractual commitments. httptape is
+maintained by a small team.
+
+## Scope: what counts as a security issue in httptape
+
+- **Sanitizer bypass**: any input pattern where a configured redaction or
+  faker rule fails to redact data that the rule was meant to cover, causing
+  sensitive data to be written to a tape on disk
+- **Path traversal in storage**: a tape ID or filename input that causes the
+  filesystem store to read or write outside the configured store directory
+- **Replay leak**: the mock server returning data from a tape that was
+  supposed to be redacted (e.g. recorded after the rule was added but the
+  redaction did not apply, or a header rule that did not strip a configured
+  header before serve)
+- **TLS / certificate handling**: incorrect verification, leak of private
+  keys, or downgrade in record/proxy modes
+- **Faker collisions**: deterministic-faker output that maps two distinct
+  real values to the same fake (which would let a reader correlate a fake
+  back to a real value via a known-plaintext pair)
+
+## Out of scope
+
+- Bugs in upstream HTTP services that httptape records — those are the
+  upstream's problem
+- Denial-of-service via oversized tapes when the user has explicitly opted
+  to record them (bound the input on your side)
+- Crashes or hangs that require an attacker to control the embedder's Go
+  code — that's a code-execution problem, not an httptape problem
+- Vulnerabilities in third-party CI Actions used in this repo's workflows —
+  report those upstream
+
+## Acknowledgement
+
+We credit reporters in the published advisory unless asked otherwise.
+```
+
+Note for the dev: the GitHub Private Vulnerability Reporting setting is
+already enabled on the repo (verified by the architect). If it ever needs to
+be re-enabled, the one-liner is:
+
+```sh
+gh api -X PUT /repos/VibeWarden/httptape/private-vulnerability-reporting
+```
+
+The manual UI path is: repo Settings -> Code security -> "Private
+vulnerability reporting" -> Enable. **Do not include this verification note
+in the published `SECURITY.md`** — it goes in the PR description as a
+self-check only.
+
+###### `CONTRIBUTING.md` (repo root)
+
+```markdown
+# Contributing to httptape
+
+Thanks for your interest in contributing. This document describes how this
+repository is actually maintained today, not how a generic OSS project
+might be.
+
+## How issues become PRs in this repo
+
+httptape is built using a four-stage agent pipeline backed by a human
+reviewer. The flow is:
+
+1. **PM agent** drafts the issue spec (problem, scope, acceptance criteria,
+   non-goals).
+2. **Architect agent** reads the spec, makes design decisions, and appends an
+   ADR to `decisions.md`.
+3. **Dev agent** implements the design exactly as specified.
+4. **Reviewer agent** reviews the PR for spec compliance, test coverage, and
+   adherence to project rules.
+5. The repo owner reviews and merges.
+
+The full pipeline rules live in `CLAUDE.md`. External contributors do not
+need to use the agent pipeline — opening a clear issue and a focused PR is
+fine. The same coding rules apply either way.
+
+## Hard rules (from `CLAUDE.md`)
+
+- **stdlib only**: no new Go-module dependencies. v1 is committed to a
+  zero-transitive-deps surface for embedders.
+- **No `init()` functions**: zero side effects on import.
+- **No package-level mutable state**: everything via dependency injection or
+  functional options.
+- **Race-clean tests**: `go test ./... -race` must pass. CI enforces this.
+- **godoc on every exported type and function**: no exceptions.
+- **Functional options for all public constructors**: see existing
+  `WithStore`, `WithMatcher`, etc. patterns.
+
+## Conventional commits
+
+Commit messages and PR titles use these prefixes (matching what's already
+in `git log`):
+
+- `feat:`  new feature
+- `fix:`   bug fix
+- `chore:` maintenance / housekeeping (no behavior change)
+- `docs:`  documentation only
+- `test:`  test-only changes
+- `ci:`    CI/workflow changes
+
+Use the imperative mood: "add X", not "added X" or "adds X".
+
+## Branch naming
+
+- `feat/<issue-number>-<short-slug>` for features
+- `fix/<issue-number>-<short-slug>` for bug fixes
+
+Example: `feat/129-repo-polish`, `fix/142-recorder-deadlock`.
+
+## Running tests locally
+
+```sh
+go test ./... -race -count=1
+```
+
+`-count=1` disables the test cache and ensures every run is fresh. Required
+before opening a PR.
+
+## Architectural decisions
+
+All architectural decisions are recorded in `decisions.md`. The "Locked
+decisions" table at the top of that file lists choices that are not open
+for relitigation in a PR — examples include "stdlib only", "Apache 2.0
+license", "JSON fixture format", "sanitize on write".
+
+If you believe a locked decision should change, **open an issue first** with
+an ADR-style write-up (Context / Decision / Consequences). Do not send a PR
+that quietly changes a locked decision — it will be closed and asked to go
+through the issue-first path.
+
+For additions to the architecture (new ports, new adapters, new sanitizer
+types), an ADR is appended to `decisions.md` by the architect stage of the
+pipeline. External contributors don't need to write the ADR themselves; the
+maintainer will. But please flag the architectural intent clearly in your
+issue.
+
+## Reporting security issues
+
+See `SECURITY.md`. Do **not** open a public issue for security reports.
+```
+
+###### `CODE_OF_CONDUCT.md` (repo root)
+
+Verbatim Contributor Covenant v2.1 from
+<https://www.contributor-covenant.org/version/2/1/code_of_conduct.txt>.
+The dev copies the full text and substitutes the contact line:
+
+> Community leaders are obligated to respect the privacy and security of the
+> reporter of any incident.
+>
+> ...
+>
+> Instances of abusive, harassing, or otherwise unacceptable behavior may be
+> reported to the community leaders responsible for enforcement at
+> **`tibtof@gmail.com`**.
+
+The dev must not edit any other text. The "Attribution" footer must remain
+intact (Contributor Covenant requires attribution to retain the license).
+
+###### `.github/ISSUE_TEMPLATE/bug.yml`
+
+YAML form template. Fields:
+
+```yaml
+name: Bug report
+description: Report a bug in httptape
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much
+        detail as you can — minimal reproductions are very helpful.
+
+        For security issues, do not file here. See SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: httptape version or git SHA
+      placeholder: "v0.8.0 or 3c105cd"
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version`
+      placeholder: "go version go1.26.0 darwin/arm64"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Library (Go embed)
+        - CLI - record
+        - CLI - proxy
+        - CLI - serve
+        - CLI - mock
+        - Docker
+        - Testcontainers
+        - Other (describe in repro)
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Step-by-step instructions, ideally with a minimal code or CLI snippet.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages, stack traces, or relevant log output.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Optional - minimal repro repo link, redacted fixture, screenshots.
+    validations:
+      required: false
+```
+
+###### `.github/ISSUE_TEMPLATE/feature.yml`
+
+```yaml
+name: Feature request
+description: Suggest a new feature or enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Before filing, please check the existing
+        issues and `decisions.md` to make sure this isn't already tracked
+        or already decided against.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the user-visible problem, not the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: api-sketch
+    attributes:
+      label: What would the API look like?
+      description: A rough Go-code or CLI sketch is enough. Final shape will be decided in design review.
+      render: go
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about and why they did not fit.
+    validations:
+      required: false
+```
+
+###### `.github/ISSUE_TEMPLATE/config.yml`
+
+```yaml
+blank_issues_enabled: false
+contact_links:
+  - name: Question or how-to
+    url: https://github.com/VibeWarden/httptape/discussions
+    about: For "how do I do X with httptape?" questions, please use Discussions.
+```
+
+###### `.github/PULL_REQUEST_TEMPLATE.md`
+
+```markdown
+## Summary
+
+<!-- One or two sentences. What does this PR do and why? -->
+
+## Test plan
+
+- [ ] `go test ./... -race -count=1` passes locally
+- [ ] New code has godoc on all exported symbols
+- [ ] No new entries in `go.mod` / `go.sum`
+- [ ] PR title follows conventional-commit style (`feat:`, `fix:`, `chore:`,
+      `docs:`, `test:`, `ci:`)
+
+<!-- Add bespoke test steps or manual verification notes below if needed. -->
+
+## Related
+
+Closes #<issue-number>
+```
+
+###### `.github/workflows/test.yml`
+
+```yaml
+# .github/workflows/test.yml
+#
+# Run the full test suite with the race detector on every push to main and
+# every PR targeting main. This is the workflow the README "Tests" badge
+# points at.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./... -race -count=1
+```
+
+Notes for the dev:
+
+- The workflow `name:` MUST stay as `Tests` (capital T) because the README
+  badge URL embeds it: `https://github.com/VibeWarden/httptape/actions/workflows/test.yml/badge.svg`.
+- Do **not** add a Go-version matrix in this PR. Single version, matching
+  `go.mod`, matching `release.yml`. A matrix is a future issue if needed.
+- Do **not** add a coverage upload step. Coverage tooling is out of scope
+  for this issue.
+
+###### `.github/workflows/scorecard.yml`
+
+Adapted from the canonical `ossf/scorecard` workflow at
+<https://github.com/ossf/scorecard/blob/main/.github/workflows/scorecard-analysis.yml>.
+Pin SHAs as documented there (the dev should fetch the most recent canonical
+file at PR time and copy the pinned SHAs verbatim — do not freehand them).
+
+```yaml
+# .github/workflows/scorecard.yml
+#
+# OpenSSF Scorecard analysis. Runs weekly + on pushes to main.
+# Results are published to https://api.scorecard.dev so the README badge
+# resolves to the public dashboard.
+#
+# Adapted from the canonical workflow at
+# https://github.com/ossf/scorecard/blob/main/.github/workflows/scorecard-analysis.yml
+
+name: Scorecard supply-chain security
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '30 1 * * 6'  # Weekly, Saturday 01:30 UTC
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # Upload SARIF to code-scanning
+      id-token: write          # OIDC token for publish_results
+    steps:
+      - name: Checkout
+        uses: actions/checkout@<canonical-pinned-sha>  # vX.Y.Z
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@<canonical-pinned-sha>  # vX.Y.Z
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@<canonical-pinned-sha>  # vX.Y.Z
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@<canonical-pinned-sha>  # vX.Y.Z
+        with:
+          sarif_file: results.sarif
+```
+
+The four pinned SHAs MUST be copied at PR time from
+<https://github.com/ossf/scorecard/blob/main/.github/workflows/scorecard-analysis.yml>
+so they reflect the latest reviewed canonical pin set. As of this ADR's
+writing those are (subject to update at PR time):
+
+- `actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2`
+- `ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a  # v2.4.3`
+- `actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0`
+- `github/codeql-action/upload-sarif@38697555549f1db7851b81482ff19f1fa5c4fedc  # v4.34.1`
+
+Restrictions to honor (from Scorecard's "Workflow Restrictions" section):
+
+- No top-level `env:` block, no top-level `defaults:`.
+- No workflow-level write permissions (`permissions: read-all` at top is
+  required).
+- Only the analysis job uses `id-token: write`.
+- Job runs on `ubuntu-latest` (a hosted Ubuntu runner). No containers, no
+  services, no job-level `env:` or `defaults:`.
+- Steps in the analysis job are restricted to the approved list:
+  `actions/checkout`, `actions/upload-artifact`,
+  `github/codeql-action/upload-sarif`, `ossf/scorecard-action`,
+  `step-security/harden-runner`. We use the first four — do not add
+  unrelated steps.
+
+##### README badge cluster
+
+Current cluster (lines 13-15 of `README.md`):
+
+1. Go Reference (`pkg.go.dev`)
+2. License (Apache 2.0)
+3. Docker Image Size (Docker Hub)
+
+After this PR, the cluster has 5 badges in this order:
+
+1. Go Reference (unchanged)
+2. **Tests** (new) -> `https://github.com/VibeWarden/httptape/actions/workflows/test.yml`
+   - Image: `https://github.com/VibeWarden/httptape/actions/workflows/test.yml/badge.svg?branch=main`
+   - Alt: `Tests`
+3. **OpenSSF Scorecard** (new) -> `https://scorecard.dev/viewer/?uri=github.com/VibeWarden/httptape`
+   - Image: `https://api.scorecard.dev/projects/github.com/VibeWarden/httptape/badge`
+   - Alt: `OpenSSF Scorecard`
+4. License (unchanged)
+5. Docker Image Size (unchanged)
+
+Five is the practical ceiling stated in the spec; we are exactly at it. The
+dev MUST NOT add any other badges in this PR.
+
+The Scorecard badge will return a placeholder until the workflow has run at
+least once and `publish_results: true` has reported into the dashboard. The
+dev should call this out in the PR description: it is expected for the
+badge to render as "no data" briefly after merge until the first scheduled
+or push-triggered run completes.
+
+##### File layout
+
+New files (8):
+
+- `SECURITY.md`
+- `CONTRIBUTING.md`
+- `CODE_OF_CONDUCT.md`
+- `.github/ISSUE_TEMPLATE/bug.yml`
+- `.github/ISSUE_TEMPLATE/feature.yml`
+- `.github/ISSUE_TEMPLATE/config.yml`
+- `.github/PULL_REQUEST_TEMPLATE.md`
+- `.github/workflows/test.yml`
+- `.github/workflows/scorecard.yml`
+
+Modified files (1):
+
+- `README.md` — insert Tests + Scorecard badges into the existing badge
+  cluster (between Go Reference and License) as specified above. No other
+  README changes.
+
+Total: 9 new files, 1 modified file. Zero `.go` files touched. Zero
+`go.mod` / `go.sum` changes.
+
+##### Sequence (PR construction)
+
+1. Create branch `chore/129-repo-polish`.
+2. Add the eight community-health files first (`SECURITY.md`,
+   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, three issue templates, PR
+   template). Commit: `chore: add community-health files (security, contributing, code of conduct, issue and PR templates)`.
+3. Add `.github/workflows/test.yml`. Commit: `ci: add test workflow running go test -race on push and PR`.
+4. Update `README.md` to add the `Tests` badge. Commit: `docs: add CI status badge to README`.
+5. Add `.github/workflows/scorecard.yml`. Commit: `ci: add OpenSSF Scorecard workflow`.
+6. Update `README.md` to add the `OpenSSF Scorecard` badge. Commit: `docs: add OpenSSF Scorecard badge to README`.
+7. Open PR titled `chore: repository polish — community-health, CI badge, OpenSSF Scorecard`.
+8. PR description includes the self-check: paste the output of
+   `gh api repos/VibeWarden/httptape/community/profile` showing
+   `health_percentage: 100` (run after the branch is pushed and the files
+   are visible on the branch — note this output reflects the default
+   branch, so the 100% confirmation can only be captured post-merge; the
+   PR description should note "post-merge verification deferred").
+
+Five clean commits make the review easy to step through. The PR is
+single — that's the decision in the table above.
+
+##### Error cases (what could go wrong)
+
+| Failure | Detection | Mitigation |
+|---|---|---|
+| `test.yml` fails on first PR run because of an unrelated flake | Red badge on first commit | Re-run; if it fails twice, it is a real bug — fix in this PR or block on a separate fix. Do not merge with red CI. |
+| Scorecard SARIF upload fails because `security-events: write` is missing | Workflow logs | Already handled in the YAML — verify before pushing. |
+| Scorecard `publish_results` rejected because workflow uses an unapproved step | Scorecard run failure with API rejection message | Stick to the four-step canonical layout. Do not add `step-security/harden-runner` or anything else. |
+| README badge URL 404s because workflow filename or `name:` differs from what the badge encodes | Visible broken-image badge after merge | The workflow's filename MUST be `test.yml` and `scorecard.yml`. The badge URL uses the filename, not the `name:` field. The architect specifies both in this ADR — dev must not rename. |
+| Scorecard badge shows "no data" forever | Visible after 24h | Means `publish_results` is not reporting. Check the workflow run logs for OIDC errors and re-verify `id-token: write` permission. |
+| GitHub rejects a YAML issue template due to syntax | New-issue page errors | Validate locally with `yq` or paste into a draft issue on a fork before merging. Acceptance criterion already requires "valid YAML form syntax". |
+| Contributor Covenant text accidentally edited beyond the contact line | Reviewer catches | The dev pastes the verbatim text from <https://www.contributor-covenant.org/version/2/1/code_of_conduct.txt> and only edits the contact line. The reviewer diffs against that source. |
+| Community-profile checklist still <100% after merge | `gh api repos/.../community/profile` post-merge | The eight items the API checks for are: Description, README, License, Code of conduct, Contributing, Security policy, Issue templates, PR template. All are covered by this PR (Description and README are pre-existing). 100% is the acceptance criterion. |
+
+##### Test strategy
+
+This issue ships no Go code and no Go tests. "Test" here means
+verification:
+
+- **CI green on the PR**: the new `test.yml` runs on the PR itself and must
+  pass. This both verifies the existing test suite still passes (sanity
+  check, since no `.go` files change) and verifies the new workflow file
+  is syntactically valid and works.
+- **YAML lint**: dev verifies issue-template YAML by pasting the templates
+  into a "New issue" page on a fork or scratch repo before opening the PR.
+- **Markdown render**: dev previews `SECURITY.md`, `CONTRIBUTING.md`, and
+  `CODE_OF_CONDUCT.md` on GitHub's "view raw / preview" before pushing.
+- **Badge URLs resolve**: after the workflows have run at least once on
+  `main` (post-merge), both badge images must render. Scorecard badge can
+  legitimately show "no data" for up to 24 hours after first run; reviewer
+  is aware.
+- **Community profile**: `gh api repos/VibeWarden/httptape/community/profile`
+  returns `health_percentage: 100` post-merge. Dev includes this in the PR
+  description as the final acceptance check.
+- **Scorecard score sanity**: post-merge, the dashboard at
+  `https://scorecard.dev/viewer/?uri=github.com/VibeWarden/httptape` must
+  resolve and show a numeric score. Sub-checks failing is **fine** — fixing
+  individual Scorecard checks (Pinned-Dependencies, Branch-Protection,
+  etc.) is each a separate future issue. The deliverable here is "the
+  badge resolves and the dashboard exists", not "we score 10/10".
+
+Manual smoke test the dev runs before pushing:
+
+```sh
+# Validate YAML syntax of the templates and workflows
+for f in .github/ISSUE_TEMPLATE/*.yml .github/workflows/test.yml .github/workflows/scorecard.yml; do
+  python3 -c "import yaml,sys; yaml.safe_load(open('$f'))" && echo "OK: $f" || echo "FAIL: $f"
+done
+
+# Run tests locally to confirm baseline still passes
+go test ./... -race -count=1
+```
+
+#### Consequences
+
+**Positive**
+
+- GitHub community-profile health score moves from 50% to 100%, removing
+  the "early-stage" perception flag.
+- README has a real CI signal (Tests badge) — green/red is meaningful and
+  links to logs.
+- OpenSSF Scorecard badge shows the project takes supply-chain security
+  seriously and gives reviewers a one-click view of the security posture.
+- Contributors have a documented path: how to file a bug, how to file a
+  feature, how PRs are structured, what conventional-commit prefixes to
+  use, what the agent pipeline is, where decisions are recorded.
+- Security reporters have a documented private channel (PVR primary, email
+  fallback) — no more guessing where to send vulnerabilities.
+
+**Negative / trade-offs**
+
+- More files to keep in sync. `CONTRIBUTING.md` references `CLAUDE.md` and
+  `decisions.md` by name; if either of those is renamed, this file must be
+  updated. Mitigation: the agent pipeline already touches `decisions.md`
+  on every architectural change, so drift is unlikely.
+- The Tests badge becomes a public signal — flaky tests now visibly affect
+  project perception. Mitigation: race-clean tests are already a hard
+  rule (L-13 in the locked-decisions table).
+- Scorecard score is now a public number. Initial run will likely show
+  several un-fixed sub-checks (Pinned-Dependencies on the existing
+  workflows, Branch-Protection visibility limits, Token-Permissions on
+  `release.yml`, etc.). Each is a separate future issue.
+- Contributor Covenant verbatim text is long and adds ~140 lines to the
+  repo root. This is the cost of using the de-facto standard; it's worth
+  it for the recognition it gets from the community-profile checker.
+
+**Future work explicitly not in scope here** (each is its own future
+issue):
+
+- `dependabot.yml` for action and Go-module update PRs
+- `codeql.yml` for code scanning
+- `FUNDING.yml` once owner decides on sponsorships
+- Signed releases / cosign / SBOM
+- Pinning the existing `docker.yml`, `release.yml`, `docs.yml` actions to
+  SHAs (Scorecard will flag this; addressing it is a separate cleanup PR)
+- Multi-Go-version test matrix in `test.yml`
+- Adding Discussions threads or `awesome-go` submission
+
+---
+
 ## PM Log
 
 ### 2026-04-16
@@ -8088,4 +8801,42 @@ The compatibility guarantee is enforced by:
   - Explicit non-goals: image signing/cosign, SBOM/provenance attestations, vulnerability scanning, renaming the Docker Hub repo, multi-version registry docs. Each is a separate future issue.
   - Called out that the Docker Hub README sync only takes effect on the *next* push to the registry — merging the PR is not enough on its own to make the hub.docker.com page change. The GHCR auto-link verification is also a post-release manual step (the only acceptance criterion that cannot be confirmed pre-merge).
   - Open questions flagged for the architect: single consolidated `LABEL` vs. one `LABEL` per key; which workflow file (`docker.yml` vs. `release.yml`) hosts the README-sync step; whether the existing `DOCKERHUB_TOKEN` is scoped wide enough to write the repo description (vs. push-only).
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #127** — `docs: document the typed Faker surface (interface, 12 built-ins, JSON config syntax)`.
+  - Labels: `priority:high`, `documentation`. No milestone (could grab into v0.9.0).
+  - Pure docs change driven by an audit against `main` @ `bf456dc` that found a major undocumented public surface: the `Faker` interface, `FakeFieldsWith`, all 12 built-in fakers (`RedactedFaker`, `FixedFaker`, `HMACFaker`, `EmailFaker`, `PhoneFaker`, `CreditCardFaker`, `NumericFaker`, `DateFaker`, `PatternFaker`, `PrefixFaker`, `NameFaker`, `AddressFaker`), the `Rule.Fields` config field, and the JSON-config typed-faker syntax (both shorthand and object form) are absent from `docs/sanitization.md`, `docs/api-reference.md`, and `docs/config.md`. Today, JSON-config users have no in-docs path to discover typed fakers at all.
+  - Three deliverables in one issue: (1) new \"Typed fakers\" section in `docs/sanitization.md` with the interface contract, per-built-in prose + Go example, decision guide vs auto-detect, custom-`Faker` example; (2) `docs/api-reference.md` additions covering the interface, `FakeFieldsWith`, all 12 typed types, and the `Rule.Fields` field; (3) `docs/config.md` typed-fake-fields section covering both syntaxes, validation/error behavior, and three end-to-end examples (email shorthand, numeric object form, credit-card shorthand). Cross-links between the three files required.
+  - Reference material called out for the architect/dev: `faker.go` (canonical), `sanitizer.go` (`FakeFieldsWith` wiring), `config.go` (`parseFakerSpec` and friends), `faker_test.go` and `config_test.go` (snippet sources).
+  - Explicit non-goals: no new fakers, no renames, no behavior change to `parseFakerSpec`, no `config.schema.json` edits unless an example surfaces an actual schema gap (in which case open a sibling issue), no README / `llms-full.txt` / `llms.txt` / `PROJECT.md` / `docs/cli.md` edits.
+  - Open questions flagged for the architect: per-built-in H3 vs grouped sections in `docs/sanitization.md`; whether to show `Rule.Fields` as a Go literal or JSON in the api-reference example; how to handle inconsistent constructor-vs-struct-literal idioms across the 12 fakers (document per-type and flag back if it's a real inconsistency); whether `parseFakerSpec`'s current error messages are user-friendly enough to document verbatim or warrant a separate code issue.
+  - Audit gap was specifically that `docs/sanitization.md` only covered the auto-detect `FakeFields(seed, paths...)` path — nothing in the user-facing docs surfaces the typed entrypoint or the built-ins, despite all 12 implementations being exported in `faker.go` and reachable from JSON config.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #126** — `docs: retire stale PROJECT.md and BACKLOG.md (delete or replace with redirect stubs)`.
+  - Labels: `priority:medium`, `documentation`. No milestone.
+  - Pure docs chore. `PROJECT.md` and `BACKLOG.md` at the repo root are 6-12 months stale and now actively misleading: `PROJECT.md` lines 62-95 contain a fabricated API surface (non-existent constructors, wrong type fields, wrong constructor signatures) and lines 144-149 still claim "no CLI" even though `cmd/httptape` ships with Docker images and testcontainers integration; `BACKLOG.md` shows every milestone 1-4 item as an unchecked TODO when in fact all are merged and shipped.
+  - Spec deliberately offers two viable paths (delete vs. redirect stub) and asks the architect to choose, with rationale captured in the PR description. Pre-flight repo-wide grep already confirmed no in-repo files reference either filename, so the audit step should be a quick spot-check.
+  - Out of scope: any change to `decisions.md`, any change to unrelated `BACKLOG.md` files in sibling repos (e.g. `httptape-demos/ts-frontend-first/BACKLOG.md`), any code or test changes, any new top-level docs (CONTRIBUTING.md / ROADMAP.md).
+  - Open question for the architect: pick Option A (delete) vs. Option B (3-line redirect stub). Trade-off framed in the issue around external-bookmark and AI-scraper-index breakage vs. ongoing maintenance.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #128** — `chore: documentation drift cleanup (Go version, image size, missing flags/options/fields, example fixes)`.
+  - Labels: `priority:medium`, `documentation`. No milestone.
+  - Bundles eight independently-small docs drift items into one chore: (1) Go version `1.22 -> 1.26` in `docs/getting-started.md` and `docs/index.md`; (2) Docker image size unified across eight locations (`README.md` x3, `docs/docker.md`, `docs/ui-first-dev.md`, `llms.txt`, `llms-full.txt`) using a freshly-measured number — measurement is itself an acceptance criterion; (3) missing CLI flags in `docs/cli.md` (`--tls-cert/key/ca/insecure` for `record` and `proxy`, `--config` for `serve` with the "accepted but not used" caveat); (4) missing replay options in `docs/replay.md` (`WithCORS`, `WithDelay`, `WithErrorRate`, `WithReplayHeaders`); (5) missing entries in `docs/api-reference.md` (`WithRecorderTLSConfig`, `WithProxyTLSConfig`, `BuildTLSConfig`, `Tape.Metadata`); (6) panic-conditions documentation for `NewRecorder`/`NewServer`/`NewProxy`; (7) example-correctness fixes in `docs/getting-started.md` (the async-flush misclaim and the empty-body-with-redacted-PII inconsistency); (8) `metadata` key added to the sample fixture in `docs/storage.md`.
+  - Explicit scope coordination: registry-naming inconsistency (`tibtof/httptape` vs. `ghcr.io/vibewarden/httptape`) is owned by #122 and explicitly out-of-scope here. `Rule.Fields` is owned by the parallel typed-Faker docs issue (#127) and explicitly deferred — the `docs/api-reference.md` fix here covers TLS-related missing entries and `Tape.Metadata` only.
+  - Pure docs change: no `.go` files, no tests, no `go.mod`/`go.sum`, no CI, no `Dockerfile`. Image-size measurement requires a local Docker build, which is called out as expected work.
+  - No open questions for the architect. The image-size measurement is correctly deferred to the implementer (and is itself an acceptance criterion); everything else is concretely specified including which lines, which files, and the resolution for each ambiguity.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #129** — `chore: repository polish — community-health files, CI badge, OpenSSF Scorecard`.
+  - Labels: `priority:medium`, `documentation`, `chore` (created the `chore` label — did not exist; color `#FEF2C0`, description "Maintenance, polish, or housekeeping work"). No milestone (could grab into v0.9.0).
+  - Bundles 8 deliverables that together fix the "looks early-stage" GitHub-profile signal: `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1), YAML form-style issue templates (`bug.yml` + `feature.yml` + `config.yml` with blank issues disabled and a Discussions link), `PULL_REQUEST_TEMPLATE.md`, a CI status badge in the README, and an OpenSSF Scorecard workflow + badge.
+  - Pre-flight reality check folded into the spec: there is **no existing `test.yml` workflow** — `release.yml` only runs tests on tag push, `docker.yml` runs build without tests, `docs.yml` is docs-only. Therefore the issue requires the architect to add a new minimal `test.yml` running `go test ./... -race -count=1` on push to `main` and PRs targeting `main`. A CI badge for a non-existent workflow would be worse than no badge.
+  - All content must be honest about current project state — `SECURITY.md` says supported version is `main` only (no v0.9.0 yet), `CONTRIBUTING.md` describes the actual PM → Architect → Dev → Reviewer agent pipeline rather than aspirational OSS process, conventional-commit prefixes listed match what's in `git log` (`feat`, `fix`, `chore`, `docs`, `test`, `ci`).
+  - Explicit non-goals: `FUNDING.yml` (owner still deciding on sponsorships), repo-metadata changes already done out-of-band (topics, homepage, Discussions toggle), social-preview image (UI-only upload), `awesome-go` submission (Tier 3, deferred to v0.9.0), Show HN / launch posts (owner-driven, post-v1.0), and any of the next-tier security automation (`dependabot.yml`, `codeql.yml`, cosign, SBOM) which are each their own future issue.
+  - Hard constraint reaffirmed: zero new Go-module dependencies (`go.mod` / `go.sum` unchanged); CI Action versions are not Go deps and are fine.
+  - Acceptance includes a self-check the dev runs in the PR description: `gh api repos/VibeWarden/httptape/community/profile` should show all eight community-profile checklist items satisfied after merge.
+  - Open questions flagged for the architect: (1) single consolidated PR vs. 2–3 split PRs (PM recommendation: single, for cohesion); (2) whether `gh repo edit --enable-private-vulnerability-reporting` is available in the installed `gh` (SECURITY.md content branches on the answer — PVR vs. private email); (3) whether to publish Scorecard results to the OpenSSF dashboard (requires `id-token: write`, makes the badge meaningfully clickable) vs. private (Actions-log only); (4) CI badge label ("CI" vs. "Tests").
+  - File-level coordination noted with #122 (Docker hub registry polish): #122 touches `docker.yml` and `release.yml`; #129 adds new `test.yml` and `scorecard.yml`. No conflict, but reviewers of either PR should know the other is in flight.
   - Status comment posted: `READY_FOR_ARCH`.
