@@ -50,7 +50,7 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
     docker pull ghcr.io/vibewarden/httptape:latest
     ```
 
-Requires Go 1.22 or later for the library/CLI. Docker works with any platform.
+Requires Go 1.26 or later for the library/CLI. Docker works with any platform.
 
 ## Quick example
 

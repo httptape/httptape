@@ -4,7 +4,7 @@ Record, Redact, and Replay HTTP traffic in 5 minutes.
 
 ## Prerequisites
 
-- Go 1.22 or later (for the Go library)
+- Go 1.26 or later (for the Go library)
 - Or: Docker (for CLI/Docker usage with any language)
 - `go get github.com/VibeWarden/httptape`
 
