@@ -311,8 +311,7 @@ func TestHealthMonitor_CloseStopsProbe(t *testing.T) {
 
 	// Allow a couple of probe ticks.
 	time.Sleep(80 * time.Millisecond)
-	beforeClose := rt.callCount()
-	if beforeClose == 0 {
+	if rt.callCount() == 0 {
 		t.Fatal("probe never fired")
 	}
 
@@ -320,10 +319,16 @@ func TestHealthMonitor_CloseStopsProbe(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
+	// Sample AFTER Close: by then any in-flight probe has finished (Close
+	// waits on wg) and the recheck inside runProbe guarantees no further
+	// probe will start. This makes the post-Close growth check race-free —
+	// sampling before Close races with an in-flight tick at the boundary.
+	afterClose := rt.callCount()
+
 	// After close, no further calls within 3x the interval.
 	time.Sleep(80 * time.Millisecond)
-	if got := rt.callCount(); got > beforeClose {
-		t.Errorf("probe kept firing after Close: %d -> %d", beforeClose, got)
+	if got := rt.callCount(); got > afterClose {
+		t.Errorf("probe kept firing after Close: %d -> %d", afterClose, got)
 	}
 
 	waitForGoroutineCount(t, baseline, time.Second)

@@ -344,11 +344,14 @@ func (h *HealthMonitor) runProbe() {
 	defer ticker.Stop()
 
 	// Probe context cancels when the monitor is closed so any in-flight
-	// RoundTrip is aborted promptly.
+	// RoundTrip is aborted promptly. The watcher goroutine is tracked in wg
+	// so Close() waits for it to exit before returning.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	h.wg.Add(1)
 	go func() {
+		defer h.wg.Done()
 		select {
 		case <-h.done:
 			cancel()
@@ -361,7 +364,16 @@ func (h *HealthMonitor) runProbe() {
 		case <-h.done:
 			return
 		case <-ticker.C:
-			h.runProbeOnce(ctx)
+			// Re-check h.done non-blockingly: when both <-h.done and <-ticker.C
+			// are ready, Go's select picks at random. Without this guard a
+			// probe could fire after Close() has already been observed, which
+			// breaks the "no probes after Close" contract.
+			select {
+			case <-h.done:
+				return
+			default:
+				h.runProbeOnce(ctx)
+			}
 		}
 	}
 }
@@ -389,13 +401,15 @@ func (h *HealthMonitor) runProbeOnce(ctx context.Context) {
 
 	resp, err := h.transport.RoundTrip(req)
 	if err != nil {
-		// Transport error AND no response: state stays as-is per definition B.
-		// The Proxy itself may have called observe(...) on a cache hit before
-		// returning an error path; we don't second-guess that.
-		if resp == nil {
-			h.reportError(fmt.Errorf("httptape: probe transport: %w", err))
-			return
+		// http.RoundTripper allows (resp != nil, err != nil) — e.g. partial
+		// body reads. We always close the body if present to avoid leaking
+		// connections, surface the error, and return: the response cannot be
+		// trusted to drive the state machine in this case.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
 		}
+		h.reportError(fmt.Errorf("httptape: probe transport: %w", err))
+		return
 	}
 	if resp == nil {
 		return
