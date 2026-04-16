@@ -215,8 +215,13 @@ func (h *HealthMonitor) recordProbeAttempt() {
 }
 
 // applyObservation runs the observe algorithm: detect transition, update
-// state under the lock, snapshot subscribers, then send out events without
-// holding the lock.
+// state under the lock, then broadcast to subscribers while still holding the
+// lock. Holding h.mu during the send is what protects against the
+// send-on-closed-channel race: dropSubscriber (the single owner of close) also
+// requires h.mu, so a subscriber's channel cannot be closed mid-send. The
+// per-subscriber buffer is bounded; select/default keeps the broadcast
+// non-blocking and overflowed subscribers are dropped in-place under the same
+// lock.
 func (h *HealthMonitor) applyObservation(src SourceState, fromProbe bool) {
 	if !validSourceState(src) {
 		return
@@ -225,6 +230,8 @@ func (h *HealthMonitor) applyObservation(src SourceState, fromProbe bool) {
 	now := h.now().UTC()
 
 	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	transitioned := src != h.state
 	if transitioned {
 		h.state = src
@@ -236,24 +243,30 @@ func (h *HealthMonitor) applyObservation(src SourceState, fromProbe bool) {
 	}
 
 	if !transitioned {
-		h.mu.Unlock()
 		return
 	}
 
 	snap := h.snapshotLocked()
-	subs := make([]*healthSubscriber, 0, len(h.subscribers))
-	for sub := range h.subscribers {
-		subs = append(subs, sub)
-	}
-	h.mu.Unlock()
+	h.broadcastLocked(snap)
+}
 
-	for _, sub := range subs {
+// broadcastLocked sends snap to every subscriber non-blockingly. Subscribers
+// whose buffer is full are dropped (channel closed, removed from the set)
+// under the same lock. Caller MUST hold h.mu.
+func (h *HealthMonitor) broadcastLocked(snap HealthSnapshot) {
+	var toDrop []*healthSubscriber
+	for sub := range h.subscribers {
 		select {
 		case sub.ch <- snap:
 		default:
-			// Bounded buffer overflow: drop and disconnect.
-			h.dropSubscriber(sub)
+			// Bounded buffer overflow: schedule a drop after we finish iterating
+			// (don't mutate the map while ranging over it).
+			toDrop = append(toDrop, sub)
 		}
+	}
+	for _, sub := range toDrop {
+		delete(h.subscribers, sub)
+		close(sub.ch)
 	}
 }
 
@@ -282,21 +295,34 @@ func (h *HealthMonitor) snapshotLocked() HealthSnapshot {
 
 // subscribe registers a new SSE subscriber and returns its receive channel
 // plus an unsubscribe func. The channel is closed when the subscriber is
-// dropped (either by overflow or by Close).
+// dropped (either by overflow or by Close, which goes through dropSubscriber).
+//
+// The initial seed is delivered while holding h.mu. The channel is fresh with
+// capacity sseBufferSize so the send is guaranteed not to block; holding the
+// lock makes the registration + seed atomic with respect to broadcast and
+// dropSubscriber, eliminating any send-on-closed-channel window.
 func (h *HealthMonitor) subscribe() (<-chan HealthSnapshot, func()) {
 	sub := &healthSubscriber{ch: make(chan HealthSnapshot, sseBufferSize)}
 
 	h.mu.Lock()
+	// Reject post-Close subscribes deterministically: return a closed channel
+	// and a no-op unsub so callers don't block forever.
+	select {
+	case <-h.done:
+		h.mu.Unlock()
+		close(sub.ch)
+		return sub.ch, func() {}
+	default:
+	}
 	snap := h.snapshotLocked()
 	h.subscribers[sub] = struct{}{}
-	h.mu.Unlock()
-
-	// Initial seed: the channel is fresh and capacity is sseBufferSize, so
-	// this never blocks. We still use select/default for paranoia.
+	// Initial seed: send under the lock so dropSubscriber cannot race us. The
+	// buffer is fresh, so this cannot block; select/default is defensive.
 	select {
 	case sub.ch <- snap:
 	default:
 	}
+	h.mu.Unlock()
 
 	unsub := func() {
 		h.dropSubscriber(sub)
