@@ -839,6 +839,110 @@ func TestWithHealthProbePath_EmptyIgnored(t *testing.T) {
 	}
 }
 
+// TestHealthMonitor_SubscribeObserveCloseStress races subscribe/unsubscribe
+// against concurrent observe and Close. The single-owner-of-close discipline
+// (only dropSubscriber closes channels, both producers and dropSubscriber hold
+// h.mu) must prevent send-on-closed-channel panics under -race.
+func TestHealthMonitor_SubscribeObserveCloseStress(t *testing.T) {
+	const (
+		subscribers = 32
+		observers   = 8
+		duration    = 50 * time.Millisecond
+	)
+
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Observers: continuously toggle state, broadcasting to subscribers.
+	for i := 0; i < observers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			states := []SourceState{StateLive, StateL1Cache, StateL2Cache}
+			j := id
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				h.observe(states[j%len(states)])
+				j++
+			}
+		}(i)
+	}
+
+	// Subscribers: continuously subscribe, drain a few events, unsubscribe.
+	for i := 0; i < subscribers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				ch, unsub := h.subscribe()
+				// Drain whatever is buffered without blocking.
+			drain:
+				for k := 0; k < 4; k++ {
+					select {
+					case _, ok := <-ch:
+						if !ok {
+							break drain
+						}
+					default:
+						break drain
+					}
+				}
+				unsub()
+			}
+		}()
+	}
+
+	// Let the workload race for a bit, then close mid-flight.
+	time.Sleep(duration)
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Stop the workers and wait for them to exit. They should observe
+	// post-Close state cleanly: subscribe returns a closed channel + no-op
+	// unsub, observe still runs harmlessly (transitions broadcast to an empty
+	// subscriber set), and no goroutine should panic.
+	close(stop)
+	wg.Wait()
+}
+
+// TestHealthMonitor_SubscribeAfterCloseReturnsClosedChannel asserts that
+// subscribe() called after Close() does not block and returns a closed
+// channel + no-op unsub. This is the single-owner-of-close contract.
+func TestHealthMonitor_SubscribeAfterCloseReturnsClosedChannel(t *testing.T) {
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ch, unsub := h.subscribe()
+	if unsub == nil {
+		t.Fatal("subscribe returned nil unsub after Close")
+	}
+	// Calling the no-op unsub must be safe.
+	unsub()
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Error("expected closed channel from subscribe after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscribe channel was not closed after Close")
+	}
+}
+
 // fakeClock is a controllable clock for tests.
 type fakeClock struct {
 	mu  sync.Mutex
