@@ -29,6 +29,7 @@ httptape serve --fixtures ./fixtures [flags]
 | `--delay` | `0` | Fixed delay before every response (e.g., `200ms`, `1s`) |
 | `--error-rate` | `0` | Fraction of requests that return 500 (0.0-1.0) |
 | `--replay-header` | (none) | Header to inject into responses (`Key=Value`, repeatable) |
+| `--config` | (none) | Path to redaction config JSON. Accepted but not currently used by `serve` (reserved for future use). |
 
 The server uses `DefaultMatcher` (method + path matching) and loads fixtures from the specified directory. It shuts down gracefully on SIGINT/SIGTERM.
 
@@ -53,6 +54,10 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 | `--config` | (none) | Path to redaction config JSON |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
+| `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
+| `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
+| `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
+| `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
 The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
 
@@ -86,6 +91,10 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
+| `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
+| `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
+| `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
+| `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
 When the upstream is reachable, requests are forwarded and responses are cached:
 
