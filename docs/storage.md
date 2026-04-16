@@ -107,11 +107,14 @@ Each tape is stored as pretty-printed JSON with a trailing newline:
       "Content-Type": ["application/json"]
     },
     "body": "eyJ1c2VyIjoib2N0b2NhdCJ9"
-  }
+  },
+  "metadata": {}
 }
 ```
 
 Fixtures are human-readable and safe to commit to version control (especially when sanitized).
+
+The `metadata` field is optional and is omitted from the JSON when empty during serialization. See [Fixture Authoring](fixtures-authoring.md) for the metadata keys (`delay`, `error`, etc.) the replay server reads.
 
 ### ID validation
 
