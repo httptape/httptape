@@ -1,0 +1,77 @@
+# .github/workflows/examples.yml
+#
+# Per-example smoke build for examples/<name>/.
+#
+# Lives in its own workflow (separate from `test.yml`) so that an
+# example breakage does not turn the library "Tests" badge red. Each
+# example is a matrix entry; `fail-fast: false` keeps one broken
+# example from short-circuiting the others.
+#
+# Path filter restricts triggers to changes under examples/** or this
+# workflow file itself. Library-only changes do not run this workflow.
+#
+# Adding a new example:
+#   1. Add an entry to the `matrix.example` list. Required keys:
+#        name              - human-readable check label
+#        path              - directory under examples/
+#        node-version      - Node.js major to install
+#        lockfile          - relative path to the npm lockfile
+#                            (used by setup-node cache)
+#        build-command     - shell command run inside `path`
+#   2. Add matching dependabot.yml blocks for the example's ecosystems
+#      (see .github/dependabot.yml for the pattern).
+#   3. Append a row to examples/README.md.
+
+name: Examples
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/**"
+      - ".github/workflows/examples.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "examples/**"
+      - ".github/workflows/examples.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.example.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          - name: ts-frontend-first
+            path: examples/ts-frontend-first
+            node-version: "20"
+            lockfile: examples/ts-frontend-first/package-lock.json
+            build-command: npm run build
+    defaults:
+      run:
+        working-directory: ${{ matrix.example.path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.example.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.example.lockfile }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: ${{ matrix.example.build-command }}

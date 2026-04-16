@@ -1,0 +1,142 @@
+# .github/dependabot.yml
+#
+# Dependabot v2 configuration for httptape.
+#
+# Scope:
+#   - Library Go modules (root + testcontainers subpackage).
+#   - GitHub Actions used by repo workflows.
+#   - Docker base images (root Dockerfile + per-example Dockerfiles).
+#   - npm dependencies in JS/TS examples.
+#
+# Grouping policy:
+#   - Minor + patch updates per ecosystem are batched into a single PR
+#     (`minor-and-patch` group) to keep PR volume manageable.
+#   - Major updates ship as individual PRs so each can be reviewed in
+#     isolation (likely-breaking changes).
+#
+# Cadence:
+#   - Weekly on Mondays at 09:00 UTC (UK/EU morning, before US-Pacific
+#     business hours start) — matches the spec in #136.
+#
+# Labels:
+#   - All PRs get `dependencies` plus an ecosystem tag (`go` / `npm` /
+#     `docker` / `github-actions`) so they can be filtered cleanly.
+#
+# When adding a new example under examples/<name>/:
+#   - Add an `npm` block (if it has package.json) and a `docker` block
+#     (if it has a Dockerfile) following the ts-frontend-first pattern
+#     below.
+
+version: 2
+updates:
+  # ----- Library: root Go module (stdlib-only by design; covers tooling) -----
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "go"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Testcontainers subpackage (third-party deps by design) -----
+  - package-ecosystem: "gomod"
+    directory: "/testcontainers"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "go"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- CI Actions (workflows under .github/workflows) -----
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Root Dockerfile base images -----
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Example: ts-frontend-first (npm) -----
+  - package-ecosystem: "npm"
+    directory: "/examples/ts-frontend-first"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Example: ts-frontend-first (Dockerfile, node:20-alpine) -----
+  - package-ecosystem: "docker"
+    directory: "/examples/ts-frontend-first"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
