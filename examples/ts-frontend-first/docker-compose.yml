@@ -1,12 +1,12 @@
 services:
   upstream:
-    image: ghcr.io/vibewarden/httptape:0.10.0
+    image: ghcr.io/vibewarden/httptape:0.10.1
     command: ["serve", "--fixtures", "/fixtures"]
     volumes:
       - ./mocks/upstream-fixtures:/fixtures:ro
 
   proxy:
-    image: ghcr.io/vibewarden/httptape:0.10.0
+    image: ghcr.io/vibewarden/httptape:0.10.1
     command:
       - proxy
       - --upstream
@@ -21,6 +21,7 @@ services:
       - --fallback-on-5xx
       - --health-endpoint
       - --upstream-probe-interval=2s
+      - --sse-timing=realtime
     volumes:
       - ./.httptape-cache/fixtures:/fixtures
       - ./mocks/sanitize.json:/config/sanitize.json:ro
