@@ -1,16 +1,20 @@
 # httptape
 
 > Record, Redact, Replay -- HTTP traffic recording, redaction, and replay.
-> Embeddable Go library, CLI, and Docker image.
+> Embeddable Go library, CLI, and Docker image. SSE (Server-Sent Events) record/replay built in.
 
 ## Overview
 
 httptape captures HTTP request/response pairs ("tapes"), redacts sensitive data
 on write, and replays them as a mock server. Zero dependencies (stdlib only).
+SSE streams (e.g., LLM streaming completions) are recorded as discrete events
+with per-event timing metadata and replayed with configurable speed.
 
 ## Core Types
 
 - Tape: recorded HTTP request/response pair (JSON-serializable)
+- SSEEvent: a single Server-Sent Event with offset timing (OffsetMS, Type, Data, ID, Retry)
+- SSETimingMode: sealed interface controlling SSE replay timing (Realtime, Accelerated, Instant)
 - Recorder: http.RoundTripper that records traffic to a Store
 - Server: http.Handler that replays tapes from a Store
 - Proxy: http.RoundTripper with L1/L2 caching and fallback
@@ -28,7 +32,10 @@ client := &http.Client{Transport: rec}
 ```
 
 Options: WithTransport, WithRoute, WithSanitizer, WithAsync, WithBufferSize,
-WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError
+WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError, WithSSERecording
+
+SSE detection: automatic for Content-Type: text/event-stream. Events are parsed
+and stored individually with timing metadata. Disable with WithSSERecording(false).
 
 ## Redaction (Go type: Sanitizer/Pipeline)
 
@@ -37,22 +44,31 @@ sanitizer := httptape.NewPipeline(
     httptape.RedactHeaders("Authorization", "Cookie"),
     httptape.RedactBodyPaths("$.password", "$.ssn"),
     httptape.FakeFields("seed", "$.email", "$.user_id"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+    httptape.FakeSSEEventData("seed", "$.user.email"),
 )
 ```
 
 - RedactHeaders: replace header values with "[REDACTED]"
 - RedactBodyPaths: type-aware JSON field redaction
 - FakeFields: deterministic HMAC-SHA256 fakes (emails, UUIDs, numbers, strings)
+- RedactSSEEventData: redact fields within each SSE event's JSON data
+- FakeSSEEventData: deterministic faking within each SSE event's JSON data
 
 ## Replay
 
 ```go
-srv := httptape.NewServer(store)
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ts := httptest.NewServer(srv)
 ```
 
 Options: WithMatcher, WithFallbackStatus, WithFallbackBody, WithOnNoMatch,
-WithCORS, WithDelay, WithErrorRate, WithReplayHeaders
+WithCORS, WithDelay, WithErrorRate, WithReplayHeaders, WithSSETiming
+
+SSE timing modes:
+- SSETimingRealtime(): original inter-event gaps
+- SSETimingAccelerated(factor): gaps divided by factor
+- SSETimingInstant(): all events emitted immediately
 
 ## Proxy (fallback-to-cache)
 
@@ -64,6 +80,8 @@ proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 ```
 
 X-Httptape-Source header: "l1-cache" or "l2-cache" when serving from cache.
+SSE responses pass through and are cached with per-event timing. L2 fallback
+replays cached SSE events using WithProxySSETiming (default: instant).
 
 ## Matching
 
@@ -113,6 +131,15 @@ docker pull ghcr.io/vibewarden/httptape:latest
 ]}
 ```
 
+## How it compares
+
+| Feature | httptape | WireMock | gock/httpmock | MSW |
+|---|---|---|---|---|
+| SSE record/replay | **yes** | no | no | partial (mock-only) |
+| Redaction on write | **yes** | no | no | no |
+| Embeddable in Go | **yes** | no (Java) | yes | no (browser) |
+| Proxy with fallback | **yes** | no | no | no |
+
 ## Key APIs
 
 ```go
@@ -127,6 +154,11 @@ func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
 func ExportBundle(ctx, store, opts...) (io.Reader, error)
 func ImportBundle(ctx, store, reader) error
 func LoadConfigFile(path string) (*Config, error)
+func SSETimingRealtime() SSETimingMode
+func SSETimingAccelerated(factor float64) SSETimingMode
+func SSETimingInstant() SSETimingMode
+func RedactSSEEventData(paths ...string) SanitizeFunc
+func FakeSSEEventData(seed string, paths ...string) SanitizeFunc
 ```
 
 ## Links

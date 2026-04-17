@@ -3,6 +3,7 @@ package httptape
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -650,7 +651,9 @@ func TestIntegration_RecordReplay_PostWithBody(t *testing.T) {
 // flow using MemoryStore: an upstream SSE server is recorded through the
 // Recorder, then replayed by the Server with instant timing.
 func TestIntegration_SSE_RecordReplay_E2E(t *testing.T) {
-	// Start an upstream that serves SSE.
+	const eventCount = 5
+
+	// Start an upstream that serves SSE with valid JSON event data.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -661,10 +664,8 @@ func TestIntegration_SSE_RecordReplay_E2E(t *testing.T) {
 		w.WriteHeader(200)
 		flusher.Flush()
 
-		for i := 0; i < 5; i++ {
-			body := strings.NewReader("")
-			_ = body
-			w.Write([]byte("data: {\"n\":" + strings.TrimRight(strings.Repeat("0", i+1), "0") + "}\n\n"))
+		for i := 0; i < eventCount; i++ {
+			fmt.Fprintf(w, "data: {\"n\":%d}\n\n", i)
 			flusher.Flush()
 		}
 	}))
@@ -682,9 +683,13 @@ func TestIntegration_SSE_RecordReplay_E2E(t *testing.T) {
 	origBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	// The caller should have received the raw SSE bytes.
-	if !strings.Contains(string(origBody), "data:") {
-		t.Error("caller should see raw SSE data")
+	// The caller should have received the raw SSE bytes with valid JSON payloads.
+	origStr := string(origBody)
+	for i := 0; i < eventCount; i++ {
+		want := fmt.Sprintf("data: {\"n\":%d}", i)
+		if !strings.Contains(origStr, want) {
+			t.Errorf("original body missing %q", want)
+		}
 	}
 
 	// Replay.
@@ -709,9 +714,13 @@ func TestIntegration_SSE_RecordReplay_E2E(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 
-	// The replayed body should contain SSE data lines.
-	if !strings.Contains(string(replayBody), "data:") {
-		t.Error("replayed response should contain SSE data")
+	// Verify each event's data was replayed with the correct JSON payload.
+	replayStr := string(replayBody)
+	for i := 0; i < eventCount; i++ {
+		want := fmt.Sprintf("data: {\"n\":%d}", i)
+		if !strings.Contains(replayStr, want) {
+			t.Errorf("replayed body missing %q; got:\n%s", want, replayStr)
+		}
 	}
 }
 

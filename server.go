@@ -327,5 +327,5 @@ func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request, tape Tape) {
 	flusher.Flush()
 
 	// Replay events with the configured timing.
-	_ = replaySSEEvents(r.Context(), w, flusher, tape.Response.SSEEvents, s.sseTiming)
+	_ = replaySSEEvents(r.Context(), w, flusher, tape.Response.SSEEvents, s.sseTiming) //nolint:errcheck // SSE replay write failure is not actionable
 }

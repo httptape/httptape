@@ -453,6 +453,68 @@ Instead of building pipelines in code, you can define redaction rules in a JSON 
 
 The `fake` action also accepts a `fields` map that selects a typed faker per path -- the JSON-config equivalent of `FakeFieldsWith`. See [Config](config.md#typed-fake-fields) for syntax and the full list of shorthands.
 
+## SSE event redaction
+
+For SSE (Server-Sent Events) responses, httptape provides two `SanitizeFunc` constructors that operate on individual event payloads. Each event's `Data` field is treated as an independent JSON body, so the same path syntax applies as `RedactBodyPaths` and `FakeFields`.
+
+These functions are no-ops for non-SSE tapes, so they compose safely in a pipeline that handles both regular and SSE responses.
+
+### RedactSSEEventData
+
+Redacts fields within each SSE event's JSON data:
+
+```go
+httptape.RedactSSEEventData("$.choices[*].delta.content", "$.usage.prompt_tokens")
+```
+
+Example: an LLM streaming response where each event looks like:
+
+```json
+{"id":"chatcmpl-1","choices":[{"delta":{"content":"The user's SSN is 123-45-6789"}}]}
+```
+
+After `RedactSSEEventData("$.choices[*].delta.content")`:
+
+```json
+{"id":"chatcmpl-1","choices":[{"delta":{"content":"[REDACTED]"}}]}
+```
+
+Each event is redacted independently. Non-JSON event data (e.g., `[DONE]`) is left unchanged.
+
+### FakeSSEEventData
+
+Replaces fields within each SSE event's JSON data with deterministic fakes:
+
+```go
+httptape.FakeSSEEventData("my-seed", "$.user.email", "$.user.name")
+```
+
+This uses the same HMAC-SHA256 faking strategy as `FakeFields`. The same seed and input always produce the same fake, so cross-event consistency is preserved.
+
+### Complete pipeline for LLM streaming
+
+A typical pipeline for recording LLM API traffic with streaming redaction:
+
+```go
+sanitizer := httptape.NewPipeline(
+    // Step 1: Redact auth headers.
+    httptape.RedactHeaders("Authorization", "X-Api-Key"),
+
+    // Step 2: Redact sensitive fields in regular (non-SSE) response bodies.
+    httptape.RedactBodyPaths("$.api_key"),
+
+    // Step 3: Redact PII from SSE event payloads.
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+
+    // Step 4: Fake user identifiers in SSE events with deterministic values.
+    httptape.FakeSSEEventData("my-seed", "$.user.email", "$.user.id"),
+)
+
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+```
+
+The order is: headers first, regular body paths, SSE event redaction, SSE event faking. SSE-specific functions are no-ops for non-SSE tapes, and `RedactBodyPaths`/`FakeFields` are no-ops for SSE tapes (since SSE tapes have nil `Body`), so all functions coexist safely in one pipeline.
+
 ## Custom sanitize functions
 
 You can write your own `SanitizeFunc` and add it to the pipeline:

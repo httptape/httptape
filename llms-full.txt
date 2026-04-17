@@ -1,16 +1,20 @@
 # httptape
 
 > Record, Redact, Replay -- HTTP traffic recording, redaction, and replay.
-> Embeddable Go library, CLI, and Docker image.
+> Embeddable Go library, CLI, and Docker image. SSE (Server-Sent Events) record/replay built in.
 
 ## Overview
 
 httptape captures HTTP request/response pairs ("tapes"), redacts sensitive data
 on write, and replays them as a mock server. Zero dependencies (stdlib only).
+SSE streams (e.g., LLM streaming completions) are recorded as discrete events
+with per-event timing metadata and replayed with configurable speed.
 
 ## Core Types
 
 - Tape: recorded HTTP request/response pair (JSON-serializable)
+- SSEEvent: a single Server-Sent Event with offset timing (OffsetMS, Type, Data, ID, Retry)
+- SSETimingMode: sealed interface controlling SSE replay timing (Realtime, Accelerated, Instant)
 - Recorder: http.RoundTripper that records traffic to a Store
 - Server: http.Handler that replays tapes from a Store
 - Proxy: http.RoundTripper with L1/L2 caching and fallback
@@ -28,7 +32,10 @@ client := &http.Client{Transport: rec}
 ```
 
 Options: WithTransport, WithRoute, WithSanitizer, WithAsync, WithBufferSize,
-WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError
+WithSampling, WithMaxBodySize, WithSkipRedirects, WithOnError, WithSSERecording
+
+SSE detection: automatic for Content-Type: text/event-stream. Events are parsed
+and stored individually with timing metadata. Disable with WithSSERecording(false).
 
 ## Redaction (Go type: Sanitizer/Pipeline)
 
@@ -37,22 +44,31 @@ sanitizer := httptape.NewPipeline(
     httptape.RedactHeaders("Authorization", "Cookie"),
     httptape.RedactBodyPaths("$.password", "$.ssn"),
     httptape.FakeFields("seed", "$.email", "$.user_id"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+    httptape.FakeSSEEventData("seed", "$.user.email"),
 )
 ```
 
 - RedactHeaders: replace header values with "[REDACTED]"
 - RedactBodyPaths: type-aware JSON field redaction
 - FakeFields: deterministic HMAC-SHA256 fakes (emails, UUIDs, numbers, strings)
+- RedactSSEEventData: redact fields within each SSE event's JSON data
+- FakeSSEEventData: deterministic faking within each SSE event's JSON data
 
 ## Replay
 
 ```go
-srv := httptape.NewServer(store)
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ts := httptest.NewServer(srv)
 ```
 
 Options: WithMatcher, WithFallbackStatus, WithFallbackBody, WithOnNoMatch,
-WithCORS, WithDelay, WithErrorRate, WithReplayHeaders
+WithCORS, WithDelay, WithErrorRate, WithReplayHeaders, WithSSETiming
+
+SSE timing modes:
+- SSETimingRealtime(): original inter-event gaps
+- SSETimingAccelerated(factor): gaps divided by factor
+- SSETimingInstant(): all events emitted immediately
 
 ## Proxy (fallback-to-cache)
 
@@ -64,6 +80,8 @@ proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 ```
 
 X-Httptape-Source header: "l1-cache" or "l2-cache" when serving from cache.
+SSE responses pass through and are cached with per-event timing. L2 fallback
+replays cached SSE events using WithProxySSETiming (default: instant).
 
 ## Matching
 
@@ -127,6 +145,11 @@ func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
 func ExportBundle(ctx, store, opts...) (io.Reader, error)
 func ImportBundle(ctx, store, reader) error
 func LoadConfigFile(path string) (*Config, error)
+func SSETimingRealtime() SSETimingMode
+func SSETimingAccelerated(factor float64) SSETimingMode
+func SSETimingInstant() SSETimingMode
+func RedactSSEEventData(paths ...string) SanitizeFunc
+func FakeSSEEventData(seed string, paths ...string) SanitizeFunc
 ```
 
 ## Links
@@ -155,11 +178,14 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
 
 **Nobody does redaction.** Existing tools record raw traffic including secrets and PII. Redaction is always an afterthought. httptape redacts on write -- sensitive data never hits disk.
 
+**Nobody does SSE record/replay.** LLM streaming (OpenAI, Anthropic, etc.) uses Server-Sent Events. httptape records SSE streams with per-event timing, replays them with configurable speed, and redacts PII from individual event payloads. WireMock, gock, httpmock, and MSW do not support this.
+
 ## Key features
 
 - **Record** -- wrap any `http.RoundTripper` to capture real HTTP traffic
 - **Redact on write** -- strip headers, body fields, or replace values with deterministic fakes before storage
 - **Replay** -- serve recorded fixtures as a mock `http.Handler`
+- **SSE record/replay** -- record Server-Sent Event streams with per-event timing, replay with configurable speed (realtime, accelerated, instant), redact PII from individual event payloads
 - **Proxy with fallback** -- forward to upstream with automatic fallback to cached responses when the backend is down
 - **Composable matching** -- match requests by method, path, query params, headers, body hash, or fuzzy body fields
 - **Pluggable storage** -- in-memory for tests, filesystem for fixtures, or implement your own `Store`
@@ -583,6 +609,22 @@ Always call `Close` when recording is complete. In async mode, `Close` flushes a
 
 After `Close` returns, any further `RoundTrip` calls pass through to the inner transport without recording.
 
+## SSE (Server-Sent Events) recording
+
+When the upstream responds with `Content-Type: text/event-stream`, the Recorder automatically detects the SSE stream and records it as discrete events (stored in `RecordedResp.SSEEvents`) rather than a single body blob. Each event includes timing metadata (`OffsetMS`) for replay.
+
+SSE recording is enabled by default. Disable with `WithSSERecording(false)`.
+
+Combine with per-event redaction:
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+)
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+```
+
 ## Thread safety
 
 `Recorder` is safe for concurrent use. Multiple goroutines can call `RoundTrip` simultaneously. `Close` must be called exactly once when recording is complete (though calling it multiple times is safe due to `sync.Once`).
@@ -705,6 +747,22 @@ For each incoming request, the `Server`:
 4. If no match is found, calls `OnNoMatch` (if set) and writes the fallback response
 
 The `Content-Length` header from the recorded response is removed and re-calculated by `net/http` to ensure it matches the actual body (which may have been modified by sanitization).
+
+## SSE replay
+
+When the Server encounters a tape with `SSEEvents` (i.e., `IsSSE()` returns true), it switches to SSE replay mode. Events are streamed using the configured `SSETimingMode`.
+
+SSE timing modes (set with `WithSSETiming`):
+
+| Mode | Behavior |
+|------|----------|
+| `SSETimingRealtime()` | Original inter-event gaps (default) |
+| `SSETimingAccelerated(N)` | Gaps divided by N |
+| `SSETimingInstant()` | Zero delay between events |
+
+```go
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+```
 
 ## Using with httptest
 
@@ -946,6 +1004,23 @@ With `FakeFields("my-seed", "$.user.email", "$.user.id", "$.user.name")`:
 ```
 
 The key property: if `alice@company.com` appears in another fixture, it will be faked to the same value. This preserves relational consistency across your fixture set.
+
+## SSE event redaction
+
+For SSE responses, two SanitizeFunc constructors operate on individual event payloads:
+
+- `RedactSSEEventData(paths...)` -- redact fields within each SSE event's JSON data
+- `FakeSSEEventData(seed, paths...)` -- deterministic faking within each SSE event's JSON data
+
+Both are no-ops for non-SSE tapes. Each event's Data is treated as an independent JSON body.
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+    httptape.FakeSSEEventData("my-seed", "$.user.email"),
+)
+```
 
 ## Combining redaction and faking
 
@@ -1249,6 +1324,17 @@ cd frontend && npm run dev
 ```
 
 Check the `X-Httptape-Source` response header in browser dev tools to see whether each response is live or cached.
+
+## SSE passthrough and fallback
+
+SSE responses pass through proxy mode transparently. When the upstream is reachable, the SSE stream is forwarded to the caller while events are parsed and cached to L1/L2. When the upstream is unavailable, L2 fallback replays cached SSE events using `WithProxySSETiming` (default: `SSETimingInstant()`).
+
+```go
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxySanitizer(sanitizer),
+    httptape.WithProxySSETiming(httptape.SSETimingInstant()),
+)
+```
 
 ## Thread safety
 

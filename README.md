@@ -19,9 +19,10 @@
 
 ---
 
-httptape captures HTTP request/response pairs, redacts sensitive data on write,
-and replays them as a mock server. Think WireMock, but with a 3 MB Docker image,
-an embeddable Go library, and a redaction pipeline built into the core.
+httptape captures HTTP request/response pairs (including SSE streams), redacts
+sensitive data on write, and replays them as a mock server. Think WireMock, but
+with a 3 MB Docker image, an embeddable Go library, SSE record/replay with
+per-event timing, and a redaction pipeline built into the core.
 
 **Docs**: [vibewarden.dev/docs/httptape](https://vibewarden.dev/docs/httptape/) · **From**: [VibeWarden](https://vibewarden.dev)
 
@@ -37,6 +38,7 @@ an embeddable Go library, and a redaction pipeline built into the core.
 - **Go mocking libraries** (`gock`, `httpmock`) only work inside test code -- no standalone server, no recording, no fixture management
 - **json-server / Mockoon** -- no recording, no redaction, manual fixture writing only
 - **Nobody does redaction** -- existing tools record raw traffic including secrets and PII. httptape redacts on write -- sensitive data never hits disk
+- **SSE record and replay** -- record Server-Sent Event streams (LLM completions, real-time feeds) with per-event timing, replay them with configurable speed (realtime, accelerated, or instant), and redact PII from individual event payloads. No other Go mocking tool does this
 
 ## Use cases
 
@@ -91,6 +93,42 @@ httptape proxy --upstream https://api.example.com \
 ```
 
 When the upstream is reachable, requests are forwarded and responses are cached in two tiers (L1 in-memory, L2 on disk). When the upstream is down, httptape transparently serves cached responses. See [Proxy Mode](https://vibewarden.dev/docs/httptape/proxy/) for details.
+
+### Recording LLM streaming responses
+Record SSE streams from OpenAI, Anthropic, or any SSE-based API. Each event is stored individually with timing metadata, so replay can simulate the original streaming behavior.
+
+```go
+store := httptape.NewMemoryStore()
+
+// Record -- SSE detection is automatic for text/event-stream responses.
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+)
+rec := httptape.NewRecorder(store,
+    httptape.WithSanitizer(sanitizer),
+    httptape.WithRoute("openai"),
+)
+defer rec.Close()
+
+client := &http.Client{Transport: rec}
+// Hit the real LLM API -- SSE events are captured with per-event timing.
+resp, _ := client.Post("https://api.openai.com/v1/chat/completions",
+    "application/json", strings.NewReader(`{
+        "model": "gpt-4", "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}]
+    }`))
+io.Copy(io.Discard, resp.Body)
+resp.Body.Close()
+
+// Replay with instant timing for fast tests.
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+ts := httptest.NewServer(srv)
+defer ts.Close()
+// Point your code at ts.URL -- streaming responses replay instantly.
+```
+
+See [Recording](https://vibewarden.dev/docs/httptape/recording/) and [Replay](https://vibewarden.dev/docs/httptape/replay/) for details on SSE support.
 
 ## Install
 
@@ -224,6 +262,23 @@ curl -N http://localhost:8081/__httptape/health/stream
 
 `state` mirrors the existing `X-Httptape-Source` header (`live`, `l1-cache`, `l2-cache`). With both flags absent, no endpoints are mounted and no probe goroutine is started — behavior is byte-for-byte unchanged.
 
+### SSE replay
+
+Replay recorded SSE streams with configurable timing. Use `SSETimingInstant()` for fast tests:
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithSSETiming(httptape.SSETimingInstant()),
+)
+ts := httptest.NewServer(srv)
+defer ts.Close()
+
+resp, _ := http.Get(ts.URL + "/v1/chat/completions")
+// Events are streamed back instantly -- no waiting for original timing.
+```
+
+Other timing modes: `SSETimingRealtime()` preserves original inter-event gaps, `SSETimingAccelerated(10)` replays 10x faster.
+
 ### Import / Export
 
 ```go
@@ -308,6 +363,7 @@ More examples coming. See [`examples/README.md`](examples/README.md) for the ind
 | Redaction on write | **yes** | no | no | no | no |
 | Deterministic faking | **yes** | no | no | no | no |
 | Proxy with fallback | **yes** | no | no | no | no |
+| SSE record/replay | **yes** | no | no | partial | no |
 | Frontend mock backend | **yes** | yes | yes | yes (browser) | no |
 | Fixture import/export | **yes** | partial | no | no | no |
 | Dependencies | **zero** | JVM | npm | npm | 1 |

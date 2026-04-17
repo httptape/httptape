@@ -8783,6 +8783,157 @@ issue):
 
 ---
 
+### ADR-35: Server-Sent Events (SSE) record / replay / proxy passthrough
+
+**Date**: 2026-04-16
+**Issue**: #124
+**Status**: Accepted
+
+#### Context
+
+LLM APIs (OpenAI, Anthropic, etc.) stream completions via Server-Sent Events
+(SSE). Developers recording these interactions with httptape received a single
+opaque `Body` blob containing concatenated SSE frames with no timing metadata.
+Replay delivered the entire stream instantly, making it useless for testing
+streaming UIs, back-pressure, or timing-dependent logic.
+
+No existing Go HTTP mocking library (gock, httpmock) or standalone tool
+(WireMock, json-server, Mockoon) provides SSE record + replay with per-event
+timing and per-event sanitization. MSW offers mock-side SSE construction but
+not recording of real upstream streams. mitmproxy captures but cannot replay.
+
+This is httptape's strongest competitive differentiator.
+
+#### Decision
+
+##### Type design
+
+**`SSEEvent`** (in `sse.go`): pure value type representing one parsed SSE event.
+
+```go
+type SSEEvent struct {
+    OffsetMS int64  `json:"offset_ms"`        // ms since response headers
+    Type     string `json:"type,omitempty"`    // "event:" field
+    Data     string `json:"data"`             // "data:" field(s), joined with "\n"
+    ID       string `json:"id,omitempty"`     // "id:" field
+    Retry    int    `json:"retry,omitempty"`  // "retry:" field (ms)
+}
+```
+
+**`SSETimingMode`** (in `sse.go`): sealed interface controlling replay timing.
+Three constructors:
+
+- `SSETimingRealtime()` -- replays with original inter-event gaps
+- `SSETimingAccelerated(factor float64)` -- divides gaps by factor (must be > 0;
+  panics otherwise as a constructor guard)
+- `SSETimingInstant()` -- emits all events back-to-back with zero delay
+
+The interface is sealed (unexported `sseTimingMode()` method) so the set of
+implementations is closed. Each type computes its delay from `OffsetMS` deltas.
+
+##### Schema migration
+
+`RecordedResp` gains an `SSEEvents []SSEEvent` field with `json:"sse_events,omitempty"`.
+Body and SSEEvents are mutually exclusive by construction:
+
+- The Recorder populates one or the other, never both.
+- During replay, `IsSSE()` (non-nil, non-empty SSEEvents) takes precedence.
+- Old tapes (before SSE support) have `SSEEvents` nil/empty and continue to
+  work unchanged -- the field is `omitempty`, so existing JSON fixtures round-trip
+  without modification.
+
+No schema version bump is needed. The field is purely additive.
+
+##### Recording approach
+
+`sseRecordingReader` (in `sse.go`) wraps the upstream response body:
+
+1. `io.TeeReader` feeds bytes to both the caller and an `io.Pipe`.
+2. A background goroutine reads from the pipe through `parseSSEStream`,
+   calling `onEvent` for each dispatched event.
+3. `parseSSEStream` follows the W3C SSE specification: blank-line dispatch,
+   comment-line skip, field parsing with colon+space stripping, multi-line
+   data joining, retry as digits-only.
+4. When the caller closes the body (or upstream hits EOF), the pipe is closed,
+   the parser exits, and `onDone` is called.
+
+**Critical ordering**: `onDone` (which persists the tape) is called *before*
+`close(r.done)`, so the tape is saved before `Close()` returns. This is
+essential for synchronous recording mode where the caller expects the tape to
+be in the store immediately after closing the body.
+
+SSE detection is based on `Content-Type: text/event-stream` (case-insensitive,
+parameter-tolerant via `mime.ParseMediaType`). Detection is enabled by default
+(`sseRecording: true` on Recorder) and can be disabled with
+`WithSSERecording(false)`, in which case SSE responses are buffered as regular
+bodies.
+
+##### Replay timing modes
+
+The `Server` gains a `WithSSETiming(mode SSETimingMode)` option (default:
+`SSETimingRealtime`). When serving an SSE tape, `serveSSE` checks for
+`http.Flusher` support, sets SSE-required headers (`Content-Type`,
+`Cache-Control`, `Connection`), writes the status code, then calls
+`replaySSEEvents` which iterates over events, applying the timing mode's
+`delay()` before each write. Each event is written with `writeSSEEvent`
+and flushed individually. Context cancellation (client disconnect) is
+respected between events.
+
+The `Proxy` gains `WithProxySSETiming(mode SSETimingMode)` for L2 fallback
+(default: `SSETimingInstant`). Proxy L2 fallback synthesizes an `*http.Response`
+with a piped body and streams events through it.
+
+##### Sanitization composition
+
+Two new `SanitizeFunc` constructors (in `sanitizer.go`):
+
+- `RedactSSEEventData(paths ...string)` -- applies body-path redaction to each
+  event's Data field independently (treats each Data as a JSON body).
+- `FakeSSEEventData(seed string, paths ...string)` -- applies deterministic
+  faking to each event's Data field.
+
+Both are no-ops for non-SSE tapes. They compose naturally with existing
+pipeline functions -- no new interface or protocol needed. They copy the
+SSEEvents slice before mutation to preserve immutability.
+
+##### Shared `writeSSEEvent` helper
+
+The `writeSSEEvent` function in `sse.go` writes a single SSE event in wire
+format. It is used by:
+
+- `replaySSEEvents` (server replay)
+- `Proxy.sseResponseFromTape` (proxy L2 fallback)
+- `health.go` SSE stream handler (refactored from inline formatting)
+
+This eliminates duplicated SSE wire-format code across the codebase.
+
+#### Consequences
+
+**Positive**
+
+- httptape can record, replay, and sanitize SSE streams from any upstream
+  (LLM APIs, real-time feeds, notification streams) with per-event granularity.
+- Replay timing modes let users choose between realistic simulation
+  (Realtime), faster tests (Accelerated), and instant tests (Instant).
+- Sanitization applies to individual event payloads, so PII in streamed
+  LLM completions is redacted before it touches disk.
+- Backward compatible: no schema version bump, old tapes work unchanged.
+- No new dependencies (stdlib only).
+
+**Negative / trade-offs**
+
+- SSE events are fully parsed and stored individually, increasing fixture file
+  size compared to a raw body blob for streams with many small events. This is
+  acceptable because it enables per-event timing and sanitization.
+- The `sseRecordingReader` adds a background goroutine per SSE response during
+  recording. This is the same pattern used by the async recorder channel and
+  has negligible overhead for the expected use case (a handful of concurrent
+  SSE connections in test/dev).
+- `parseSSEStream` buffers up to 1 MB per line (configurable scanner buffer).
+  Pathological SSE streams with very long lines could hit this limit.
+
+---
+
 ## PM Log
 
 ### 2026-04-16

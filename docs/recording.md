@@ -122,6 +122,68 @@ Always call `Close` when recording is complete. In async mode, `Close` flushes a
 
 After `Close` returns, any further `RoundTrip` calls pass through to the inner transport without recording.
 
+## SSE (Server-Sent Events) recording
+
+When the upstream responds with `Content-Type: text/event-stream`, the Recorder automatically detects the SSE stream and records it as discrete events rather than a single body blob.
+
+### How SSE detection works
+
+SSE detection triggers on `Content-Type: text/event-stream` (case-insensitive, parameter-tolerant). When detected, the Recorder:
+
+1. Wraps the response body in an internal `sseRecordingReader`.
+2. The caller reads from the wrapper as normal -- bytes pass through unchanged.
+3. A background goroutine parses the SSE stream according to the W3C specification, collecting individual events with timing metadata (`OffsetMS` -- milliseconds since the response headers were received).
+4. When the body is closed (or the upstream hits EOF), all collected events are stored as `RecordedResp.SSEEvents` and the regular `Body` field is left nil. The two fields are mutually exclusive.
+
+### Tape format for SSE responses
+
+SSE tapes store events individually instead of as a raw body:
+
+```json
+{
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["text/event-stream"]},
+    "sse_events": [
+      {"offset_ms": 0, "data": "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}"},
+      {"offset_ms": 150, "data": "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}"},
+      {"offset_ms": 310, "type": "done", "data": "[DONE]"}
+    ]
+  }
+}
+```
+
+Each event captures:
+- `offset_ms` -- timing relative to stream start (used for replay timing)
+- `type` -- the SSE event type (omitted when it is the default `message` type)
+- `data` -- the event payload (multi-line data is joined with `\n`)
+- `id` -- the event ID (omitted when absent)
+- `retry` -- reconnection time in ms (omitted when absent)
+
+### Disabling SSE detection
+
+SSE recording is enabled by default. To record SSE responses as regular bodies (one large blob):
+
+```go
+rec := httptape.NewRecorder(store, httptape.WithSSERecording(false))
+```
+
+### SSE recording with redaction
+
+Combine SSE recording with per-event redaction to strip PII from streaming LLM responses:
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+)
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+```
+
+Each event's `Data` field is treated as an independent JSON body, so the same path syntax works as `RedactBodyPaths`. Non-JSON event data is left unchanged.
+
+See [Redaction](sanitization.md) for more on SSE redaction and faking.
+
 ## Thread safety
 
 `Recorder` is safe for concurrent use. Multiple goroutines can call `RoundTrip` simultaneously. `Close` must be called exactly once when recording is complete (though calling it multiple times is safe due to `sync.Once`).

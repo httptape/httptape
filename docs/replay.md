@@ -135,6 +135,88 @@ For each incoming request, the `Server`:
 
 The `Content-Length` header from the recorded response is removed and re-calculated by `net/http` to ensure it matches the actual body (which may have been modified by sanitization).
 
+## SSE replay
+
+When the `Server` encounters a tape with `SSEEvents` (i.e., `IsSSE()` returns true), it switches to SSE replay mode instead of writing a regular body.
+
+### How SSE replay works
+
+For an SSE tape, `ServeHTTP`:
+
+1. Checks that the `http.ResponseWriter` supports `http.Flusher` (required for streaming). If not, returns 500.
+2. Writes the tape's response headers, setting `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+3. Removes `Content-Length` (SSE streams are chunked).
+4. Writes the status code and flushes.
+5. Iterates over `SSEEvents`, applying the configured `SSETimingMode` delay before each event, then writing and flushing it.
+6. Respects context cancellation (client disconnect) between events.
+
+### SSE timing modes
+
+Control inter-event timing with `WithSSETiming`:
+
+```go
+// Replay with original recorded timing (default).
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingRealtime()))
+
+// Replay 10x faster -- useful for integration tests that need some timing
+// realism without waiting for the full duration.
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingAccelerated(10)))
+
+// Replay instantly -- all events emitted back-to-back with no delay.
+// Best for unit tests where timing is irrelevant.
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+```
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `SSETimingRealtime()` | Original inter-event gaps from `OffsetMS` | UI testing, back-pressure simulation |
+| `SSETimingAccelerated(N)` | Gaps divided by N | Integration tests (fast but still sequential) |
+| `SSETimingInstant()` | Zero delay between events | Unit tests, CI pipelines |
+
+### Example: replaying LLM streaming in tests
+
+```go
+func TestStreamingChat(t *testing.T) {
+    store, _ := httptape.NewFileStore(
+        httptape.WithDirectory("testdata/fixtures"),
+    )
+
+    // Use instant timing so the test completes immediately.
+    srv := httptape.NewServer(store,
+        httptape.WithSSETiming(httptape.SSETimingInstant()),
+    )
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    // Point your LLM client at the mock server.
+    resp, err := http.Post(ts.URL+"/v1/chat/completions",
+        "application/json",
+        strings.NewReader(`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"Hi"}]}`),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    if resp.Header.Get("Content-Type") != "text/event-stream" {
+        t.Fatal("expected SSE content type")
+    }
+
+    // Read events and verify your streaming logic.
+    scanner := bufio.NewScanner(resp.Body)
+    var eventCount int
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.HasPrefix(line, "data: ") {
+            eventCount++
+        }
+    }
+    if eventCount == 0 {
+        t.Error("expected at least one SSE event")
+    }
+}
+```
+
 ## Using with httptest
 
 The most common pattern for tests:

@@ -226,6 +226,41 @@ cd frontend && npm run dev
 
 Check the `X-Httptape-Source` response header in browser dev tools to see whether each response is live or cached.
 
+## SSE passthrough and fallback
+
+SSE (`text/event-stream`) responses pass through proxy mode transparently. When the upstream is reachable:
+
+1. The SSE stream is forwarded to the caller unchanged.
+2. A background goroutine parses the stream into discrete `SSEEvent` entries with timing metadata.
+3. When the stream ends, the parsed events are saved to L1 (raw) and L2 (redacted, if a sanitizer is configured).
+
+When the upstream is unavailable, the proxy falls back to cached SSE tapes. L2 fallback synthesizes a streaming response from the stored events using the configured timing mode.
+
+### Proxy SSE timing for fallback
+
+Control the replay timing of cached SSE responses with `WithProxySSETiming`:
+
+```go
+proxy := httptape.NewProxy(l1, l2,
+    httptape.WithProxySSETiming(httptape.SSETimingInstant()), // default
+)
+```
+
+The default is `SSETimingInstant()` -- cached SSE responses are delivered as fast as possible. This is appropriate because proxy fallback is a resilience mechanism, not a simulation tool. Use `SSETimingRealtime()` or `SSETimingAccelerated(N)` if you need realistic streaming behavior during fallback.
+
+### SSE redaction in proxy mode
+
+SSE event redaction is applied only to L2 writes (the persistent, disk-backed cache). L1 always stores raw events for within-session fidelity.
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+    httptape.FakeSSEEventData("my-seed", "$.user.email"),
+)
+proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+```
+
 ## Thread safety
 
 `Proxy` is safe for concurrent use by multiple goroutines. `RoundTrip` may be called from multiple goroutines simultaneously.
