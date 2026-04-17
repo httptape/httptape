@@ -1,0 +1,48 @@
+{
+  "id": "a1b2c3d4-0005-4000-8000-000000000005",
+  "route": "assist",
+  "recorded_at": "2026-04-16T10:01:00Z",
+  "request": {
+    "method": "GET",
+    "url": "/api/assist/keyboard",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/event-stream"],
+      "Cache-Control": ["no-cache"],
+      "Connection": ["keep-alive"]
+    },
+    "body": null,
+    "sse_events": [
+      { "offset_ms": 100, "data": "{\"delta\":\"The Wireless\"}" },
+      { "offset_ms": 185, "data": "{\"delta\":\" Keyboard is\"}" },
+      { "offset_ms": 260, "data": "{\"delta\":\" the top\"}" },
+      { "offset_ms": 345, "data": "{\"delta\":\" choice for\"}" },
+      { "offset_ms": 420, "data": "{\"delta\":\" developers. Low-profile\"}" },
+      { "offset_ms": 500, "data": "{\"delta\":\" mechanical switches\"}" },
+      { "offset_ms": 580, "data": "{\"delta\":\" give you\"}" },
+      { "offset_ms": 660, "data": "{\"delta\":\" fast, precise\"}" },
+      { "offset_ms": 735, "data": "{\"delta\":\" typing with\"}" },
+      { "offset_ms": 820, "data": "{\"delta\":\" satisfying tactile\"}" },
+      { "offset_ms": 900, "data": "{\"delta\":\" feedback, and\"}" },
+      { "offset_ms": 975, "data": "{\"delta\":\" the customizable\"}" },
+      { "offset_ms": 1060, "data": "{\"delta\":\" RGB backlight\"}" },
+      { "offset_ms": 1140, "data": "{\"delta\":\" keeps every\"}" },
+      { "offset_ms": 1215, "data": "{\"delta\":\" key visible\"}" },
+      { "offset_ms": 1300, "data": "{\"delta\":\" during late-night\"}" },
+      { "offset_ms": 1375, "data": "{\"delta\":\" coding sessions.\"}" },
+      { "offset_ms": 1460, "data": "{\"delta\":\" At $49.95,\"}" },
+      { "offset_ms": 1540, "data": "{\"delta\":\" it pairs\"}" },
+      { "offset_ms": 1620, "data": "{\"delta\":\" over Bluetooth\"}" },
+      { "offset_ms": 1695, "data": "{\"delta\":\" with up\"}" },
+      { "offset_ms": 1780, "data": "{\"delta\":\" to three\"}" },
+      { "offset_ms": 1860, "data": "{\"delta\":\" devices at\"}" },
+      { "offset_ms": 1935, "data": "{\"delta\":\" once.\"}" },
+      { "offset_ms": 1950, "data": "[DONE]" }
+    ]
+  }
+}

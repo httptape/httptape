@@ -1,0 +1,48 @@
+{
+  "id": "a1b2c3d4-0006-4000-8000-000000000006",
+  "route": "assist",
+  "recorded_at": "2026-04-16T10:02:00Z",
+  "request": {
+    "method": "GET",
+    "url": "/api/assist/hub",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/event-stream"],
+      "Cache-Control": ["no-cache"],
+      "Connection": ["keep-alive"]
+    },
+    "body": null,
+    "sse_events": [
+      { "offset_ms": 100, "data": "{\"delta\":\"The USB-C\"}" },
+      { "offset_ms": 175, "data": "{\"delta\":\" Hub handles\"}" },
+      { "offset_ms": 260, "data": "{\"delta\":\" both needs\"}" },
+      { "offset_ms": 340, "data": "{\"delta\":\" perfectly. The\"}" },
+      { "offset_ms": 415, "data": "{\"delta\":\" 4K HDMI\"}" },
+      { "offset_ms": 500, "data": "{\"delta\":\" output drives\"}" },
+      { "offset_ms": 575, "data": "{\"delta\":\" external monitors\"}" },
+      { "offset_ms": 660, "data": "{\"delta\":\" at full\"}" },
+      { "offset_ms": 735, "data": "{\"delta\":\" resolution, while\"}" },
+      { "offset_ms": 820, "data": "{\"delta\":\" 100W passthrough\"}" },
+      { "offset_ms": 900, "data": "{\"delta\":\" charging keeps\"}" },
+      { "offset_ms": 975, "data": "{\"delta\":\" your laptop\"}" },
+      { "offset_ms": 1060, "data": "{\"delta\":\" powered all\"}" },
+      { "offset_ms": 1135, "data": "{\"delta\":\" day. The\"}" },
+      { "offset_ms": 1220, "data": "{\"delta\":\" built-in SD\"}" },
+      { "offset_ms": 1300, "data": "{\"delta\":\" card reader\"}" },
+      { "offset_ms": 1380, "data": "{\"delta\":\" and three\"}" },
+      { "offset_ms": 1460, "data": "{\"delta\":\" USB-A ports\"}" },
+      { "offset_ms": 1535, "data": "{\"delta\":\" connect all\"}" },
+      { "offset_ms": 1620, "data": "{\"delta\":\" your peripherals\"}" },
+      { "offset_ms": 1700, "data": "{\"delta\":\" without any\"}" },
+      { "offset_ms": 1775, "data": "{\"delta\":\" dongles. At\"}" },
+      { "offset_ms": 1860, "data": "{\"delta\":\" $34.50, it's\"}" },
+      { "offset_ms": 1935, "data": "{\"delta\":\" a no-brainer.\"}" },
+      { "offset_ms": 1950, "data": "[DONE]" }
+    ]
+  }
+}

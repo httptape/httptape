@@ -1,0 +1,48 @@
+{
+  "id": "a1b2c3d4-0004-4000-8000-000000000004",
+  "route": "assist",
+  "recorded_at": "2026-04-16T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "/api/assist/headphones",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/event-stream"],
+      "Cache-Control": ["no-cache"],
+      "Connection": ["keep-alive"]
+    },
+    "body": null,
+    "sse_events": [
+      { "offset_ms": 100, "data": "{\"delta\":\"For office\"}" },
+      { "offset_ms": 180, "data": "{\"delta\":\" use, the\"}" },
+      { "offset_ms": 255, "data": "{\"delta\":\" Noise-Cancelling Headphones\"}" },
+      { "offset_ms": 340, "data": "{\"delta\":\" are the\"}" },
+      { "offset_ms": 410, "data": "{\"delta\":\" best pick.\"}" },
+      { "offset_ms": 495, "data": "{\"delta\":\" With 30-hour\"}" },
+      { "offset_ms": 575, "data": "{\"delta\":\" battery life\"}" },
+      { "offset_ms": 650, "data": "{\"delta\":\" and hybrid\"}" },
+      { "offset_ms": 740, "data": "{\"delta\":\" ANC, you\"}" },
+      { "offset_ms": 820, "data": "{\"delta\":\" can focus\"}" },
+      { "offset_ms": 895, "data": "{\"delta\":\" through meetings\"}" },
+      { "offset_ms": 985, "data": "{\"delta\":\" or commutes\"}" },
+      { "offset_ms": 1055, "data": "{\"delta\":\" without hearing\"}" },
+      { "offset_ms": 1140, "data": "{\"delta\":\" coworkers, planes,\"}" },
+      { "offset_ms": 1215, "data": "{\"delta\":\" or cafe\"}" },
+      { "offset_ms": 1300, "data": "{\"delta\":\" noise. They\"}" },
+      { "offset_ms": 1380, "data": "{\"delta\":\" fold flat\"}" },
+      { "offset_ms": 1455, "data": "{\"delta\":\" for travel\"}" },
+      { "offset_ms": 1545, "data": "{\"delta\":\" and the\"}" },
+      { "offset_ms": 1620, "data": "{\"delta\":\" multipoint Bluetooth\"}" },
+      { "offset_ms": 1710, "data": "{\"delta\":\" lets you\"}" },
+      { "offset_ms": 1785, "data": "{\"delta\":\" switch between\"}" },
+      { "offset_ms": 1870, "data": "{\"delta\":\" laptop and\"}" },
+      { "offset_ms": 1940, "data": "{\"delta\":\" phone seamlessly.\"}" },
+      { "offset_ms": 1950, "data": "[DONE]" }
+    ]
+  }
+}

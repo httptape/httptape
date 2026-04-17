@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { getProducts, getProfile, createCart, type Product, type UserProfile, type DataSource } from "./api";
 import { useHealthStream } from "./useHealthStream";
 import { ProfileCard } from "./components/ProfileCard";
+import { Assistant } from "./components/Assistant";
 import { ArchitectureDiagram } from "./components/ArchitectureDiagram";
 import { Instructions } from "./components/Instructions";
 import "./App.css";
@@ -91,6 +92,7 @@ function App() {
                 </div>
               ))}
             </div>
+            <Assistant />
           </>
         )}
       </main>

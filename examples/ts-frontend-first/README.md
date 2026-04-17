@@ -59,17 +59,37 @@ The proxy exposes `GET /__httptape/health/stream` (Server-Sent Events) when star
 
 No polling, no manual refresh. See [`src/useHealthStream.ts`](src/useHealthStream.ts).
 
+## Ask the assistant
+
+Below the product grid, the demo includes an **AI shopping assistant** section with three pre-defined questions. Click a button and watch the response stream in word-by-word, exactly like a real LLM chat completion.
+
+### How it works (and why it's the same as recording an OpenAI streaming call)
+
+The three assistant fixtures in `mocks/upstream-fixtures/` (`get-assist-headphones.json`, `get-assist-keyboard.json`, `get-assist-hub.json`) are hand-authored httptape `Tape` recordings with `sse_events` arrays. Each fixture contains 25 SSE events using OpenAI-style `{"delta": "..."}` JSON payloads, with a final `[DONE]` sentinel to signal stream completion.
+
+The wire format is **identical** to what you would get by recording a real `chat.completions.create(stream=True)` call with httptape:
+
+1. The Recorder detects `Content-Type: text/event-stream` and parses individual SSE frames.
+2. Each frame is stored as an `SSEEvent` with its `offset_ms` timestamp (milliseconds since response headers).
+3. On replay, `WithSSETiming(SSETimingRealtime())` (the default) re-introduces the original inter-event delays, producing the typewriter effect in the browser.
+
+The only difference is that these fixtures were written by hand rather than captured from a live API -- the recording flow, storage format, and replay behavior are exactly the same. You could replace these fixtures with real recorded LLM responses and the demo would work identically.
+
+### Per-event sanitization
+
+httptape's `RedactSSEEventData` and `FakeSSEEventData` sanitization functions operate on individual SSE event payloads, so PII inside streamed LLM completions is redacted before it touches disk. To see this in action, configure the proxy with `RedactSSEEventData` in the sanitization pipeline and watch the L2 cache in `.httptape-cache/`. The JSON config parser does not yet support SSE-specific rules, so this requires programmatic (Go API) configuration.
+
 ## Quick start
 
 ```bash
 docker compose up
 ```
 
-Pulls `ghcr.io/vibewarden/httptape:0.10.0` (the version that introduced SSE record/replay) and builds the React frontend. No local Go build needed.
+Pulls `ghcr.io/vibewarden/httptape:0.10.1` (v0.10.0 introduced SSE record/replay; v0.10.1 added the `--sse-timing` CLI flag this demo uses to preserve typewriter cadence on cache fallback). Also builds the React frontend. No local Go build needed.
 
 Open [http://localhost:3000](http://localhost:3000).
 
-> Pinned to `0.10.0` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
+> Pinned to `0.10.1` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
 
 ## Try it
 
@@ -117,19 +137,24 @@ Each file is a single httptape `Tape` (request/response pair).
 ts-frontend-first/
   src/
     api.ts                       # fetch wrapper
-    App.tsx                      # main app: profile + product grid + add-to-cart
+    App.tsx                      # main app: profile + product grid + assistant + add-to-cart
     useHealthStream.ts           # SSE hook driving the badge + refetch
+    useAssistantStream.ts        # SSE hook for AI assistant streaming (OpenAI-style deltas)
     components/
       ProfileCard.tsx            # identity + credit-card visualization (shows redaction)
+      Assistant.tsx              # AI assistant: query buttons + streaming output
       ArchitectureDiagram.tsx    # live diagram of upstream/cache state
       Instructions.tsx           # the "Try it" copy-button list
   mocks/
     upstream-fixtures/           # source of truth — committed
+      get-assist-headphones.json # SSE fixture: headphones recommendation (25 events)
+      get-assist-keyboard.json   # SSE fixture: keyboard recommendation (25 events)
+      get-assist-hub.json        # SSE fixture: hub recommendation (25 events)
     sanitize.json                # httptape redaction config (typed fakers)
   scripts/
     toggle-upstream.sh           # one-liner to flip upstream up/down
   .httptape-cache/               # L2 cache — generated, gitignored
     fixtures/                    # populated on first request, used as L2 fallback
-  docker-compose.yml             # 3 services, pinned to httptape v0.10.0 from GHCR
+  docker-compose.yml             # 3 services, pinned to httptape v0.10.1 from GHCR
   Dockerfile                     # multi-stage build for the React frontend
 ```
