@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -121,6 +122,33 @@ func run(args []string) int {
 	return exitOK
 }
 
+// parseSSETiming parses the --sse-timing flag value into an SSETimingMode.
+// Accepted values: "realtime", "instant", "accelerated=<factor>".
+// Returns an error (suitable for wrapping in *usageError) on invalid input.
+func parseSSETiming(s string) (httptape.SSETimingMode, error) {
+	switch {
+	case s == "realtime":
+		return httptape.SSETimingRealtime(), nil
+	case s == "instant":
+		return httptape.SSETimingInstant(), nil
+	case strings.HasPrefix(s, "accelerated="):
+		raw := strings.TrimPrefix(s, "accelerated=")
+		if raw == "" {
+			return nil, fmt.Errorf("invalid --sse-timing %q: accelerated requires a factor (e.g., accelerated=5). Valid modes: realtime, instant, accelerated=<factor>", s)
+		}
+		factor, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --sse-timing %q: factor is not a valid number. Valid modes: realtime, instant, accelerated=<factor>", s)
+		}
+		if factor <= 0 {
+			return nil, fmt.Errorf("invalid --sse-timing %q: factor must be greater than 0. Valid modes: realtime, instant, accelerated=<factor>", s)
+		}
+		return httptape.SSETimingAccelerated(factor), nil
+	default:
+		return nil, fmt.Errorf("invalid --sse-timing %q: valid modes are realtime, instant, accelerated=<factor>", s)
+	}
+}
+
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("httptape serve", flag.ContinueOnError)
 	fixtures := fs.String("fixtures", "", "Path to fixture directory (required)")
@@ -132,6 +160,7 @@ func runServe(args []string) error {
 	errorRate := fs.Float64("error-rate", 0, "Fraction of requests that return 500 (0.0-1.0)")
 	var replayHeaders repeatableFlag
 	fs.Var(&replayHeaders, "replay-header", "Header to inject into responses (Key=Value, repeatable)")
+	sseTiming := fs.String("sse-timing", "", "SSE replay timing mode: realtime, instant, accelerated=<factor>")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -149,6 +178,13 @@ func runServe(args []string) error {
 
 	var serverOpts []httptape.ServerOption
 	serverOpts = append(serverOpts, httptape.WithFallbackStatus(*fallbackStatus))
+	if *sseTiming != "" {
+		mode, err := parseSSETiming(*sseTiming)
+		if err != nil {
+			return &usageError{err}
+		}
+		serverOpts = append(serverOpts, httptape.WithSSETiming(mode))
+	}
 	if *cors {
 		serverOpts = append(serverOpts, httptape.WithCORS())
 	}
@@ -340,6 +376,7 @@ func runProxy(args []string) error {
 	upstreamProbeInterval := fs.Duration("upstream-probe-interval", 0,
 		"Active upstream probe cadence. 0 = disabled. When --health-endpoint is set "+
 			"and this is unset, defaults to 2s.")
+	sseTiming := fs.String("sse-timing", "", "SSE replay timing mode: realtime, instant, accelerated=<factor>")
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -402,6 +439,14 @@ func runProxy(args []string) error {
 			}
 			return resp != nil && resp.StatusCode >= 500
 		}))
+	}
+
+	if *sseTiming != "" {
+		mode, err := parseSSETiming(*sseTiming)
+		if err != nil {
+			return &usageError{err}
+		}
+		proxyOpts = append(proxyOpts, httptape.WithProxySSETiming(mode))
 	}
 
 	if *healthEndpoint {

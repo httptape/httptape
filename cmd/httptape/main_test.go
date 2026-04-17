@@ -362,6 +362,115 @@ func TestProxyHealthEndpointMounted(t *testing.T) {
 	}
 }
 
+func TestParseSSETiming(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		errMsg  string // substring expected in the error message
+	}{
+		{name: "realtime", input: "realtime", wantErr: false},
+		{name: "instant", input: "instant", wantErr: false},
+		{name: "accelerated integer", input: "accelerated=5", wantErr: false},
+		{name: "accelerated float", input: "accelerated=2.5", wantErr: false},
+		{name: "accelerated fractional", input: "accelerated=0.1", wantErr: false},
+		{name: "empty string", input: "", wantErr: true, errMsg: "valid modes are"},
+		{name: "unknown mode", input: "turbo", wantErr: true, errMsg: "valid modes are"},
+		{name: "accelerated missing factor", input: "accelerated=", wantErr: true, errMsg: "accelerated requires a factor"},
+		{name: "accelerated non-numeric", input: "accelerated=fast", wantErr: true, errMsg: "not a valid number"},
+		{name: "accelerated zero", input: "accelerated=0", wantErr: true, errMsg: "must be greater than 0"},
+		{name: "accelerated negative", input: "accelerated=-1", wantErr: true, errMsg: "must be greater than 0"},
+		{name: "accelerated no equals", input: "accelerated", wantErr: true, errMsg: "valid modes are"},
+		{name: "case sensitive realtime", input: "Realtime", wantErr: true, errMsg: "valid modes are"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mode, err := parseSSETiming(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseSSETiming(%q) = %v, want error", tt.input, mode)
+				}
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("parseSSETiming(%q) error = %q, want substring %q", tt.input, err.Error(), tt.errMsg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSSETiming(%q) unexpected error: %v", tt.input, err)
+			}
+			if mode == nil {
+				t.Fatalf("parseSSETiming(%q) returned nil mode", tt.input)
+			}
+		})
+	}
+}
+
+func TestSSETimingFlagIntegration(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	tests := []struct {
+		name     string
+		args     []string
+		wantCode int
+	}{
+		{
+			name:     "serve valid realtime",
+			args:     []string{"serve", "--fixtures", tmpDir, "--sse-timing", "realtime", "-h"},
+			wantCode: exitOK,
+		},
+		{
+			name:     "serve valid instant",
+			args:     []string{"serve", "--fixtures", tmpDir, "--sse-timing", "instant", "-h"},
+			wantCode: exitOK,
+		},
+		{
+			name:     "serve valid accelerated",
+			args:     []string{"serve", "--fixtures", tmpDir, "--sse-timing", "accelerated=10", "-h"},
+			wantCode: exitOK,
+		},
+		{
+			name:     "serve invalid mode",
+			args:     []string{"serve", "--fixtures", tmpDir, "--sse-timing", "bogus"},
+			wantCode: exitUsage,
+		},
+		{
+			name:     "serve accelerated zero",
+			args:     []string{"serve", "--fixtures", tmpDir, "-sse-timing", "accelerated=0"},
+			wantCode: exitUsage,
+		},
+		{
+			name:     "serve accelerated missing factor",
+			args:     []string{"serve", "--fixtures", tmpDir, "--sse-timing", "accelerated="},
+			wantCode: exitUsage,
+		},
+		{
+			name:     "proxy invalid mode",
+			args:     []string{"proxy", "--upstream", "http://example.com", "--fixtures", tmpDir, "--sse-timing", "nope"},
+			wantCode: exitUsage,
+		},
+		{
+			name:     "proxy valid instant",
+			args:     []string{"proxy", "--upstream", "http://example.com", "--fixtures", tmpDir, "--sse-timing", "instant", "-h"},
+			wantCode: exitOK,
+		},
+		{
+			name:     "serve no sse-timing flag",
+			args:     []string{"serve", "--fixtures", tmpDir, "-h"},
+			wantCode: exitOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := run(tt.args)
+			if got != tt.wantCode {
+				t.Errorf("run(%v) = %d, want %d", tt.args, got, tt.wantCode)
+			}
+		})
+	}
+}
+
 func itoa(i int) string {
 	const digits = "0123456789"
 	if i == 0 {
