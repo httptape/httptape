@@ -260,3 +260,105 @@ func TestServer_ConcurrentServeHTTP(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestRecorder_ConcurrentSSERecording exercises concurrent SSE recording
+// under the race detector, verifying the goroutine + io.Pipe path is safe.
+func TestRecorder_ConcurrentSSERecording(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		fmt.Fprint(w, "data: event1\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: event2\n\n")
+		flusher.Flush()
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store,
+		WithTransport(backend.Client().Transport),
+		WithRoute("sse-race"),
+	)
+
+	const n = 20
+	var wg sync.WaitGroup
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req, err := http.NewRequest("GET", backend.URL+fmt.Sprintf("/stream/%d", i), nil)
+			if err != nil {
+				t.Errorf("NewRequest error: %v", err)
+				return
+			}
+			resp, err := rec.RoundTrip(req)
+			if err != nil {
+				t.Errorf("RoundTrip(%d) error: %v", i, err)
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+}
+
+// TestServer_ConcurrentSSEReplay exercises concurrent SSE replay under the
+// race detector.
+func TestServer_ConcurrentSSEReplay(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+
+	// Pre-load SSE tapes.
+	for i := 0; i < 5; i++ {
+		tape := NewTape("sse-race", RecordedReq{
+			Method:  "GET",
+			URL:     fmt.Sprintf("/stream/%d", i),
+			Headers: http.Header{},
+		}, RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+			SSEEvents: []SSEEvent{
+				{OffsetMS: 0, Data: fmt.Sprintf("event-%d-a", i)},
+				{OffsetMS: 10, Data: fmt.Sprintf("event-%d-b", i)},
+			},
+		})
+		if err := store.Save(ctx, tape); err != nil {
+			t.Fatalf("Save() error: %v", err)
+		}
+	}
+
+	srv := NewServer(store, WithSSETiming(SSETimingInstant()))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	const n = 50
+	var wg sync.WaitGroup
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			path := fmt.Sprintf("/stream/%d", i%5)
+			resp, err := http.Get(ts.URL + path)
+			if err != nil {
+				t.Errorf("GET %s error: %v", path, err)
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+}

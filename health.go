@@ -566,7 +566,8 @@ func (h *HealthMonitor) serveStream(w http.ResponseWriter, r *http.Request) {
 				h.reportError(fmt.Errorf("httptape: stream encode: %w", err))
 				return
 			}
-			if _, werr := fmt.Fprintf(w, "data: %s\n\n", payload); werr != nil {
+			ev := SSEEvent{Data: string(payload)}
+			if werr := writeSSEEvent(w, ev); werr != nil {
 				h.reportError(fmt.Errorf("httptape: stream write: %w", werr))
 				return
 			}

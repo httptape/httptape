@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,9 @@ type Proxy struct {
 	route      string                                    // logical route label
 	onError    func(error)                               // error callback
 	isFallback func(err error, resp *http.Response) bool // determines when to fall back
+
+	// sseReplayTiming controls SSE replay timing for L2 fallback.
+	sseReplayTiming SSETimingMode
 
 	// health is the optional HealthMonitor enabled via WithProxyHealthEndpoint.
 	// nil when the option is absent — every call site is nil-receiver-safe so
@@ -108,6 +112,15 @@ func WithProxyOnError(fn func(error)) ProxyOption {
 func WithProxyFallbackOn(fn func(err error, resp *http.Response) bool) ProxyOption {
 	return func(p *Proxy) {
 		p.isFallback = fn
+	}
+}
+
+// WithProxySSETiming sets the SSE timing mode used when replaying cached
+// SSE tapes from L2 fallback. Defaults to SSETimingInstant (emit all
+// events immediately in degraded mode).
+func WithProxySSETiming(mode SSETimingMode) ProxyOption {
+	return func(p *Proxy) {
+		p.sseReplayTiming = mode
 	}
 }
 
@@ -224,11 +237,12 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy {
 	}
 
 	p := &Proxy{
-		transport: http.DefaultTransport,
-		l1:        l1,
-		l2:        l2,
-		sanitizer: NewPipeline(),
-		matcher:   DefaultMatcher(),
+		transport:       http.DefaultTransport,
+		l1:              l1,
+		l2:              l2,
+		sanitizer:       NewPipeline(),
+		matcher:         DefaultMatcher(),
+		sseReplayTiming: SSETimingInstant(),
 		isFallback: func(err error, _ *http.Response) bool {
 			return err != nil
 		},
@@ -365,7 +379,12 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		return p.fallback(req, resp, transportErr)
 	}
 
-	// 4. Success path: capture response body.
+	// 4. SSE detection on success path.
+	if isSSEContentType(resp.Header.Get("Content-Type")) {
+		return p.roundTripSSE(req, resp, reqBody)
+	}
+
+	// 5. Success path: capture response body (non-SSE).
 	var respBody []byte
 	if resp.Body != nil {
 		var err error
@@ -378,11 +397,11 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	// 5. Detect body encodings.
+	// 6. Detect body encodings.
 	reqBodyEncoding := detectBodyEncoding(req.Header.Get("Content-Type"))
 	respBodyEncoding := detectBodyEncoding(resp.Header.Get("Content-Type"))
 
-	// 6. Build raw tape.
+	// 7. Build raw tape.
 	recordedReq := RecordedReq{
 		Method:       req.Method,
 		URL:          req.URL.String(),
@@ -400,21 +419,21 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	rawTape := NewTape(p.route, recordedReq, recordedResp)
 
-	// 7. Save raw to L1 (synchronous, in-memory, fast).
+	// 8. Save raw to L1 (synchronous, in-memory, fast).
 	if saveErr := p.l1.Save(req.Context(), rawTape); saveErr != nil {
 		p.onErrorSafe(saveErr)
 	}
 
-	// 8. Sanitize and save to L2 (synchronous).
+	// 9. Sanitize and save to L2 (synchronous).
 	sanitizedTape := p.sanitizer.Sanitize(rawTape)
 	if saveErr := p.l2.Save(req.Context(), sanitizedTape); saveErr != nil {
 		p.onErrorSafe(saveErr)
 	}
 
-	// 9. Update health state (no-op when health surface disabled).
+	// 10. Update health state (no-op when health surface disabled).
 	p.health.observe(StateLive)
 
-	// 10. Return real response (with body restored).
+	// 11. Return real response (with body restored).
 	return resp, nil
 }
 
@@ -465,6 +484,76 @@ func (p *Proxy) matchFromStore(ctx context.Context, req *http.Request, store Sto
 	return p.matcher.Match(req, tapes)
 }
 
+// roundTripSSE handles SSE responses in the proxy success path. The body
+// is wrapped in an sseRecordingReader that delivers bytes to the caller
+// unchanged while a background goroutine parses SSE events. When the
+// stream completes, the tape is saved to L1 and L2.
+func (p *Proxy) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) (*http.Response, error) {
+	startTime := time.Now()
+	respHeaders := resp.Header.Clone()
+
+	reqBodyEncoding := detectBodyEncoding(req.Header.Get("Content-Type"))
+
+	recordedReq := RecordedReq{
+		Method:       req.Method,
+		URL:          req.URL.String(),
+		Headers:      req.Header.Clone(),
+		Body:         reqBody,
+		BodyHash:     BodyHashFromBytes(reqBody),
+		BodyEncoding: reqBodyEncoding,
+	}
+
+	var mu sync.Mutex
+	var events []SSEEvent
+
+	onEvent := func(ev SSEEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	onDone := func(parseErr error) {
+		mu.Lock()
+		collectedEvents := make([]SSEEvent, len(events))
+		copy(collectedEvents, events)
+		mu.Unlock()
+
+		truncated := parseErr != nil
+		if truncated {
+			p.onErrorSafe(fmt.Errorf("httptape: proxy SSE stream truncated: %w", parseErr))
+		}
+
+		recordedResp := RecordedResp{
+			StatusCode: resp.StatusCode,
+			Headers:    respHeaders,
+			Body:       nil,
+			SSEEvents:  collectedEvents,
+			Truncated:  truncated,
+		}
+
+		rawTape := NewTape(p.route, recordedReq, recordedResp)
+
+		// Save raw to L1.
+		if saveErr := p.l1.Save(context.Background(), rawTape); saveErr != nil {
+			p.onErrorSafe(saveErr)
+		}
+
+		// Sanitize and save to L2.
+		sanitizedTape := p.sanitizer.Sanitize(rawTape)
+		if saveErr := p.l2.Save(context.Background(), sanitizedTape); saveErr != nil {
+			p.onErrorSafe(saveErr)
+		}
+
+		// Update health state.
+		p.health.observe(StateLive)
+	}
+
+	wrapper := newSSERecordingReader(resp.Body, startTime, onEvent, onDone)
+	resp.Body = wrapper
+
+	return resp, nil
+}
+
 // tapeToResponse synthesizes an *http.Response from a cached Tape.
 // The source parameter is set as the X-Httptape-Source header to indicate
 // where the response came from ("l1-cache" or "l2-cache"). The same value
@@ -479,19 +568,55 @@ func (p *Proxy) tapeToResponse(tape Tape, source string) *http.Response {
 	// due to sanitization. Let the HTTP stack set it from actual body size.
 	header.Del("Content-Length")
 
+	// Update the health state machine (no-op when the health surface is
+	// disabled). A nil-receiver call here keeps the default-off path free.
+	p.health.observe(SourceState(source))
+
+	// SSE tape: build a streaming body via an io.Pipe.
+	if tape.Response.IsSSE() {
+		return p.sseResponseFromTape(tape, header)
+	}
+
 	body := tape.Response.Body
 	if body == nil {
 		body = []byte{}
 	}
 
-	// Update the health state machine (no-op when the health surface is
-	// disabled). A nil-receiver call here keeps the default-off path free.
-	p.health.observe(SourceState(source))
-
 	return &http.Response{
 		StatusCode: tape.Response.StatusCode,
 		Header:     header,
 		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+// sseResponseFromTape synthesizes an *http.Response with a streaming body
+// for an SSE tape. A goroutine writes events into a pipe using the
+// configured sseReplayTiming mode.
+func (p *Proxy) sseResponseFromTape(tape Tape, header http.Header) *http.Response {
+	header.Set("Content-Type", "text/event-stream")
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		// Create a no-op flusher for pipe writes (flushing is meaningless
+		// for a pipe -- the reader sees bytes immediately).
+		for i, ev := range tape.Response.SSEEvents {
+			d := p.sseReplayTiming.delay(tape.Response.SSEEvents, i)
+			if d > 0 {
+				time.Sleep(d)
+			}
+			if err := writeSSEEvent(pw, ev); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+		}
+		pw.Close()
+	}()
+
+	return &http.Response{
+		StatusCode: tape.Response.StatusCode,
+		Header:     header,
+		Body:       pr,
 	}
 }
 

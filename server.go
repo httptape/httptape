@@ -16,14 +16,15 @@ import (
 type Server struct {
 	store          Store
 	matcher        Matcher
-	fallbackStatus int              // HTTP status when no tape matches
-	fallbackBody   []byte           // response body when no tape matches
+	fallbackStatus int                 // HTTP status when no tape matches
+	fallbackBody   []byte              // response body when no tape matches
 	onNoMatch      func(*http.Request) // optional callback when no tape matches
-	cors           bool             // if true, add CORS headers to all responses
-	delay          time.Duration    // fixed delay before every response; zero means no delay
-	errorRate      float64          // fraction of requests that return 500 (0.0-1.0)
-	randFloat      func() float64   // random number generator (injectable for testing)
-	replayHeaders  map[string]string // headers injected into every replayed response
+	cors           bool                // if true, add CORS headers to all responses
+	delay          time.Duration       // fixed delay before every response; zero means no delay
+	errorRate      float64             // fraction of requests that return 500 (0.0-1.0)
+	randFloat      func() float64      // random number generator (injectable for testing)
+	replayHeaders  map[string]string   // headers injected into every replayed response
+	sseTiming      SSETimingMode       // controls SSE replay inter-event timing
 }
 
 // ServerOption configures a Server.
@@ -109,6 +110,17 @@ func WithReplayHeaders(key, value string) ServerOption {
 	}
 }
 
+// WithSSETiming sets the inter-event timing mode for SSE tape replay.
+// Defaults to SSETimingRealtime (replay with original inter-event gaps).
+//
+// Modes:
+//   - SSETimingRealtime(): replay with original timing
+//   - SSETimingAccelerated(factor): divide gaps by factor (must be > 0)
+//   - SSETimingInstant(): emit all events immediately, no delay
+func WithSSETiming(mode SSETimingMode) ServerOption {
+	return func(s *Server) { s.sseTiming = mode }
+}
+
 // withRandFloat overrides the random number generator for testing.
 // This is unexported -- only used in tests to make error simulation
 // deterministic.
@@ -139,6 +151,7 @@ func NewServer(store Store, opts ...ServerOption) *Server {
 		matcher:        DefaultMatcher(),
 		fallbackStatus: http.StatusNotFound,
 		fallbackBody:   []byte("httptape: no matching tape found"),
+		sseTiming:      SSETimingRealtime(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -258,20 +271,61 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 8. Write the matched tape's response.
-	// 8a: copy response headers (clone slices to prevent aliasing with tape data).
+	// 8. Check if this is an SSE tape.
+	if tape.Response.IsSSE() {
+		s.serveSSE(w, r, tape)
+		return
+	}
+
+	// 9. Write the matched tape's response (non-SSE path).
+	// 9a: copy response headers (clone slices to prevent aliasing with tape data).
 	for key, values := range tape.Response.Headers {
 		w.Header()[key] = append([]string(nil), values...)
 	}
-	// 8b: apply replay header overrides (if any).
+	// 9b: apply replay header overrides (if any).
 	for key, value := range s.replayHeaders {
 		w.Header().Set(key, value)
 	}
-	// 8c: remove Content-Length — the recorded value may be stale if the body
+	// 9c: remove Content-Length — the recorded value may be stale if the body
 	// was modified by sanitization. Let net/http set it from the actual body.
 	w.Header().Del("Content-Length")
-	// 8d: write status code.
+	// 9d: write status code.
 	w.WriteHeader(tape.Response.StatusCode)
-	// 8e: write body.
+	// 9e: write body.
 	w.Write(tape.Response.Body) //nolint:errcheck // response write failure is not actionable
+}
+
+// serveSSE handles SSE tape replay. It writes response headers, then
+// streams events using the configured SSETimingMode.
+func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request, tape Tape) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "httptape: streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy tape response headers.
+	for key, values := range tape.Response.Headers {
+		w.Header()[key] = append([]string(nil), values...)
+	}
+
+	// Ensure SSE-required headers are set.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Apply replay header overrides (if any).
+	for key, value := range s.replayHeaders {
+		w.Header().Set(key, value)
+	}
+
+	// Remove Content-Length — SSE streams are chunked.
+	w.Header().Del("Content-Length")
+
+	// Write status code.
+	w.WriteHeader(tape.Response.StatusCode)
+	flusher.Flush()
+
+	// Replay events with the configured timing.
+	_ = replaySSEEvents(r.Context(), w, flusher, tape.Response.SSEEvents, s.sseTiming)
 }

@@ -110,6 +110,10 @@ func deepCopyTape(t Tape) Tape {
 	cp.Request.Body = copyBytes(t.Request.Body)
 	cp.Response.Headers = copyHeaders(t.Response.Headers)
 	cp.Response.Body = copyBytes(t.Response.Body)
+	if t.Response.SSEEvents != nil {
+		cp.Response.SSEEvents = make([]SSEEvent, len(t.Response.SSEEvents))
+		copy(cp.Response.SSEEvents, t.Response.SSEEvents)
+	}
 	return cp
 }
 

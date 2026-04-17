@@ -2,11 +2,13 @@ package httptape
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --------------------------------------------------------------------
@@ -641,5 +643,154 @@ func TestIntegration_RecordReplay_PostWithBody(t *testing.T) {
 	}
 	if string(replayBody) != string(origBody) {
 		t.Errorf("replay body = %q, want %q", string(replayBody), string(origBody))
+	}
+}
+
+// TestIntegration_SSE_RecordReplay_E2E tests the full SSE record-and-replay
+// flow using MemoryStore: an upstream SSE server is recorded through the
+// Recorder, then replayed by the Server with instant timing.
+func TestIntegration_SSE_RecordReplay_E2E(t *testing.T) {
+	// Start an upstream that serves SSE.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher.Flush()
+
+		for i := 0; i < 5; i++ {
+			body := strings.NewReader("")
+			_ = body
+			w.Write([]byte("data: {\"n\":" + strings.TrimRight(strings.Repeat("0", i+1), "0") + "}\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	store := NewMemoryStore()
+	rec := NewRecorder(store, WithAsync(false))
+	client := &http.Client{Transport: rec}
+
+	// Record.
+	resp, err := client.Get(upstream.URL + "/events")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	origBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// The caller should have received the raw SSE bytes.
+	if !strings.Contains(string(origBody), "data:") {
+		t.Error("caller should see raw SSE data")
+	}
+
+	// Replay.
+	srv := NewServer(store, WithSSETiming(SSETimingInstant()))
+	replayTS := httptest.NewServer(srv)
+	defer replayTS.Close()
+
+	replayResp, err := http.Get(replayTS.URL + "/events")
+	if err != nil {
+		t.Fatalf("replay GET: %v", err)
+	}
+	replayBody, _ := io.ReadAll(replayResp.Body)
+	replayResp.Body.Close()
+
+	if replayResp.StatusCode != 200 {
+		t.Errorf("replay status = %d, want 200", replayResp.StatusCode)
+	}
+
+	// Check Content-Type.
+	ct := replayResp.Header.Get("Content-Type")
+	if ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// The replayed body should contain SSE data lines.
+	if !strings.Contains(string(replayBody), "data:") {
+		t.Error("replayed response should contain SSE data")
+	}
+}
+
+// TestIntegration_SSE_Proxy_E2E tests the SSE proxy passthrough and L2
+// fallback flow end-to-end.
+func TestIntegration_SSE_Proxy_E2E(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher.Flush()
+
+		w.Write([]byte("data: proxy-event-1\n\n"))
+		flusher.Flush()
+		w.Write([]byte("data: proxy-event-2\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	proxy := NewProxy(l1, l2, WithProxyTransport(upstream.Client().Transport))
+
+	// Passthrough: forward to upstream.
+	req, _ := http.NewRequest("GET", upstream.URL+"/sse", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if !strings.Contains(string(body), "proxy-event-1") {
+		t.Error("proxy should deliver live SSE events")
+	}
+
+	// Wait for onDone save.
+	deadline := time.After(2 * time.Second)
+	for {
+		l2Tapes, _ := l2.List(t.Context(), Filter{})
+		if len(l2Tapes) > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("L2 tape not saved within timeout")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// L2 fallback: upstream is now "down".
+	proxy2 := NewProxy(l1, l2,
+		WithProxyTransport(roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+			return nil, errors.New("down")
+		})),
+		WithProxySSETiming(SSETimingInstant()),
+	)
+
+	req2, _ := http.NewRequest("GET", upstream.URL+"/sse", nil)
+	resp2, err := proxy2.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip fallback: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	src := resp2.Header.Get("X-Httptape-Source")
+	if src != "l1-cache" && src != "l2-cache" {
+		t.Errorf("X-Httptape-Source = %q, want l1-cache or l2-cache", src)
+	}
+
+	// Read and verify the fallback SSE body.
+	fallbackBody, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(fallbackBody), "proxy-event-1") {
+		t.Errorf("fallback should contain cached events, got: %q", string(fallbackBody))
 	}
 }

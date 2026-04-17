@@ -83,6 +83,12 @@ type RecordedReq struct {
 }
 
 // RecordedResp captures the essential parts of an HTTP response for replay.
+//
+// For SSE (text/event-stream) responses, the discrete events are stored in
+// SSEEvents and Body is nil. The two fields are mutually exclusive by
+// construction: the Recorder populates one or the other, never both.
+// During replay, if SSEEvents is non-nil and non-empty the tape is treated
+// as an SSE tape and Body is ignored (even if present).
 type RecordedResp struct {
 	// StatusCode is the HTTP response status code.
 	StatusCode int `json:"status_code"`
@@ -98,12 +104,26 @@ type RecordedResp struct {
 	BodyEncoding BodyEncoding `json:"body_encoding,omitempty"`
 
 	// Truncated is true if the body was truncated due to exceeding the
-	// configured maximum body size.
+	// configured maximum body size, or if an SSE stream was disconnected
+	// before a clean termination.
 	Truncated bool `json:"truncated,omitempty"`
 
 	// OriginalBodySize is the original body size in bytes before truncation.
 	// Only set when Truncated is true.
 	OriginalBodySize int64 `json:"original_body_size,omitempty"`
+
+	// SSEEvents holds the parsed Server-Sent Events for text/event-stream
+	// responses. When non-nil and non-empty, this tape represents an SSE
+	// response and Body is ignored during replay.
+	// When nil or empty (including for tapes created before SSE support was
+	// added), the tape is treated as a regular HTTP response.
+	SSEEvents []SSEEvent `json:"sse_events,omitempty"`
+}
+
+// IsSSE reports whether this response represents an SSE stream.
+// It returns true when SSEEvents is non-nil and non-empty.
+func (r RecordedResp) IsSSE() bool {
+	return len(r.SSEEvents) > 0
 }
 
 // NewTape creates a new Tape with a generated ID and the current UTC timestamp.

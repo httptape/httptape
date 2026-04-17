@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Sanitizer transforms a Tape before it is persisted, redacting or faking
@@ -33,24 +34,25 @@ type Sanitizer interface {
 // called from multiple goroutines simultaneously. Close must be called exactly
 // once when recording is complete.
 type Recorder struct {
-	transport http.RoundTripper // inner transport to delegate to
-	store     Store             // where to persist tapes
-	route     string            // logical route label for all tapes produced
-	sanitizer Sanitizer         // always set; defaults to no-op Pipeline
-	async     bool              // true = non-blocking writes via channel
-	sampleRate float64          // 0.0–1.0; 1.0 = record everything
-	randFloat func() float64   // returns [0.0, 1.0); injectable for testing
-	bufSize   int               // channel buffer size (only used when async=true)
-	onError       func(error)   // callback for async write errors; defaults to no-op
-	maxBodySize   int           // max body size in bytes; 0 = no limit
-	skipRedirects bool          // when true, skip recording 3xx responses
+	transport     http.RoundTripper // inner transport to delegate to
+	store         Store             // where to persist tapes
+	route         string            // logical route label for all tapes produced
+	sanitizer     Sanitizer         // always set; defaults to no-op Pipeline
+	async         bool              // true = non-blocking writes via channel
+	sampleRate    float64           // 0.0–1.0; 1.0 = record everything
+	randFloat     func() float64    // returns [0.0, 1.0); injectable for testing
+	bufSize       int               // channel buffer size (only used when async=true)
+	onError       func(error)       // callback for async write errors; defaults to no-op
+	maxBodySize   int               // max body size in bytes; 0 = no limit
+	skipRedirects bool              // when true, skip recording 3xx responses
+	sseRecording  bool              // true = detect and record SSE streams (default true)
 
 	// async internals
-	sendMu    sync.Mutex   // coordinates closed-check-then-send with close-channel
-	closed    atomic.Bool  // set to true when Close is called; guards against send-on-closed-channel
+	sendMu    sync.Mutex    // coordinates closed-check-then-send with close-channel
+	closed    atomic.Bool   // set to true when Close is called; guards against send-on-closed-channel
 	tapeCh    chan Tape     // buffered channel for async mode
 	done      chan struct{} // closed when background goroutine exits
-	closeOnce sync.Once    // ensures Close is idempotent
+	closeOnce sync.Once     // ensures Close is idempotent
 }
 
 // RecorderOption configures a Recorder.
@@ -140,6 +142,16 @@ func WithMaxBodySize(n int) RecorderOption {
 	}
 }
 
+// WithSSERecording controls whether SSE detection and stream-aware
+// recording is enabled. When true (default), responses with Content-Type
+// text/event-stream are parsed into discrete SSEEvent entries with timing
+// metadata. When false, SSE responses are buffered as regular bodies.
+func WithSSERecording(enabled bool) RecorderOption {
+	return func(r *Recorder) {
+		r.sseRecording = enabled
+	}
+}
+
 // WithSkipRedirects controls whether intermediate redirect responses (3xx)
 // are skipped during recording. When true, 3xx responses are not recorded --
 // only the final non-redirect response is stored. When false (default),
@@ -195,13 +207,14 @@ func NewRecorder(store Store, opts ...RecorderOption) *Recorder {
 	}
 
 	r := &Recorder{
-		transport:  http.DefaultTransport,
-		store:      store,
-		sanitizer:  NewPipeline(), // default no-op sanitizer
-		async:      true,
-		sampleRate: 1.0,
-		randFloat:  rand.Float64,
-		bufSize:    1024,
+		transport:    http.DefaultTransport,
+		store:        store,
+		sanitizer:    NewPipeline(), // default no-op sanitizer
+		async:        true,
+		sampleRate:   1.0,
+		randFloat:    rand.Float64,
+		bufSize:      1024,
+		sseRecording: true,
 	}
 
 	for _, opt := range opts {
@@ -271,6 +284,12 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 
+	// SSE detection: if the response is text/event-stream and SSE recording
+	// is enabled, use the streaming recording path instead of buffering.
+	if r.sseRecording && isSSEContentType(resp.Header.Get("Content-Type")) {
+		return r.roundTripSSE(req, resp, reqBody)
+	}
+
 	// Capture response body.
 	var respBody []byte
 	if resp.Body != nil {
@@ -338,17 +357,101 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	tape = r.sanitizer.Sanitize(tape)
 
 	// Persist the tape.
+	r.persistTape(req.Context(), tape)
+
+	return resp, nil
+}
+
+// roundTripSSE handles the SSE recording path. The response body is wrapped
+// in an sseRecordingReader that delivers bytes to the caller unchanged while
+// parsing SSE events in a background goroutine. Tape persistence is deferred
+// until the caller finishes consuming the body (Close or EOF).
+func (r *Recorder) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) (*http.Response, error) {
+	startTime := time.Now()
+	respHeaders := resp.Header.Clone()
+
+	var mu sync.Mutex
+	var events []SSEEvent
+
+	reqBodyEncoding := detectBodyEncoding(req.Header.Get("Content-Type"))
+
+	// Apply body truncation to request body if configured.
+	var reqTruncated bool
+	var reqOrigSize int64
+	if r.maxBodySize > 0 && len(reqBody) > r.maxBodySize {
+		reqOrigSize = int64(len(reqBody))
+		reqBody = reqBody[:r.maxBodySize]
+		reqTruncated = true
+		if r.onError != nil {
+			r.onError(fmt.Errorf("httptape: request body truncated from %d to %d bytes", reqOrigSize, r.maxBodySize))
+		}
+	}
+
+	// Build the request portion of the tape now (it won't change).
+	recordedReq := RecordedReq{
+		Method:           req.Method,
+		URL:              req.URL.String(),
+		Headers:          req.Header.Clone(),
+		Body:             reqBody,
+		BodyHash:         BodyHashFromBytes(reqBody),
+		BodyEncoding:     reqBodyEncoding,
+		Truncated:        reqTruncated,
+		OriginalBodySize: reqOrigSize,
+	}
+
+	// Capture the request context for use in onDone. The context may be
+	// cancelled by the time the body is fully consumed, so we use
+	// context.Background for the save operation.
+	onEvent := func(ev SSEEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	onDone := func(parseErr error) {
+		mu.Lock()
+		collectedEvents := make([]SSEEvent, len(events))
+		copy(collectedEvents, events)
+		mu.Unlock()
+
+		truncated := parseErr != nil
+		if truncated && r.onError != nil {
+			r.onError(fmt.Errorf("httptape: SSE stream truncated: %w", parseErr))
+		}
+
+		recordedResp := RecordedResp{
+			StatusCode: resp.StatusCode,
+			Headers:    respHeaders,
+			Body:       nil,
+			SSEEvents:  collectedEvents,
+			Truncated:  truncated,
+		}
+
+		tape := NewTape(r.route, recordedReq, recordedResp)
+		tape = r.sanitizer.Sanitize(tape)
+		r.persistTape(context.Background(), tape)
+	}
+
+	wrapper := newSSERecordingReader(resp.Body, startTime, onEvent, onDone)
+	resp.Body = wrapper
+
+	return resp, nil
+}
+
+// persistTape saves a tape to the store, using the async channel if
+// configured, or synchronously otherwise.
+func (r *Recorder) persistTape(ctx context.Context, tape Tape) {
 	if r.async {
 		r.sendMu.Lock()
 		if r.closed.Load() {
 			r.sendMu.Unlock()
-			// recorder closed — drop tape silently
+			// recorder closed -- drop tape silently
 		} else {
 			select {
 			case r.tapeCh <- tape:
 				// sent
 			default:
-				// channel full — drop tape, call onError if set
+				// channel full -- drop tape, call onError if set
 				if r.onError != nil {
 					r.onError(fmt.Errorf("httptape: recorder buffer full, tape dropped"))
 				}
@@ -356,13 +459,11 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			r.sendMu.Unlock()
 		}
 	} else {
-		saveErr := r.store.Save(req.Context(), tape)
+		saveErr := r.store.Save(ctx, tape)
 		if saveErr != nil && r.onError != nil {
 			r.onError(saveErr)
 		}
 	}
-
-	return resp, nil
 }
 
 // Close flushes all pending asynchronous recordings and waits for the

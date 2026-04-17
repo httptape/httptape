@@ -572,3 +572,63 @@ func fakeNumericID(hash []byte) float64 {
 func fakeString(hash []byte) string {
 	return "fake_" + hex.EncodeToString(hash[:4])
 }
+
+// RedactSSEEventData returns a SanitizeFunc that applies body-path
+// redaction to each SSE event's Data field in the response. Each event's
+// Data is treated as an independent JSON body. Non-JSON Data is left
+// unchanged.
+//
+// For non-SSE tapes (SSEEvents is nil/empty), this function is a no-op.
+//
+// Paths use the same JSONPath-like syntax as RedactBodyPaths.
+func RedactSSEEventData(paths ...string) SanitizeFunc {
+	var parsed []parsedPath
+	for _, p := range paths {
+		if pp, ok := parsePath(p); ok {
+			parsed = append(parsed, pp)
+		}
+	}
+
+	return func(t Tape) Tape {
+		if !t.Response.IsSSE() {
+			return t
+		}
+		events := make([]SSEEvent, len(t.Response.SSEEvents))
+		copy(events, t.Response.SSEEvents)
+		for i := range events {
+			events[i].Data = string(redactBodyFields([]byte(events[i].Data), parsed))
+		}
+		t.Response.SSEEvents = events
+		return t
+	}
+}
+
+// FakeSSEEventData returns a SanitizeFunc that applies deterministic
+// faking to each SSE event's Data field in the response. Each event's
+// Data is treated as an independent JSON body. Non-JSON Data is left
+// unchanged.
+//
+// For non-SSE tapes (SSEEvents is nil/empty), this function is a no-op.
+//
+// Paths use the same JSONPath-like syntax as FakeFields.
+func FakeSSEEventData(seed string, paths ...string) SanitizeFunc {
+	var parsed []parsedPath
+	for _, p := range paths {
+		if pp, ok := parsePath(p); ok {
+			parsed = append(parsed, pp)
+		}
+	}
+
+	return func(t Tape) Tape {
+		if !t.Response.IsSSE() {
+			return t
+		}
+		events := make([]SSEEvent, len(t.Response.SSEEvents))
+		copy(events, t.Response.SSEEvents)
+		for i := range events {
+			events[i].Data = string(fakeBodyFields([]byte(events[i].Data), parsed, seed))
+		}
+		t.Response.SSEEvents = events
+		return t
+	}
+}
