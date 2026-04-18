@@ -9,7 +9,7 @@ CachingTransport is the library primitive for cache-through-upstream logic. Use 
 | Use case | Solution |
 |----------|----------|
 | Embed cache-through-upstream in your Go app | **CachingTransport** |
-| Two-tier L1/L2 cache with CLI integration | [Proxy](proxy.md) (separate implementation; unification planned, see #205) |
+| Two-tier L1/L2 cache with CLI integration | [Proxy](proxy.md) (composes CachingTransport internally since v0.13.1) |
 | Record-only (audit, capture) | [Recorder](recording.md) |
 | Replay-only (mock server) | [Server](replay.md) |
 
@@ -295,13 +295,13 @@ Non-fatal errors are reported via the `WithCacheOnError` callback. They never af
 | Feature | CachingTransport | Proxy |
 |---------|-----------------|-------|
 | Store model | Single store | L1 (memory) + L2 (disk) |
-| Single-flight dedup | Yes | No |
+| Single-flight dedup | Yes | Yes (via composed CachingTransport) |
 | Stale fallback | Yes (opt-in) | Yes (L1 then L2) |
 | Health endpoint | No | No |
 | CLI integration | No | Yes (`httptape proxy`) |
 | Use case | Library embedding | CLI-oriented caching proxy |
 
-CachingTransport and Proxy share the same cache-through-upstream conceptual model, but they are currently separate implementations. CachingTransport is the library primitive for single-store caching; Proxy manages L1/L2 two-tier caching with its own independent logic. Unifying the two paths (Proxy composing CachingTransport for L2+upstream) is planned as a follow-up (#205).
+Proxy composes CachingTransport internally (since v0.13.1). L1 pre-check + fallback logic live at the Proxy layer; L2 cache + stale fallback + SSE tee live in CachingTransport. CachingTransport remains usable as a standalone single-store primitive for library embedding.
 
 ## Full example: zero-cost demo hosting
 

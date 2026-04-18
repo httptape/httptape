@@ -23,7 +23,7 @@ No manual encoding -- the Content-Type header determines the shape automatically
 - Recorder: http.RoundTripper that records traffic to a Store
 - Server: http.Handler that replays tapes from a Store
 - CachingTransport: http.RoundTripper with single-store caching, single-flight dedup, stale fallback
-- Proxy: http.RoundTripper with L1/L2 caching and fallback (separate implementation; unification with CachingTransport planned, see #205)
+- Proxy: http.RoundTripper with L1/L2 caching and fallback (composes CachingTransport internally since v0.13.1)
 - Pipeline: ordered chain of SanitizeFunc transformations (implements Sanitizer)
 - Store: persistence interface (MemoryStore, FileStore, or custom)
 - Matcher: request-to-tape matching (CompositeMatcher with scored criteria)
@@ -119,8 +119,9 @@ proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 X-Httptape-Source header: "l1-cache" or "l2-cache" when serving from cache.
 SSE responses pass through and are cached with per-event timing. L2 fallback
 replays cached SSE events using WithProxySSETiming (default: instant).
-Proxy and CachingTransport share the same conceptual model but are currently
-separate implementations. Unification is planned (see #205).
+Proxy composes CachingTransport internally (since v0.13.1). L1 pre-check +
+fallback logic live at the Proxy layer; L2 cache + stale fallback + SSE tee
+live in CachingTransport.
 
 ## Matching
 

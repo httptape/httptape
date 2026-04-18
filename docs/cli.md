@@ -78,7 +78,7 @@ Then point your application at `http://localhost:8081` instead of the real API. 
 
 ### proxy
 
-Forward requests to an upstream server with two-tier caching and automatic fallback. The `proxy` subcommand currently uses Proxy's own cache-through-upstream implementation; CachingTransport provides the same conceptual model as a standalone library primitive (unification planned, see #205). See [Proxy Mode](proxy.md) for a full guide, or [CachingTransport](caching-transport.md) for the library API.
+Forward requests to an upstream server with two-tier caching and automatic fallback. The `proxy` subcommand uses Proxy, which composes CachingTransport internally for upstream forwarding, sanitization, and recording (since v0.13.1). See [Proxy Mode](proxy.md) for a full guide, or [CachingTransport](caching-transport.md) for the standalone library API.
 
 ```bash
 httptape proxy --upstream <url> --fixtures <dir> [flags]

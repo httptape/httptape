@@ -893,3 +893,107 @@ func TestProxy_HealthIntegration(t *testing.T) {
 		t.Fatalf("expected live, got %q", snap.State)
 	}
 }
+
+// TestProxy_SingleFlightViaComposition verifies that concurrent identical
+// requests on cache miss result in upstream being called exactly once,
+// because Proxy composes CachingTransport internally and CachingTransport
+// has single-flight deduplication enabled by default.
+func TestProxy_SingleFlightViaComposition(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	var upstreamCalls atomic.Int32
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		upstreamCalls.Add(1)
+		// Small delay to allow concurrent requests to pile up.
+		time.Sleep(50 * time.Millisecond)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"X-Upstream": {"true"}},
+			Body:       io.NopCloser(strings.NewReader("single-flight-response")),
+		}, nil
+	})
+
+	proxy := NewProxy(l1, l2, WithProxyTransport(transport))
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	responses := make([]*http.Response, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req, _ := http.NewRequest("GET", "http://example.com/api/data", nil)
+			responses[idx], errs[idx] = proxy.RoundTrip(req)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: unexpected error: %v", i, err)
+		}
+		body, _ := io.ReadAll(responses[i].Body)
+		responses[i].Body.Close()
+		if string(body) != "single-flight-response" {
+			t.Errorf("goroutine %d: body=%q, want %q", i, string(body), "single-flight-response")
+		}
+	}
+
+	// With single-flight dedup, upstream should be called exactly once.
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Errorf("upstream called %d times, want 1 (single-flight dedup)", got)
+	}
+}
+
+// TestProxy_CompositionSanitizationPath verifies that Proxy's internal
+// CachingTransport applies the sanitizer to L2 writes while
+// l1RecordingTransport saves raw tapes to L1, confirming the composition
+// wiring is correct.
+func TestProxy_CompositionSanitizationPath(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	sanitizer := NewPipeline(RedactHeaders("X-Secret"))
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"X-Response": {"ok"}},
+				Body:       io.NopCloser(strings.NewReader("body")),
+			}, nil
+		})),
+		WithProxySanitizer(sanitizer),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	req.Header.Set("X-Secret", "top-secret-value")
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	resp.Body.Close()
+
+	// L1 should have the raw (unsanitized) tape via l1RecordingTransport.
+	l1Tapes, _ := l1.List(context.Background(), Filter{})
+	if len(l1Tapes) != 1 {
+		t.Fatalf("L1 has %d tapes, want 1", len(l1Tapes))
+	}
+	l1Secret := l1Tapes[0].Request.Headers.Get("X-Secret")
+	if l1Secret != "top-secret-value" {
+		t.Errorf("L1 X-Secret=%q, want raw value", l1Secret)
+	}
+
+	// L2 should have the sanitized tape via CachingTransport.
+	l2Tapes, _ := l2.List(context.Background(), Filter{})
+	if len(l2Tapes) != 1 {
+		t.Fatalf("L2 has %d tapes, want 1", len(l2Tapes))
+	}
+	l2Secret := l2Tapes[0].Request.Headers.Get("X-Secret")
+	if l2Secret == "top-secret-value" {
+		t.Errorf("L2 X-Secret should be redacted, got raw value %q", l2Secret)
+	}
+}

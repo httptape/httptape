@@ -267,7 +267,7 @@ proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 
 ## CachingTransport
 
-`Proxy` and `CachingTransport` share the same conceptual model (cache-then-upstream-on-miss), but they are currently separate implementations. `Proxy` manages L1/L2 two-tier caching with its own cache-through-upstream logic, while `CachingTransport` is a standalone single-store primitive with single-flight deduplication, stale-fallback, and SSE tee recording. Unifying the two (Proxy composing CachingTransport internally for L2+upstream) is planned as a follow-up (#205).
+Proxy composes CachingTransport internally (since v0.13.1). L1 pre-check + fallback logic live at the Proxy layer; L2 cache + stale fallback + SSE tee live in CachingTransport. Single-flight deduplication is now active in proxy mode via the composed CachingTransport.
 
 See [CachingTransport](caching-transport.md) for the full guide.
 
