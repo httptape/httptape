@@ -63,6 +63,12 @@ jobs:
             path: examples/java-spring-boot
             java-version: "25"
             build-command: ./mvnw -B test
+
+          - name: kotlin-ktor-koog
+            path: examples/kotlin-ktor-koog
+            java-version: "25"
+            gradle-cache: true
+            build-command: ./gradlew test --no-daemon
     defaults:
       run:
         working-directory: ${{ matrix.example.path }}
@@ -90,7 +96,7 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.example.java-version }}
-          cache: maven
+          cache: ${{ matrix.example.gradle-cache && 'gradle' || 'maven' }}
 
       # --- Build / test (all examples) ---
       - name: Build

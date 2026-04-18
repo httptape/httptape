@@ -1,0 +1,20 @@
+{
+  "id": "weather-berlin",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:01Z",
+  "request": {
+    "method": "GET",
+    "url": "/v1/forecast?city=Berlin",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJjaXR5IjoiQmVybGluIiwidGVtcCI6MTIsImNvbmRpdGlvbiI6InJhaW4iLCJodW1pZGl0eSI6ODIsIndpbmRfa3BoIjoxNSwiZmVlbHNfbGlrZSI6OX0=",
+    "body_hash": ""
+  }
+}

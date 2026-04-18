@@ -180,3 +180,43 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # ----- Example: kotlin-ktor-koog (Gradle) -----
+  - package-ecosystem: "gradle"
+    directory: "/examples/kotlin-ktor-koog"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "java"
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Example: kotlin-ktor-koog (Dockerfile, eclipse-temurin) -----
+  - package-ecosystem: "docker"
+    directory: "/examples/kotlin-ktor-koog"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

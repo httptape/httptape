@@ -1,0 +1,22 @@
+{
+  "id": "chat-1-tool-call",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJtb2RlbCI6ImdwdC00by1taW5pIiwibWVzc2FnZXMiOlt7InJvbGUiOiJzeXN0ZW0iLCJjb250ZW50IjoiWW91IGFyZSBhIGhlbHBmdWwgd2VhdGhlciBhZHZpc29yLiJ9LHsicm9sZSI6InVzZXIiLCJjb250ZW50IjoiV2hhdCdzIHRoZSB3ZWF0aGVyIGluIEJlcmxpbj8gU2hvdWxkIEkgYnJpbmcgYW4gdW1icmVsbGE/In1dLCJzdHJlYW0iOmZhbHNlfQ==",
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJpZCI6ImNoYXRjbXBsLXRjMSIsIm9iamVjdCI6ImNoYXQuY29tcGxldGlvbiIsImNyZWF0ZWQiOjE3MTMyNjQwMDAsIm1vZGVsIjoiZ3B0LTRvLW1pbmkiLCJjaG9pY2VzIjpbeyJpbmRleCI6MCwibWVzc2FnZSI6eyJyb2xlIjoiYXNzaXN0YW50IiwiY29udGVudCI6bnVsbCwidG9vbF9jYWxscyI6W3siaWQiOiJjYWxsX3dlYXRoZXJfMSIsInR5cGUiOiJmdW5jdGlvbiIsImZ1bmN0aW9uIjp7Im5hbWUiOiJnZXRXZWF0aGVyIiwiYXJndW1lbnRzIjoie1wiY2l0eVwiOlwiQmVybGluXCJ9In19XX0sImZpbmlzaF9yZWFzb24iOiJ0b29sX2NhbGxzIn1dLCJ1c2FnZSI6eyJwcm9tcHRfdG9rZW5zIjo1MCwiY29tcGxldGlvbl90b2tlbnMiOjIwLCJ0b3RhbF90b2tlbnMiOjcwfX0=",
+    "body_hash": ""
+  }
+}

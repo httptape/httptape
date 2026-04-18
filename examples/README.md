@@ -5,9 +5,10 @@ Each subdirectory is a self-contained, runnable example of httptape used in a re
 | Example | What it shows |
 |---|---|
 | [`java-spring-boot/`](java-spring-boot/) | **Spring AI streaming chat completions + classic REST**, both tested deterministically via Testcontainers. Demonstrates SSE fixture replay in OpenAI's exact wire format with `@DynamicPropertySource` bean overrides. |
+| [`kotlin-ktor-koog/`](kotlin-ktor-koog/) | **Koog AI agent with tool use**, tested via a single httptape Testcontainers instance. Demonstrates `body_fuzzy` matcher composition to distinguish two POST requests to the same URL by JSON body structure. |
 | [`ts-frontend-first/`](ts-frontend-first/) | Vite + React frontend talking to an httptape proxy, with live source-state updates over SSE. Demonstrates fallback-to-cache (live → L1 → L2) and per-event redaction in `mocks/sanitize.json`. |
 
-> More examples coming: Go-embedded library use, Kotlin testcontainers, Python CI fixtures, Kotlin proxy integration. Tracked in `httptape-demos/` for now; will land here as each is polished.
+> More examples coming: Go-embedded library use, Python CI fixtures, Kotlin proxy integration. Tracked in `httptape-demos/` for now; will land here as each is polished.
 
 ## Conventions
 

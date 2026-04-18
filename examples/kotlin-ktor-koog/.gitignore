@@ -1,0 +1,23 @@
+# === Gradle ===
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# === httptape ===
+.httptape-cache/
+
+# === IntelliJ IDEA ===
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# === Editor swap files ===
+*.swp
+*.swo
+*~
+
+# === OS files ===
+.DS_Store
+Thumbs.db

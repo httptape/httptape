@@ -1,0 +1,22 @@
+{
+  "id": "chat-2-final-answer",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:02Z",
+  "request": {
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJtb2RlbCI6ImdwdC00by1taW5pIiwibWVzc2FnZXMiOlt7InJvbGUiOiJzeXN0ZW0iLCJjb250ZW50IjoiWW91IGFyZSBhIGhlbHBmdWwgd2VhdGhlciBhZHZpc29yLiJ9LHsicm9sZSI6InVzZXIiLCJjb250ZW50IjoiV2hhdCdzIHRoZSB3ZWF0aGVyIGluIEJlcmxpbj8gU2hvdWxkIEkgYnJpbmcgYW4gdW1icmVsbGE/In0seyJyb2xlIjoiYXNzaXN0YW50IiwiY29udGVudCI6bnVsbCwidG9vbF9jYWxscyI6W3siaWQiOiJjYWxsX3dlYXRoZXJfMSIsInR5cGUiOiJmdW5jdGlvbiIsImZ1bmN0aW9uIjp7Im5hbWUiOiJnZXRXZWF0aGVyIiwiYXJndW1lbnRzIjoie1wiY2l0eVwiOlwiQmVybGluXCJ9In19XX0seyJyb2xlIjoidG9vbCIsInRvb2xfY2FsbF9pZCI6ImNhbGxfd2VhdGhlcl8xIiwiY29udGVudCI6IntcImNpdHlcIjpcIkJlcmxpblwiLFwidGVtcFwiOjEyLFwiY29uZGl0aW9uXCI6XCJyYWluXCIsXCJodW1pZGl0eVwiOjgyLFwid2luZF9rcGhcIjoxNSxcImZlZWxzX2xpa2VcIjo5fSJ9XSwic3RyZWFtIjpmYWxzZX0=",
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJpZCI6ImNoYXRjbXBsLXRjMiIsIm9iamVjdCI6ImNoYXQuY29tcGxldGlvbiIsImNyZWF0ZWQiOjE3MTMyNjQwMDIsIm1vZGVsIjoiZ3B0LTRvLW1pbmkiLCJjaG9pY2VzIjpbeyJpbmRleCI6MCwibWVzc2FnZSI6eyJyb2xlIjoiYXNzaXN0YW50IiwiY29udGVudCI6IkJhc2VkIG9uIHRoZSB3ZWF0aGVyIGluIEJlcmxpbiwgeWVzLCBicmluZyBhbiB1bWJyZWxsYS4gSXQgaXMgY3VycmVudGx5IHJhaW5pbmcgd2l0aCBhIHRlbXBlcmF0dXJlIG9mIDEyIGRlZ3JlZXMgQ2Vsc2l1cyBhbmQgaGlnaCBodW1pZGl0eSBhdCA4MiUuIn0sImZpbmlzaF9yZWFzb24iOiJzdG9wIn1dLCJ1c2FnZSI6eyJwcm9tcHRfdG9rZW5zIjoxMjAsImNvbXBsZXRpb25fdG9rZW5zIjozNSwidG90YWxfdG9rZW5zIjoxNTV9fQ==",
+    "body_hash": ""
+  }
+}

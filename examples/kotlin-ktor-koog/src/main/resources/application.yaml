@@ -1,0 +1,11 @@
+ktor:
+  deployment:
+    port: 8080
+
+koog:
+  openai:
+    base-url: ${OPENAI_BASE_URL:-https://api.openai.com}
+    api-key: ${OPENAI_API_KEY:-sk-placeholder}
+
+weather:
+  base-url: ${WEATHER_BASE_URL:-https://wttr.in}
