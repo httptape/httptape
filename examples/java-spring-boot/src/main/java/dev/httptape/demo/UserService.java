@@ -1,4 +1,4 @@
-package dev.vibewarden.httptape.demo;
+package dev.httptape.demo;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.web.client.RestClient;

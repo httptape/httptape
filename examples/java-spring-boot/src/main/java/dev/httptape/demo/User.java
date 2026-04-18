@@ -1,4 +1,4 @@
-package dev.vibewarden.httptape.demo;
+package dev.httptape.demo;
 
 /**
  * A user returned by the external REST API.

@@ -1,4 +1,4 @@
-package dev.vibewarden.httptape.demo;
+package dev.httptape.demo;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Value;

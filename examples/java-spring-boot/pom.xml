@@ -6,7 +6,7 @@
 
     <!-- BOM-based dependency management (no <parent> inheritance from spring-boot-starter-parent) -->
 
-    <groupId>dev.vibewarden.httptape</groupId>
+    <groupId>dev.httptape</groupId>
     <artifactId>java-spring-boot-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>httptape Java + Spring Boot Demo</name>

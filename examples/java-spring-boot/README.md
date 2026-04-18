@@ -96,7 +96,7 @@ curl http://localhost:8081/v1/chat/completions \
 ```
 java-spring-boot/
   src/
-    main/java/dev/vibewarden/httptape/demo/
+    main/java/dev/httptape/demo/
       Application.java                 # @SpringBootApplication
       AppConfig.java                   # Explicit @Bean wiring for all services
       RecommendationService.java       # Spring AI ChatClient (streaming)
@@ -105,7 +105,7 @@ java-spring-boot/
       DemoController.java              # REST + SSE endpoints
     main/resources/
       application.properties           # base URL configs
-    test/java/dev/vibewarden/httptape/demo/
+    test/java/dev/httptape/demo/
       RecommendationServiceIntegrationTest.java  # 2 tests: content + cadence
       UserServiceIntegrationTest.java            # 3 tests: happy, list, 404
     test/resources/fixtures/
