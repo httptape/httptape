@@ -85,11 +85,11 @@ httptape's `RedactSSEEventData` and `FakeSSEEventData` sanitization functions op
 docker compose up
 ```
 
-Pulls `ghcr.io/vibewarden/httptape:0.10.1` (v0.10.0 introduced SSE record/replay; v0.10.1 added the `--sse-timing` CLI flag this demo uses to preserve typewriter cadence on cache fallback). Also builds the React frontend. No local Go build needed.
+Pulls `ghcr.io/vibewarden/httptape:0.12.0` (v0.12.0 introduced Content-Type-driven body shape, ContentNegotiationCriterion, and the `migrate-fixtures` CLI subcommand). Also builds the React frontend. No local Go build needed.
 
 Open [http://localhost:3000](http://localhost:3000).
 
-> Pinned to `0.10.1` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
+> Pinned to `0.12.0` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
 
 ## Try it
 
@@ -155,6 +155,6 @@ ts-frontend-first/
     toggle-upstream.sh           # one-liner to flip upstream up/down
   .httptape-cache/               # L2 cache — generated, gitignored
     fixtures/                    # populated on first request, used as L2 fallback
-  docker-compose.yml             # 3 services, pinned to httptape v0.10.1 from GHCR
+  docker-compose.yml             # 3 services, pinned to httptape v0.12.0 from GHCR
   Dockerfile                     # multi-stage build for the React frontend
 ```

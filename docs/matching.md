@@ -244,7 +244,28 @@ matcher := httptape.NewCompositeMatcher(
 )
 ```
 
+## Declarative matcher config
+
+All examples above show programmatic composition in Go. The same matchers can be declared via a JSON config file, which is especially useful with the CLI and Docker:
+
+```json
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "content_negotiation" }
+    ]
+  },
+  "rules": []
+}
+```
+
+See [Config](config.md#matcher-criteria) for the full syntax and supported criterion types.
+
 ## See also
 
 - [Replay](replay.md) -- using matchers with the Server
+- [Config](config.md) -- declarative JSON configuration (including matcher composition)
 - [API Reference](api-reference.md) -- full type signatures

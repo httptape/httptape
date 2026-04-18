@@ -10,9 +10,14 @@ on write, and replays them as a mock server. Zero dependencies (stdlib only).
 SSE streams (e.g., LLM streaming completions) are recorded as discrete events
 with per-event timing metadata and replayed with configurable speed.
 
+Fixture bodies use Content-Type-driven serialization (v0.12+): JSON bodies are
+stored as native JSON objects, text bodies as strings, and binary bodies as base64.
+No manual encoding -- the Content-Type header determines the shape automatically.
+
 ## Core Types
 
-- Tape: recorded HTTP request/response pair (JSON-serializable)
+- Tape: recorded HTTP request/response pair (JSON-serializable, Content-Type-aware body marshaling)
+- MediaType: parsed media type with Type, Subtype, Suffix, Params, QValue fields
 - SSEEvent: a single Server-Sent Event with offset timing (OffsetMS, Type, Data, ID, Retry)
 - SSETimingMode: sealed interface controlling SSE replay timing (Realtime, Accelerated, Instant)
 - Recorder: http.RoundTripper that records traffic to a Store
@@ -21,6 +26,16 @@ with per-event timing metadata and replayed with configurable speed.
 - Pipeline: ordered chain of SanitizeFunc transformations (implements Sanitizer)
 - Store: persistence interface (MemoryStore, FileStore, or custom)
 - Matcher: request-to-tape matching (CompositeMatcher with scored criteria)
+
+## Fixture body shape (v0.12+)
+
+Body fields use Content-Type-aware serialization:
+- application/json, +json suffix: native JSON object/array
+- text/*, application/xml, application/javascript: JSON string
+- binary (image/*, application/octet-stream, etc.): base64-encoded string
+- nil/empty: null
+
+RecordedReq and RecordedResp implement json.Marshaler/json.Unmarshaler.
 
 ## Recording
 
@@ -86,14 +101,31 @@ replays cached SSE events using WithProxySSETiming (default: instant).
 ## Matching
 
 CompositeMatcher with scored criteria:
-- MethodCriterion (1), PathCriterion (2), HeadersCriterion (3), QueryParamsCriterion (4),
+- MethodCriterion (1), PathCriterion (2), HeadersCriterion (3),
+  ContentNegotiationCriterion (3-5), QueryParamsCriterion (4),
   BodyFuzzyCriterion (6), BodyHashCriterion (8), PathRegexCriterion (1), RouteCriterion (1)
+
+ContentNegotiationCriterion: RFC 7231 content negotiation. Matches request Accept
+header against tape response Content-Type. Score varies by specificity (exact=5,
+subtype wildcard=4, full wildcard=3). Enables multi-format fixtures at same path.
 
 ## Storage
 
 - MemoryStore: in-memory, for tests
 - FileStore: one JSON file per tape, atomic writes, WithDirectory option
 - Store interface: Save, Load, List, Delete
+
+## Media type utilities
+
+```go
+func ParseMediaType(s string) (MediaType, error)
+func ParseAccept(accept string) []MediaType
+func IsJSON(mt MediaType) bool
+func IsText(mt MediaType) bool
+func IsBinary(mt MediaType) bool
+func MatchesMediaRange(accept, contentType MediaType) bool
+func Specificity(mt MediaType) int
+```
 
 ## Mock DSL
 
@@ -107,12 +139,16 @@ defer srv.Close()
 ## CLI Commands
 
 ```
-httptape serve   --fixtures <dir> [--port 8081] [--cors] [--delay 200ms]
-httptape record  --upstream <url> --fixtures <dir> [--config redact.json]
-httptape proxy   --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
-httptape export  --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
-httptape import  --fixtures <dir> [--input file.tar.gz]
+httptape serve             --fixtures <dir> [--port 8081] [--cors] [--delay 200ms] [--config config.json]
+httptape record            --upstream <url> --fixtures <dir> [--config redact.json]
+httptape proxy             --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
+httptape export            --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
+httptape import            --fixtures <dir> [--input file.tar.gz]
+httptape migrate-fixtures  [--recursive] <dir>
 ```
+
+migrate-fixtures: converts v0.11 fixtures (base64 bodies, body_encoding field)
+to v0.12 format (Content-Type-driven body shape). Idempotent. Skips non-tape files.
 
 ## Docker
 
@@ -121,15 +157,31 @@ docker pull ghcr.io/vibewarden/httptape:latest
 # ~3 MB scratch image, runs as non-root (65534)
 ```
 
-## JSON Config (redaction rules)
+## JSON Config (redaction rules + matcher)
 
 ```json
-{"version":"1","rules":[
+{"version":"1",
+ "matcher":{"criteria":[
+   {"type":"method"},{"type":"path"},{"type":"content_negotiation"}
+ ]},
+ "rules":[
   {"action":"redact_headers","headers":["Authorization"]},
   {"action":"redact_body","paths":["$.password"]},
   {"action":"fake","seed":"s","paths":["$.email"]}
 ]}
 ```
+
+Matcher criterion types: method, path, body_fuzzy (requires paths), content_negotiation.
+
+## How it compares
+
+| Feature | httptape | WireMock | gock/httpmock | MSW |
+|---|---|---|---|---|
+| SSE record/replay | **yes** | no | no | partial (mock-only) |
+| Redaction on write | **yes** | no | no | no |
+| Embeddable in Go | **yes** | no (Java) | yes | no (browser) |
+| Proxy with fallback | **yes** | no | no | no |
+| Content negotiation | **yes** | yes | no | no |
 
 ## Key APIs
 
@@ -145,6 +197,8 @@ func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
 func ExportBundle(ctx, store, opts...) (io.Reader, error)
 func ImportBundle(ctx, store, reader) error
 func LoadConfigFile(path string) (*Config, error)
+func ParseMediaType(s string) (MediaType, error)
+func ParseAccept(accept string) []MediaType
 func SSETimingRealtime() SSETimingMode
 func SSETimingAccelerated(factor float64) SSETimingMode
 func SSETimingInstant() SSETimingMode
@@ -178,14 +232,11 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
 
 **Nobody does redaction.** Existing tools record raw traffic including secrets and PII. Redaction is always an afterthought. httptape redacts on write -- sensitive data never hits disk.
 
-**Nobody does SSE record/replay.** LLM streaming (OpenAI, Anthropic, etc.) uses Server-Sent Events. httptape records SSE streams with per-event timing, replays them with configurable speed, and redacts PII from individual event payloads. WireMock, gock, httpmock, and MSW do not support this.
-
 ## Key features
 
 - **Record** -- wrap any `http.RoundTripper` to capture real HTTP traffic
 - **Redact on write** -- strip headers, body fields, or replace values with deterministic fakes before storage
 - **Replay** -- serve recorded fixtures as a mock `http.Handler`
-- **SSE record/replay** -- record Server-Sent Event streams with per-event timing, replay with configurable speed (realtime, accelerated, instant), redact PII from individual event payloads
 - **Proxy with fallback** -- forward to upstream with automatic fallback to cached responses when the backend is down
 - **Composable matching** -- match requests by method, path, query params, headers, body hash, or fuzzy body fields
 - **Pluggable storage** -- in-memory for tests, filesystem for fixtures, or implement your own `Store`
@@ -269,10 +320,10 @@ httptape proxy --upstream https://api.github.com --fixtures ./cache
 | [Replay](replay.md) | Server options, fallback behavior, request handling |
 | [Redaction](sanitization.md) | RedactHeaders, RedactBodyPaths, FakeFields, Pipeline |
 | [Proxy Mode](proxy.md) | L1/L2 caching, fallback behavior, frontend dev |
-| [Matching](matching.md) | All matchers, CompositeMatcher, score weights |
+| [Matching](matching.md) | All matchers, CompositeMatcher, score weights, declarative config |
 | [Storage](storage.md) | MemoryStore, FileStore, custom Store implementations |
 | [Import/Export](import-export.md) | ExportBundle, ImportBundle, selective filters |
-| [Config](config.md) | Declarative JSON configuration for redaction |
+| [Config](config.md) | Declarative JSON configuration for redaction and matcher composition |
 | [CLI](cli.md) | serve, record, proxy, export, import commands |
 | [Docker](docker.md) | Container usage, docker-compose, volumes |
 | [Testcontainers](testcontainers.md) | Go Testcontainers module for integration tests |
@@ -327,11 +378,11 @@ func main() {
     defer resp.Body.Close()
 
     fmt.Println("Recorded:", resp.StatusCode)
-    // A JSON fixture file is now saved in ./fixtures/
+    // After rec.Close() returns, a JSON fixture file is saved in ./fixtures/.
 }
 ```
 
-After running this, check `./fixtures/` -- you will see a JSON file containing the full request and response.
+After running this (and after `rec.Close()` flushes the recorder), check `./fixtures/` -- you will see a JSON file containing the full request and response.
 
 ## Step 2: Replay recorded traffic
 
@@ -378,6 +429,7 @@ package main
 
 import (
     "net/http"
+    "strings"
 
     "github.com/VibeWarden/httptape"
 )
@@ -403,7 +455,7 @@ func main() {
 
     client := &http.Client{Transport: rec}
     client.Post("https://api.example.com/users", "application/json",
-        nil, // your request body here
+        strings.NewReader(`{"password":"hunter2","ssn":"123-45-6789","user":{"email":"alice@example.com","id":42}}`),
     )
 
     // The fixture file now has:
@@ -611,11 +663,53 @@ After `Close` returns, any further `RoundTrip` calls pass through to the inner t
 
 ## SSE (Server-Sent Events) recording
 
-When the upstream responds with `Content-Type: text/event-stream`, the Recorder automatically detects the SSE stream and records it as discrete events (stored in `RecordedResp.SSEEvents`) rather than a single body blob. Each event includes timing metadata (`OffsetMS`) for replay.
+When the upstream responds with `Content-Type: text/event-stream`, the Recorder automatically detects the SSE stream and records it as discrete events rather than a single body blob.
 
-SSE recording is enabled by default. Disable with `WithSSERecording(false)`.
+### How SSE detection works
 
-Combine with per-event redaction:
+SSE detection triggers on `Content-Type: text/event-stream` (case-insensitive, parameter-tolerant). When detected, the Recorder:
+
+1. Wraps the response body in an internal `sseRecordingReader`.
+2. The caller reads from the wrapper as normal -- bytes pass through unchanged.
+3. A background goroutine parses the SSE stream according to the W3C specification, collecting individual events with timing metadata (`OffsetMS` -- milliseconds since the response headers were received).
+4. When the body is closed (or the upstream hits EOF), all collected events are stored as `RecordedResp.SSEEvents` and the regular `Body` field is left nil. The two fields are mutually exclusive.
+
+### Tape format for SSE responses
+
+SSE tapes store events individually instead of as a raw body:
+
+```json
+{
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["text/event-stream"]},
+    "sse_events": [
+      {"offset_ms": 0, "data": "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}"},
+      {"offset_ms": 150, "data": "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}"},
+      {"offset_ms": 310, "type": "done", "data": "[DONE]"}
+    ]
+  }
+}
+```
+
+Each event captures:
+- `offset_ms` -- timing relative to stream start (used for replay timing)
+- `type` -- the SSE event type (omitted when it is the default `message` type)
+- `data` -- the event payload (multi-line data is joined with `\n`)
+- `id` -- the event ID (omitted when absent)
+- `retry` -- reconnection time in ms (omitted when absent)
+
+### Disabling SSE detection
+
+SSE recording is enabled by default. To record SSE responses as regular bodies (one large blob):
+
+```go
+rec := httptape.NewRecorder(store, httptape.WithSSERecording(false))
+```
+
+### SSE recording with redaction
+
+Combine SSE recording with per-event redaction to strip PII from streaming LLM responses:
 
 ```go
 sanitizer := httptape.NewPipeline(
@@ -624,6 +718,10 @@ sanitizer := httptape.NewPipeline(
 )
 rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
 ```
+
+Each event's `Data` field is treated as an independent JSON body, so the same path syntax works as `RedactBodyPaths`. Non-JSON event data is left unchanged.
+
+See [Redaction](sanitization.md) for more on SSE redaction and faking.
 
 ## Thread safety
 
@@ -737,6 +835,57 @@ Sets a callback invoked when no tape matches an incoming request. The callback r
 
 This is useful for debugging which requests are not being matched during test development.
 
+### WithCORS
+
+```go
+func WithCORS() ServerOption
+```
+
+Enables permissive CORS headers (`Access-Control-Allow-Origin: *`) on every replayed response and short-circuits `OPTIONS` preflight requests with 204. Intended for local development where a frontend dev server (e.g., `localhost:3000`) calls the mock backend (e.g., `localhost:3001`). Opt-in only.
+
+```go
+srv := httptape.NewServer(store, httptape.WithCORS())
+```
+
+### WithDelay
+
+```go
+func WithDelay(d time.Duration) ServerOption
+```
+
+Adds a fixed delay before every response. The delay is applied after matching but before writing the response. If the request context is cancelled during the delay (e.g., the client disconnects), `ServeHTTP` returns immediately without writing. A zero or negative duration is a no-op.
+
+```go
+srv := httptape.NewServer(store, httptape.WithDelay(200*time.Millisecond))
+```
+
+### WithErrorRate
+
+```go
+func WithErrorRate(rate float64) ServerOption
+```
+
+Causes a fraction of requests to return `500 Internal Server Error` with an `X-Httptape-Error: simulated` header instead of the recorded response. `rate` must be between `0.0` and `1.0` inclusive (`0.0` disables error simulation, `1.0` fails every request). Panics if `rate` is outside `[0.0, 1.0]`.
+
+```go
+srv := httptape.NewServer(store, httptape.WithErrorRate(0.1)) // 10% failure rate
+```
+
+### WithReplayHeaders
+
+```go
+func WithReplayHeaders(key, value string) ServerOption
+```
+
+Injects a header into every replayed response, applied after tape matching. Overrides any header with the same key from the recorded tape. May be called multiple times to set multiple headers. Useful for environment-specific tokens, correlation IDs, or cache-control values.
+
+```go
+srv := httptape.NewServer(store,
+    httptape.WithReplayHeaders("X-Request-ID", "test-run-1"),
+    httptape.WithReplayHeaders("Cache-Control", "no-store"),
+)
+```
+
 ## How replay works
 
 For each incoming request, the `Server`:
@@ -750,18 +899,84 @@ The `Content-Length` header from the recorded response is removed and re-calcula
 
 ## SSE replay
 
-When the Server encounters a tape with `SSEEvents` (i.e., `IsSSE()` returns true), it switches to SSE replay mode. Events are streamed using the configured `SSETimingMode`.
+When the `Server` encounters a tape with `SSEEvents` (i.e., `IsSSE()` returns true), it switches to SSE replay mode instead of writing a regular body.
 
-SSE timing modes (set with `WithSSETiming`):
+### How SSE replay works
 
-| Mode | Behavior |
-|------|----------|
-| `SSETimingRealtime()` | Original inter-event gaps (default) |
-| `SSETimingAccelerated(N)` | Gaps divided by N |
-| `SSETimingInstant()` | Zero delay between events |
+For an SSE tape, `ServeHTTP`:
+
+1. Checks that the `http.ResponseWriter` supports `http.Flusher` (required for streaming). If not, returns 500.
+2. Writes the tape's response headers, setting `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+3. Removes `Content-Length` (SSE streams are chunked).
+4. Writes the status code and flushes.
+5. Iterates over `SSEEvents`, applying the configured `SSETimingMode` delay before each event, then writing and flushing it.
+6. Respects context cancellation (client disconnect) between events.
+
+### SSE timing modes
+
+Control inter-event timing with `WithSSETiming`:
 
 ```go
+// Replay with original recorded timing (default).
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingRealtime()))
+
+// Replay 10x faster -- useful for integration tests that need some timing
+// realism without waiting for the full duration.
+srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingAccelerated(10)))
+
+// Replay instantly -- all events emitted back-to-back with no delay.
+// Best for unit tests where timing is irrelevant.
 srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+```
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `SSETimingRealtime()` | Original inter-event gaps from `OffsetMS` | UI testing, back-pressure simulation |
+| `SSETimingAccelerated(N)` | Gaps divided by N | Integration tests (fast but still sequential) |
+| `SSETimingInstant()` | Zero delay between events | Unit tests, CI pipelines |
+
+### Example: replaying LLM streaming in tests
+
+```go
+func TestStreamingChat(t *testing.T) {
+    store, _ := httptape.NewFileStore(
+        httptape.WithDirectory("testdata/fixtures"),
+    )
+
+    // Use instant timing so the test completes immediately.
+    srv := httptape.NewServer(store,
+        httptape.WithSSETiming(httptape.SSETimingInstant()),
+    )
+    ts := httptest.NewServer(srv)
+    defer ts.Close()
+
+    // Point your LLM client at the mock server.
+    resp, err := http.Post(ts.URL+"/v1/chat/completions",
+        "application/json",
+        strings.NewReader(`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"Hi"}]}`),
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    if resp.Header.Get("Content-Type") != "text/event-stream" {
+        t.Fatal("expected SSE content type")
+    }
+
+    // Read events and verify your streaming logic.
+    scanner := bufio.NewScanner(resp.Body)
+    var eventCount int
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.HasPrefix(line, "data: ") {
+            eventCount++
+        }
+    }
+    if eventCount == 0 {
+        t.Error("expected at least one SSE event")
+    }
+}
 ```
 
 ## Using with httptest
@@ -1005,22 +1220,225 @@ With `FakeFields("my-seed", "$.user.email", "$.user.id", "$.user.name")`:
 
 The key property: if `alice@company.com` appears in another fixture, it will be faked to the same value. This preserves relational consistency across your fixture set.
 
-## SSE event redaction
+## Typed fakers
 
-For SSE responses, two SanitizeFunc constructors operate on individual event payloads:
+`FakeFields` auto-detects the faking strategy from each value's runtime type. When you need explicit control -- for example, to force a generic-looking string into the credit-card format, or to fake a numeric ID as a fixed-length digit string -- use the typed-faker API.
 
-- `RedactSSEEventData(paths...)` -- redact fields within each SSE event's JSON data
-- `FakeSSEEventData(seed, paths...)` -- deterministic faking within each SSE event's JSON data
+The contract is the `Faker` interface:
 
-Both are no-ops for non-SSE tapes. Each event's Data is treated as an independent JSON body.
+```go
+type Faker interface {
+    Fake(seed string, original any) any
+}
+```
+
+Implementations take an HMAC seed and the original JSON value (already decoded by `encoding/json`, so strings are `string`, numbers are `float64`, booleans are `bool`, nulls are `nil`, objects are `map[string]any`, arrays are `[]any`). They must be deterministic: the same seed and original must always produce the same fake.
+
+Typed fakers are wired into a pipeline with `FakeFieldsWith`, which takes a seed and a path-to-`Faker` map:
 
 ```go
 sanitizer := httptape.NewPipeline(
-    httptape.RedactHeaders("Authorization"),
-    httptape.RedactSSEEventData("$.choices[*].delta.content"),
-    httptape.FakeSSEEventData("my-seed", "$.user.email"),
+    httptape.FakeFieldsWith("my-seed", map[string]httptape.Faker{
+        "$.user.email":  httptape.EmailFaker{},
+        "$.user.phone":  httptape.PhoneFaker{},
+        "$.card.number": httptape.CreditCardFaker{},
+        "$.card.cvv":    httptape.NumericFaker{Length: 3},
+    }),
 )
 ```
+
+Path syntax is identical to `RedactBodyPaths` and `FakeFields`. Invalid JSON bodies, missing paths, and invalid path strings are silently skipped (no error). All twelve built-in fakers are constructed as struct literals; none has a `NewXFaker` constructor.
+
+### Auto-detect vs. typed -- when to use each
+
+| Use case | API |
+|---|---|
+| Mixed body, you trust the value-type heuristic, want minimum config | `FakeFields(seed, paths...)` |
+| You need a specific format (credit card, fixed-length digits, pattern, prefix) | `FakeFieldsWith(seed, fields)` |
+| You want to fully redact a leaf rather than fake it | `FakeFieldsWith(...)` with `RedactedFaker{}` |
+| You want a constant value at a path regardless of input | `FakeFieldsWith(...)` with `FixedFaker{Value: ...}` |
+| You need a custom format the built-ins do not cover | Implement `Faker` and pass it to `FakeFieldsWith` |
+
+### Built-in fakers -- redaction-style
+
+These fakers replace values without preserving any information from the original. Use them when the original content is sensitive enough that even a deterministic transform of it should not appear in fixtures.
+
+#### RedactedFaker
+
+Replaces strings with `"[REDACTED]"`, numbers with `0`, and booleans with `false`. Other types (nil, objects, arrays) pass through unchanged. Equivalent to the leaf behavior of `RedactBodyPaths`, but addressable through the typed-faker map so you can mix it with other fakers in a single `FakeFieldsWith` call.
+
+```go
+httptape.FakeFieldsWith("seed", map[string]httptape.Faker{
+    "$.password": httptape.RedactedFaker{},
+    "$.email":    httptape.EmailFaker{},
+})
+```
+
+#### FixedFaker
+
+Always returns its `Value` field, ignoring both seed and original. Useful for stamping a known sentinel into a field (e.g., `"status": "active"`) so downstream tests can assert against it.
+
+```go
+httptape.FixedFaker{Value: "active"}
+httptape.FixedFaker{Value: float64(1)}
+httptape.FixedFaker{Value: true}
+```
+
+`Value` is `any`, so the encoded JSON type follows Go's `encoding/json` rules.
+
+### Built-in fakers -- generic deterministic
+
+These fakers produce a deterministic value derived from `HMAC-SHA256(seed, original)`, with no PII shape. Use them when you need consistency across fixtures but do not need the output to look like any particular format.
+
+#### HMACFaker
+
+Mirrors the auto-detect default for generic strings and numbers. Strings become `"fake_<8-hex>"`; numbers become a positive integer in `[1, 2^31-1]`; booleans, nulls, objects, and arrays pass through unchanged.
+
+```go
+httptape.HMACFaker{}
+// "abc"        -> "fake_a1b2c3d4"
+// float64(42)  -> 1734567890
+```
+
+#### NumericFaker
+
+Generates a string of `Length` HMAC-derived digits. Useful for fixed-width numeric IDs (CVVs, OTPs, account numbers) where digit-count matters.
+
+```go
+httptape.NumericFaker{Length: 3}   // CVV
+httptape.NumericFaker{Length: 16}  // account number
+```
+
+If the input is not a string, it is returned unchanged. Output length always equals `Length`, even if `Length` exceeds 32 (the HMAC is re-chained).
+
+#### PatternFaker
+
+Fills a template where `#` becomes a digit, `?` becomes a lowercase letter, and any other character is copied literally.
+
+```go
+httptape.PatternFaker{Pattern: "###-##-####"}     // SSN-shaped
+httptape.PatternFaker{Pattern: "??-#####"}         // 2 letters, dash, 5 digits
+httptape.PatternFaker{Pattern: "ORDER-####-????"} // mixed literal + variable
+```
+
+If the input is not a string, it is returned unchanged.
+
+#### PrefixFaker
+
+Generates `"<Prefix><16-hex>"`. Useful when an upstream issues namespaced identifiers (e.g., `cust_*`, `order_*`) and downstream tests look at the prefix.
+
+```go
+httptape.PrefixFaker{Prefix: "cust_"}   // "cust_a1b2c3d4e5f60718"
+httptape.PrefixFaker{Prefix: "order_"}  // "order_a1b2c3d4e5f60718"
+```
+
+If the input is not a string, it is returned unchanged.
+
+#### DateFaker
+
+Generates a date string formatted with `Format` (Go reference layout; defaults to `"2006-01-02"` when empty). The date is drawn deterministically from a ~100-year window starting at 2000-01-01.
+
+```go
+httptape.DateFaker{}                       // "2042-09-13"
+httptape.DateFaker{Format: "2006-01-02"}   // "2042-09-13"
+httptape.DateFaker{Format: time.RFC3339}   // "2042-09-13T00:00:00Z"
+```
+
+If the input is not a string, it is returned unchanged.
+
+### Built-in fakers -- PII-shaped
+
+These fakers preserve a recognizable shape (so downstream parsers do not break) while replacing the underlying content. They are the right choice for fields whose format matters to consumers (clients that validate emails, payment processors that check Luhn, address forms that expect a US zip).
+
+#### EmailFaker
+
+Replaces strings with `"user_<8-hex>@example.com"`. Non-string inputs pass through unchanged.
+
+```go
+httptape.EmailFaker{}
+// "alice@corp.com" -> "user_a1b2c3d4@example.com"
+```
+
+#### PhoneFaker
+
+Replaces digits in the input with HMAC-derived digits while preserving every non-digit character (spaces, dashes, parentheses, plus signs). Output length always equals input length.
+
+```go
+httptape.PhoneFaker{}
+// "+1 (555) 123-4567" -> "+1 (937) 481-2056"
+// "555-1234"          -> "938-1742"
+```
+
+If the input is not a string, it is returned unchanged.
+
+#### CreditCardFaker
+
+Generates a 16-digit number formatted as `XXXX-XXXX-XXXX-XXXX`. The first 6 digits (issuer prefix) are taken from the original; if the original has fewer than 6 digits, the prefix `400000` is used. The middle 9 digits are HMAC-derived; the last digit is a valid Luhn check digit.
+
+```go
+httptape.CreditCardFaker{}
+// "4532-1234-5678-9012" -> "4532-12<derived>-<luhn>"
+```
+
+If the input is not a string, it is returned unchanged.
+
+#### NameFaker
+
+Picks a first name and a last name from internal fixed lists using two HMAC bytes. Output is `"<First> <Last>"`.
+
+```go
+httptape.NameFaker{}
+// "Alice Johnson" -> "Olivia Martinez" (deterministic for that seed+input)
+```
+
+If the input is not a string, it is returned unchanged.
+
+#### AddressFaker
+
+Generates a US-style address: `"<number> <street> <suffix>, <city>, <ST> <zip>"`. House number is in `[1, 9999]`; zip is 5 digits; city, state, and street components are picked from internal fixed lists.
+
+```go
+httptape.AddressFaker{}
+// "123 Main St, Anytown, CA 90210" -> "8421 Cedar Drive, Salem, NV 30418"
+```
+
+If the input is not a string, it is returned unchanged.
+
+### Custom fakers
+
+Anything that satisfies the `Faker` interface works. A typical use case is wrapping an existing data source (a list of canonical fake company names, a generator of valid IBANs, etc.) so the recorded fixtures are coherent with the rest of your test data.
+
+```go
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+)
+
+type CompanyFaker struct {
+    Names []string
+}
+
+func (f CompanyFaker) Fake(seed string, original any) any {
+    s, ok := original.(string)
+    if !ok || len(f.Names) == 0 {
+        return original
+    }
+    // Deterministic pick using the HMAC of seed||s.
+    mac := hmac.New(sha256.New, []byte(seed))
+    mac.Write([]byte(s))
+    h := mac.Sum(nil)
+    idx := int(h[0]) % len(f.Names)
+    return f.Names[idx]
+}
+
+sanitizer := httptape.NewPipeline(
+    httptape.FakeFieldsWith("my-seed", map[string]httptape.Faker{
+        "$.employer": CompanyFaker{Names: []string{"Acme", "Globex", "Initech"}},
+    }),
+)
+```
+
+Make sure your implementation is deterministic (same seed + original always produces the same output) and does not mutate `original` -- httptape passes the value pulled out of `json.Unmarshal` directly.
 
 ## Combining redaction and faking
 
@@ -1071,6 +1489,70 @@ Instead of building pipelines in code, you can define redaction rules in a JSON 
   ]
 }
 ```
+
+The `fake` action also accepts a `fields` map that selects a typed faker per path -- the JSON-config equivalent of `FakeFieldsWith`. See [Config](config.md#typed-fake-fields) for syntax and the full list of shorthands.
+
+## SSE event redaction
+
+For SSE (Server-Sent Events) responses, httptape provides two `SanitizeFunc` constructors that operate on individual event payloads. Each event's `Data` field is treated as an independent JSON body, so the same path syntax applies as `RedactBodyPaths` and `FakeFields`.
+
+These functions are no-ops for non-SSE tapes, so they compose safely in a pipeline that handles both regular and SSE responses.
+
+### RedactSSEEventData
+
+Redacts fields within each SSE event's JSON data:
+
+```go
+httptape.RedactSSEEventData("$.choices[*].delta.content", "$.usage.prompt_tokens")
+```
+
+Example: an LLM streaming response where each event looks like:
+
+```json
+{"id":"chatcmpl-1","choices":[{"delta":{"content":"The user's SSN is 123-45-6789"}}]}
+```
+
+After `RedactSSEEventData("$.choices[*].delta.content")`:
+
+```json
+{"id":"chatcmpl-1","choices":[{"delta":{"content":"[REDACTED]"}}]}
+```
+
+Each event is redacted independently. Non-JSON event data (e.g., `[DONE]`) is left unchanged.
+
+### FakeSSEEventData
+
+Replaces fields within each SSE event's JSON data with deterministic fakes:
+
+```go
+httptape.FakeSSEEventData("my-seed", "$.user.email", "$.user.name")
+```
+
+This uses the same HMAC-SHA256 faking strategy as `FakeFields`. The same seed and input always produce the same fake, so cross-event consistency is preserved.
+
+### Complete pipeline for LLM streaming
+
+A typical pipeline for recording LLM API traffic with streaming redaction:
+
+```go
+sanitizer := httptape.NewPipeline(
+    // Step 1: Redact auth headers.
+    httptape.RedactHeaders("Authorization", "X-Api-Key"),
+
+    // Step 2: Redact sensitive fields in regular (non-SSE) response bodies.
+    httptape.RedactBodyPaths("$.api_key"),
+
+    // Step 3: Redact PII from SSE event payloads.
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+
+    // Step 4: Fake user identifiers in SSE events with deterministic values.
+    httptape.FakeSSEEventData("my-seed", "$.user.email", "$.user.id"),
+)
+
+rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
+```
+
+The order is: headers first, regular body paths, SSE event redaction, SSE event faking. SSE-specific functions are no-ops for non-SSE tapes, and `RedactBodyPaths`/`FakeFields` are no-ops for SSE tapes (since SSE tapes have nil `Body`), so all functions coexist safely in one pipeline.
 
 ## Custom sanitize functions
 
@@ -1327,13 +1809,37 @@ Check the `X-Httptape-Source` response header in browser dev tools to see whethe
 
 ## SSE passthrough and fallback
 
-SSE responses pass through proxy mode transparently. When the upstream is reachable, the SSE stream is forwarded to the caller while events are parsed and cached to L1/L2. When the upstream is unavailable, L2 fallback replays cached SSE events using `WithProxySSETiming` (default: `SSETimingInstant()`).
+SSE (`text/event-stream`) responses pass through proxy mode transparently. When the upstream is reachable:
+
+1. The SSE stream is forwarded to the caller unchanged.
+2. A background goroutine parses the stream into discrete `SSEEvent` entries with timing metadata.
+3. When the stream ends, the parsed events are saved to L1 (raw) and L2 (redacted, if a sanitizer is configured).
+
+When the upstream is unavailable, the proxy falls back to cached SSE tapes. L2 fallback synthesizes a streaming response from the stored events using the configured timing mode.
+
+### Proxy SSE timing for fallback
+
+Control the replay timing of cached SSE responses with `WithProxySSETiming`:
 
 ```go
 proxy := httptape.NewProxy(l1, l2,
-    httptape.WithProxySanitizer(sanitizer),
-    httptape.WithProxySSETiming(httptape.SSETimingInstant()),
+    httptape.WithProxySSETiming(httptape.SSETimingInstant()), // default
 )
+```
+
+The default is `SSETimingInstant()` -- cached SSE responses are delivered as fast as possible. This is appropriate because proxy fallback is a resilience mechanism, not a simulation tool. Use `SSETimingRealtime()` or `SSETimingAccelerated(N)` if you need realistic streaming behavior during fallback.
+
+### SSE redaction in proxy mode
+
+SSE event redaction is applied only to L2 writes (the persistent, disk-backed cache). L1 always stores raw events for within-session fidelity.
+
+```go
+sanitizer := httptape.NewPipeline(
+    httptape.RedactHeaders("Authorization"),
+    httptape.RedactSSEEventData("$.choices[*].delta.content"),
+    httptape.FakeSSEEventData("my-seed", "$.user.email"),
+)
+proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 ```
 
 ## Thread safety
@@ -1457,7 +1963,7 @@ httptape.HeadersCriterion{Key: "X-Feature-Flag", Value: "new-checkout"}
 
 Requires a specific header to be present in both the request and the tape with an exact value match. Header names are case-insensitive. If the header has multiple values, the criterion checks if the specified value appears among them (any-of semantics).
 
-To require multiple headers, add multiple `HeadersCriterion` criteria -- they are AND-ed together naturally. **Score: 3**
+To require multiple headers, add multiple `HeadersCriterion` instances -- they are AND-ed together naturally. **Score: 3**
 
 ### QueryParamsCriterion
 
@@ -1497,6 +2003,27 @@ Using both `BodyFuzzyCriterion` and `BodyHashCriterion` in the same matcher is s
 
 **Score: 6**
 
+### ContentNegotiationCriterion
+
+```go
+httptape.ContentNegotiationCriterion{}
+```
+
+Matches based on RFC 7231 content negotiation: the incoming request's `Accept` header is compared against the tape response's `Content-Type`. This enables multiple fixtures at the same path with different content types (e.g., JSON and XML).
+
+Scoring uses a two-pass algorithm:
+1. **Exclusion pass**: any tape whose Content-Type matches a `q=0` range in Accept is eliminated (score 0).
+2. **Match pass**: the best matching Accept range determines the score based on specificity:
+   - **Exact match** (e.g., `application/json` matches `application/json`): score 5
+   - **Subtype wildcard** (e.g., `application/*` matches `application/json`): score 4
+   - **Full wildcard** (`*/*` matches anything): score 3
+
+If the incoming request has no `Accept` header, the criterion defaults to `*/*` (matches all content types with score 3). Charset and other parameters (except `q`) are ignored.
+
+**Score: 3-5** (variable based on specificity)
+
+**Note:** Using `ContentNegotiationCriterion` alongside `HeadersCriterion{Key: "Accept", ...}` is allowed but redundant.
+
 ## Score weight table
 
 | Criterion | Score | Purpose |
@@ -1506,6 +2033,7 @@ Using both `BodyFuzzyCriterion` and `BodyHashCriterion` in the same matcher is s
 | PathRegexCriterion | 1 | Regex URL path |
 | RouteCriterion | 1 | Route label |
 | HeadersCriterion | 3 | Header key-value |
+| ContentNegotiationCriterion | 3-5 | Accept/Content-Type |
 | QueryParamsCriterion | 4 | Query parameters |
 | BodyFuzzyCriterion | 6 | Partial body fields |
 | BodyHashCriterion | 8 | Exact body hash |
@@ -1549,6 +2077,18 @@ matcher := httptape.NewCompositeMatcher(
 )
 ```
 
+### Method + path + content negotiation (multi-format APIs)
+
+```go
+matcher := httptape.NewCompositeMatcher(
+    httptape.MethodCriterion{},
+    httptape.PathCriterion{},
+    httptape.ContentNegotiationCriterion{},
+)
+```
+
+This pattern enables multiple fixtures at the same endpoint that return different content types. For example, `GET /api/data` could have a JSON fixture and an XML fixture, selected based on the client's `Accept` header.
+
 ### Method + regex path + fuzzy body (complex POST APIs)
 
 ```go
@@ -1560,9 +2100,30 @@ matcher := httptape.NewCompositeMatcher(
 )
 ```
 
+## Declarative matcher config
+
+All examples above show programmatic composition in Go. The same matchers can be declared via a JSON config file, which is especially useful with the CLI and Docker:
+
+```json
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "content_negotiation" }
+    ]
+  },
+  "rules": []
+}
+```
+
+See [Config](config.md#matcher-criteria) for the full syntax and supported criterion types.
+
 ## See also
 
 - [Replay](replay.md) -- using matchers with the Server
+- [Config](config.md) -- declarative JSON configuration (including matcher composition)
 - [API Reference](api-reference.md) -- full type signatures
 # Storage
 
@@ -1672,12 +2233,15 @@ Each tape is stored as pretty-printed JSON with a trailing newline:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJ1c2VyIjoib2N0b2NhdCJ9"
-  }
+    "body": {"user": "octocat"}
+  },
+  "metadata": {}
 }
 ```
 
 Fixtures are human-readable and safe to commit to version control (especially when sanitized).
+
+The `metadata` field is optional and is omitted from the JSON when empty during serialization. See [Fixture Authoring](fixtures-authoring.md) for the metadata keys (`delay`, `error`, etc.) the replay server reads.
 
 ### ID validation
 
@@ -1766,7 +2330,7 @@ Every fixture file is a single JSON object with these fields:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XX0="
+    "body": {"users": [{"id": 1, "name": "Alice"}]}
   },
   "metadata": {}
 }
@@ -1782,29 +2346,34 @@ Every fixture file is a single JSON object with these fields:
 | `request.method` | string | Yes | HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`). |
 | `request.url` | string | Yes | Full URL. The path component is used for matching (e.g., `http://mock/api/users`). |
 | `request.headers` | object | No | Request headers. Each key maps to an array of strings. |
-| `request.body` | string/null | No | Base64-encoded request body, or `null` for bodiless requests. |
+| `request.body` | varies | No | Request body. Shape depends on Content-Type (see below). `null` for bodiless requests. |
 | `request.body_hash` | string | No | Hex-encoded SHA-256 hash of the original request body. Required for `BodyHashCriterion`. |
-| `request.body_encoding` | string | No | `"identity"` for UTF-8 text, `"base64"` for binary. Defaults to identity if omitted. |
 | `response.status_code` | int | Yes | HTTP status code (200, 201, 204, 404, 500, etc.). |
 | `response.headers` | object | No | Response headers. Each key maps to an array of strings. |
-| `response.body` | string/null | No | Base64-encoded response body. |
-| `response.body_encoding` | string | No | Same as request body encoding. |
+| `response.body` | varies | No | Response body. Shape depends on Content-Type (see below). |
 | `metadata` | object | No | Key-value pairs for delay/error simulation. Not used for matching. |
 
-### Body encoding
+### Content-Type-driven body shape (v0.12+)
 
-Go's `encoding/json` handles `[]byte` fields as base64 automatically. When authoring by hand:
+The `body` field's JSON representation depends on the `Content-Type` header:
 
-- **JSON response bodies**: base64-encode the JSON string and set the body field
-- **Text responses**: base64-encode the text
-- **No body** (e.g., 204): set body to `null`
+| Content-Type | Body shape | Example |
+|---|---|---|
+| `application/json`, `+json` suffix | Native JSON object/array | `{"name": "Alice"}` |
+| `text/*`, `application/xml`, `application/javascript` | JSON string | `"Hello, world!"` |
+| Binary (`image/*`, `application/octet-stream`, etc.) | Base64-encoded string | `"aGVsbG8="` |
+| Missing or unknown | Base64-encoded string | `"aGVsbG8="` |
+| Nil or empty body | `null` | `null` |
 
-To base64-encode on the command line:
+This means JSON fixtures are human-readable: response bodies appear as native JSON objects, not opaque base64 strings.
+
+**Migrating from v0.11:** Fixtures created with v0.11 used base64 encoding for all bodies and included a `body_encoding` field. Use the migration tool to convert:
 
 ```bash
-echo -n '{"users":[{"id":1,"name":"Alice"}]}' | base64
-# eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XX0=
+httptape migrate-fixtures --recursive ./fixtures
 ```
+
+The migration tool reads each `.json` file, decodes any base64 bodies, removes the `body_encoding` field, and writes the fixture in the new Content-Type-aware format. It is safe to run multiple times (idempotent).
 
 ### URL format and matching
 
@@ -1838,16 +2407,17 @@ The `request.url` field stores a full URL, but the `DefaultMatcher` (used by the
       "Content-Type": ["application/json"],
       "X-Total-Count": ["42"]
     },
-    "body": "eyJ1c2VycyI6W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9LHsiaWQiOjIsIm5hbWUiOiJCb2IifV19"
+    "body": {
+      "users": [
+        {"id": 1, "name": "Alice"},
+        {"id": 2, "name": "Bob"}
+      ]
+    }
   }
 }
 ```
 
-The response body decodes to:
-
-```json
-{"users":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]}
-```
+The response body is native JSON -- no encoding needed.
 
 ### POST returning created resource (201)
 
@@ -1873,15 +2443,13 @@ The response body decodes to:
       "Content-Type": ["application/json"],
       "Location": ["/api/users/3"]
     },
-    "body": "eyJpZCI6MywibmFtZSI6IkNoYXJsaWUiLCJjcmVhdGVkX2F0IjoiMjAyNS0wMS0xNVQxMDowMDowMFoifQ=="
+    "body": {
+      "id": 3,
+      "name": "Charlie",
+      "created_at": "2025-01-15T10:00:00Z"
+    }
   }
 }
-```
-
-The response body decodes to:
-
-```json
-{"id":3,"name":"Charlie","created_at":"2025-01-15T10:00:00Z"}
 ```
 
 ### DELETE returning 204 No Content
@@ -1936,10 +2504,39 @@ The response body decodes to:
       "X-Per-Page": ["10"],
       "Link": ["<http://mock/api/users?page=3&per_page=10>; rel=\"next\""]
     },
-    "body": "eyJ1c2VycyI6W3siaWQiOjExLCJuYW1lIjoiS2FyZW4ifV19"
+    "body": {
+      "users": [{"id": 11, "name": "Karen"}]
+    }
   }
 }
 ```
+
+### GET returning text (text/plain)
+
+**File:** `fixtures/get-health.json`
+
+```json
+{
+  "id": "get-health",
+  "route": "health",
+  "request": {
+    "method": "GET",
+    "url": "http://mock/health",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/plain"]
+    },
+    "body": "OK"
+  }
+}
+```
+
+Text bodies are stored as JSON strings -- no base64 encoding needed.
 
 ## Metadata: delay and error simulation
 
@@ -1964,7 +2561,7 @@ Add a `delay` key with a Go duration string:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJzdGF0dXMiOiJjb21wbGV0ZSJ9"
+    "body": {"status": "complete"}
   },
   "metadata": {
     "delay": "2s"
@@ -1995,7 +2592,7 @@ Add an `error` key with a `status` code and optional `body`:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJvayI6dHJ1ZX0="
+    "body": {"ok": true}
   },
   "metadata": {
     "error": {
@@ -2055,7 +2652,7 @@ store, err := httptape.NewFileStore(httptape.WithDirectory("./testdata/api-fixtu
 
 **Keep the `route` consistent.** If you plan to filter fixtures by route (e.g., to run tests against a subset), use the same route string across related fixtures.
 
-**Omit optional fields.** Fields like `body_hash`, `body_encoding`, `recorded_at`, and `metadata` can be omitted entirely:
+**Omit optional fields.** Fields like `body_hash`, `recorded_at`, and `metadata` can be omitted entirely:
 
 ```json
 {
@@ -2072,20 +2669,12 @@ store, err := httptape.NewFileStore(httptape.WithDirectory("./testdata/api-fixtu
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJzdGF0dXMiOiJvayJ9"
+    "body": {"status": "ok"}
   }
 }
 ```
 
-**Base64 helper script.** Create a shell alias for encoding response bodies:
-
-```bash
-alias b64='python3 -c "import sys,base64; print(base64.b64encode(sys.stdin.buffer.read()).decode())"'
-
-# Usage:
-echo -n '{"status":"ok"}' | b64
-# eyJzdGF0dXMiOiJvayJ9
-```
+**Write JSON bodies as native JSON.** Since v0.12, JSON response bodies are written as native JSON objects -- no base64 encoding needed. Just write the JSON inline in the `body` field.
 
 **Validate your fixtures.** Load fixtures with `FileStore` and check for JSON parse errors:
 
@@ -2463,16 +3052,12 @@ Your frontend needs `GET /api/notifications`, which does not have a fixture yet.
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "W3siaWQiOjEsIm1lc3NhZ2UiOiJXZWxjb21lISIsInJlYWQiOmZhbHNlfV0="
+    "body": [{"id": 1, "message": "Welcome!", "read": false}]
   }
 }
 ```
 
-The body decodes to:
-
-```json
-[{"id":1,"message":"Welcome!","read":false}]
-```
+The response body is native JSON -- no encoding needed (Content-Type is `application/json`).
 
 Save the file. Refresh the frontend. The notification badge appears.
 
@@ -2495,7 +3080,7 @@ Frontend loading states (spinners, skeletons, progress bars) are hard to test ag
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJ3aWRnZXRzIjpbXX0="
+    "body": {"widgets": []}
   },
   "metadata": {
     "delay": "2s"
@@ -2552,7 +3137,7 @@ Return a specific error for a specific endpoint:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJpZCI6MX0="
+    "body": {"id": 1}
   },
   "metadata": {
     "error": {
@@ -3039,13 +3624,20 @@ docker compose -f docker-compose.test.yml down
 - [Replay](replay.md) -- server options and replay behavior
 # Declarative Configuration
 
-Instead of building sanitization pipelines in Go code, httptape supports a JSON configuration format. This is useful for the [CLI](cli.md), [Docker](docker.md), and [Testcontainers](testcontainers.md) workflows where you want to define sanitization rules outside your Go code.
+Instead of building sanitization pipelines and matchers in Go code, httptape supports a JSON configuration format. This is useful for the [CLI](cli.md), [Docker](docker.md), and [Testcontainers](testcontainers.md) workflows where you want to define sanitization rules and matching criteria outside your Go code.
 
 ## Config format
 
 ```json
 {
   "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "content_negotiation" }
+    ]
+  },
   "rules": [
     { "action": "redact_headers" },
     { "action": "redact_body", "paths": ["$.password", "$.ssn"] },
@@ -3058,9 +3650,72 @@ Instead of building sanitization pipelines in Go code, httptape supports a JSON 
 
 Must be `"1"`. This field is required.
 
+### Matcher (optional)
+
+Declares the `CompositeMatcher` criteria the replay server uses to select recorded tapes. When omitted, `DefaultMatcher()` (method + path) is used. When present, replaces the default matcher entirely.
+
+See [Matching](matching.md) for the scoring model and available criteria.
+
 ### Rules
 
-An ordered array of sanitization rules. Rules are applied sequentially, matching the Pipeline's semantics. At least one rule is required.
+An ordered array of sanitization rules. Rules are applied sequentially, matching the Pipeline's semantics. Rules may be empty (`[]`) when the config is used only for matcher composition.
+
+## Matcher criteria
+
+The `matcher.criteria` array declares which `Criterion` implementations to compose. Each entry has a `type` field (matching `Criterion.Name()`) and optional type-specific fields.
+
+| Type | Fields | Maps to |
+|------|--------|---------|
+| `"method"` | (none) | `MethodCriterion{}` |
+| `"path"` | (none) | `PathCriterion{}` |
+| `"body_fuzzy"` | `paths` (required, valid JSONPath-like) | `NewBodyFuzzyCriterion(paths...)` |
+| `"content_negotiation"` | (none) | `ContentNegotiationCriterion{}` |
+
+**Example: method + path + content negotiation**
+
+```json
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "content_negotiation" }
+    ]
+  },
+  "rules": []
+}
+```
+
+**Example: method + path + body fuzzy (for distinguishing POST requests by body)**
+
+```json
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "body_fuzzy", "paths": ["$.action", "$.messages[*].role"] }
+    ]
+  },
+  "rules": [
+    { "action": "redact_headers" }
+  ]
+}
+```
+
+### BuildMatcher
+
+```go
+matcher := cfg.BuildMatcher()
+
+srv := httptape.NewServer(store,
+    httptape.WithMatcher(matcher),
+)
+```
+
+`BuildMatcher` returns `nil` when no `matcher` section is present. Check for nil before passing to `WithMatcher`.
 
 ## Actions
 
@@ -3090,13 +3745,81 @@ The `paths` field is required and must be non-empty.
 
 ### fake
 
-Maps to `FakeFields()`. Replaces values with deterministic HMAC-based fakes.
+Replaces values with deterministic HMAC-based fakes. The `seed` field is always required. The faking strategy is selected by which other field you set:
+
+- `paths` -- auto-detects the strategy from each value's runtime type (maps to `FakeFields`).
+- `fields` -- selects an explicit faker per path (maps to `FakeFieldsWith`).
+
+Exactly one of `paths` or `fields` must be set; specifying both is rejected.
+
+#### Auto-detect form (paths)
 
 ```json
 { "action": "fake", "seed": "my-project-seed", "paths": ["$.user.email", "$.user.id", "$.user.name"] }
 ```
 
-Both `seed` and `paths` are required and must be non-empty.
+Auto-detect picks `EmailFaker`-equivalent output for strings containing `@`, UUID-shaped output for UUID strings, a positive integer for numbers, and `"fake_<hex>"` for other strings. See [Redaction](sanitization.md#fakefields) for the full table.
+
+#### Typed fake fields
+
+When you need a specific format -- credit card, fixed-length digits, a sentinel value -- use the `fields` map. Each entry maps a JSONPath-like path to a faker spec.
+
+```json
+{
+  "action": "fake",
+  "seed": "my-project-seed",
+  "fields": {
+    "$.user.email":   "email",
+    "$.user.phone":   "phone",
+    "$.card.number":  "credit_card",
+    "$.card.cvv":     { "type": "numeric", "length": 3 },
+    "$.user.dob":     { "type": "date", "format": "2006-01-02" },
+    "$.order.status": { "type": "fixed", "value": "active" }
+  }
+}
+```
+
+A faker spec is either a **string shorthand** or an **object** with a `type` field.
+
+##### String shorthands
+
+These names construct the corresponding zero-value Faker:
+
+| Shorthand | Faker | Output |
+|---|---|---|
+| `"redacted"` | `RedactedFaker{}` | strings -> `"[REDACTED]"`, numbers -> `0`, bools -> `false` |
+| `"hmac"` | `HMACFaker{}` | strings -> `"fake_<hex>"`, numbers -> positive int |
+| `"email"` | `EmailFaker{}` | `"user_<hex>@example.com"` |
+| `"phone"` | `PhoneFaker{}` | digits replaced, format preserved |
+| `"credit_card"` | `CreditCardFaker{}` | `XXXX-XXXX-XXXX-XXXX`, prefix preserved, valid Luhn |
+| `"name"` | `NameFaker{}` | `"<First> <Last>"` from internal lists |
+| `"address"` | `AddressFaker{}` | `"<num> <street> <suffix>, <city>, <ST> <zip>"` |
+
+A shorthand may also be written in object form (`{ "type": "email" }`) -- handy when an editor's JSON schema completion prefers objects, or when you want to keep all entries visually uniform.
+
+##### Object-form fakers
+
+Five fakers take parameters and must be written as objects:
+
+| `type` | Required fields | Maps to |
+|---|---|---|
+| `"numeric"` | `length` (number > 0) | `NumericFaker{Length: ...}` |
+| `"date"` | (optional) `format` (Go layout string; defaults to `"2006-01-02"`) | `DateFaker{Format: ...}` |
+| `"pattern"` | `pattern` (non-empty string) | `PatternFaker{Pattern: ...}` -- `#` -> digit, `?` -> letter |
+| `"prefix"` | `prefix` (non-empty string) | `PrefixFaker{Prefix: ...}` -> `"<Prefix><16-hex>"` |
+| `"fixed"` | `value` (any JSON value) | `FixedFaker{Value: ...}` -- always returns `value` |
+
+Examples:
+
+```json
+{ "type": "numeric", "length": 16 }
+{ "type": "date", "format": "2006-01-02T15:04:05Z07:00" }
+{ "type": "pattern", "pattern": "###-##-####" }
+{ "type": "prefix", "prefix": "cust_" }
+{ "type": "fixed", "value": true }
+```
+
+See [Redaction -> Typed fakers](sanitization.md#typed-fakers) for output examples and prose descriptions of each faker.
 
 ## Loading config in Go
 
@@ -3145,12 +3868,27 @@ err := cfg.Validate()
 
 Validation checks:
 - Version must be `"1"`
-- Rules must be non-empty
+- Rules may be empty only when a `matcher` section is present (the config is matcher-only)
 - Each rule must have a known action (`redact_headers`, `redact_body`, `fake`)
 - Action-specific required fields must be present
 - All paths must use valid JSONPath-like syntax (`$.field`, `$.nested.field`, `$.array[*].field`)
 - Fields irrelevant to an action are rejected (e.g., `paths` on `redact_headers`)
 - Unknown JSON fields are rejected
+
+Additional rules for `fake`:
+- `seed` must be present and non-empty.
+- Exactly one of `paths` or `fields` must be set; setting both is rejected, setting neither is rejected.
+- Each key in `fields` must be a valid JSONPath-like path.
+- Each value in `fields` must be either a known string shorthand or an object with a known `type`.
+- Object-form fakers must include their required parameters (`numeric.length`, `pattern.pattern`, `prefix.prefix`, `fixed.value`); `date.format` is optional.
+- Anything else (numbers, arrays, nulls) as a `fields` value is rejected.
+
+Additional rules for `matcher`:
+- `criteria` must be a non-empty array.
+- Each criterion must have a known `type` (`method`, `path`, `body_fuzzy`, `content_negotiation`).
+- `body_fuzzy` requires a non-empty `paths` array with valid JSONPath-like paths.
+- `method`, `path`, and `content_negotiation` do not accept `paths`; specifying them is rejected.
+- Unknown criterion fields are rejected.
 
 ## JSON Schema
 
@@ -3198,9 +3936,74 @@ Reference it in your config file:
 }
 ```
 
+## Typed-faker examples
+
+### Email shorthand
+
+The simplest typed-faker config: route a single field through `EmailFaker` so it always lands as `user_<hex>@example.com` regardless of what the upstream actually sends.
+
+```json
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "fake",
+      "seed": "my-project-2024",
+      "fields": {
+        "$.user.email": "email"
+      }
+    }
+  ]
+}
+```
+
+### Numeric object form
+
+Force a fixed-width numeric ID (CVV, OTP, account number) into a deterministic three-digit string. Auto-detect would treat the field as a generic string and produce `"fake_<hex>"`, which would not pass downstream length validation.
+
+```json
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "fake",
+      "seed": "my-project-2024",
+      "fields": {
+        "$.payment.cvv": { "type": "numeric", "length": 3 }
+      }
+    }
+  ]
+}
+```
+
+### Credit card shorthand
+
+Generate a Luhn-valid card number that preserves the issuer prefix from the original. Combine with `redact_body` to also clear out an unrelated CVV in the same pipeline.
+
+```json
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "redact_body",
+      "paths": ["$.payment.cvv"]
+    },
+    {
+      "action": "fake",
+      "seed": "my-project-2024",
+      "fields": {
+        "$.payment.card_number": "credit_card"
+      }
+    }
+  ]
+}
+```
+
 ## See also
 
 - [Redaction](sanitization.md) -- programmatic redaction pipeline API
+- [Redaction -> Typed fakers](sanitization.md#typed-fakers) -- prose descriptions of every built-in faker
+- [API Reference -> Faker interface](api-reference.md#faker-interface) -- full Go signatures
 - [CLI](cli.md) -- using config files with the CLI
 - [Docker](docker.md) -- mounting config files into containers
 # CLI Reference
@@ -3234,8 +4037,10 @@ httptape serve --fixtures ./fixtures [flags]
 | `--delay` | `0` | Fixed delay before every response (e.g., `200ms`, `1s`) |
 | `--error-rate` | `0` | Fraction of requests that return 500 (0.0-1.0) |
 | `--replay-header` | (none) | Header to inject into responses (`Key=Value`, repeatable) |
+| `--sse-timing` | (none) | SSE replay timing mode: `realtime`, `instant`, `accelerated=<factor>`. When unset, the library default (`realtime`) is used. |
+| `--config` | (none) | Path to httptape config JSON. When the config includes a `matcher` section, the server uses it to build a `CompositeMatcher` instead of the default method + path matcher. Sanitization rules in the config are ignored by `serve`. See [Config](config.md). |
 
-The server uses `DefaultMatcher` (method + path matching) and loads fixtures from the specified directory. It shuts down gracefully on SIGINT/SIGTERM.
+The server uses `DefaultMatcher` (method + path matching) unless a `--config` with a `matcher` section is provided. Fixtures are loaded from the specified directory. The server shuts down gracefully on SIGINT/SIGTERM.
 
 **Example:**
 
@@ -3258,6 +4063,10 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 | `--config` | (none) | Path to redaction config JSON |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
+| `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
+| `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
+| `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
+| `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
 The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
 
@@ -3291,6 +4100,11 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
+| `--sse-timing` | (none) | SSE replay timing mode for L2 fallback: `realtime`, `instant`, `accelerated=<factor>`. When unset, the library default (`instant`) is used. |
+| `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
+| `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
+| `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
+| `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
 When the upstream is reachable, requests are forwarded and responses are cached:
 
@@ -3368,6 +4182,41 @@ httptape import --fixtures ./fixtures --input bundle.tar.gz
 
 # Import from stdin
 cat bundle.tar.gz | httptape import --fixtures ./fixtures
+```
+
+### migrate-fixtures
+
+Migrate fixtures from v0.11 format (base64-encoded bodies with `body_encoding` field) to v0.12 format (Content-Type-driven body shape).
+
+```bash
+httptape migrate-fixtures [--recursive] <dir>
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--recursive` | `false` | Recurse into subdirectories |
+
+The migration tool:
+- Reads each `.json` file in `<dir>`
+- Skips non-tape JSON files (files that don't parse as valid Tape objects)
+- Decodes base64-encoded bodies using the legacy `body_encoding` field
+- Re-serializes the tape with the new Content-Type-aware body shape
+- Removes the `body_encoding` field
+- Prints a summary of migrated, skipped, and errored files
+
+The tool is idempotent: running it on already-migrated fixtures produces the same output.
+
+**Examples:**
+
+```bash
+# Migrate a flat fixtures directory
+httptape migrate-fixtures ./fixtures
+
+# Migrate recursively (e.g., route-based subdirectories)
+httptape migrate-fixtures --recursive ./fixtures
+
+# Migrate example project fixtures
+httptape migrate-fixtures --recursive ./examples/java-spring-boot/src/test/resources/fixtures/
 ```
 
 ## Exit codes
@@ -3840,6 +4689,163 @@ func TestRecordWithSanitization(t *testing.T) {
 - [Docker](docker.md) -- manual Docker usage and compose files
 - [Config](config.md) -- sanitization config format
 - [CLI](cli.md) -- the commands that run inside the container
+# TLS / mTLS Configuration
+
+httptape supports custom TLS configuration for **outbound** connections
+(httptape to upstream). This enables recording and proxying through backends
+that use self-signed certificates, internal CAs, or mutual TLS (mTLS).
+
+!!! note "Inbound connections are not affected"
+    The TLS flags configure only the connection **from httptape to the upstream**.
+    httptape itself listens on plain HTTP. Place a reverse proxy (nginx, Caddy)
+    in front of httptape if you need TLS on the inbound side.
+
+## Four levels of TLS
+
+| Level | Use case | Configuration |
+|-------|----------|---------------|
+| **Basic TLS** | Upstream uses HTTPS with a publicly trusted certificate | None -- works out of the box |
+| **Custom CA** | Upstream uses a self-signed or internal CA certificate | `--tls-ca` |
+| **mTLS** | Upstream requires a client certificate | `--tls-cert` + `--tls-key` (+ optional `--tls-ca`) |
+| **Skip verify** | Dev shortcut when certs are broken or self-signed | `--tls-insecure` |
+
+## CLI usage
+
+### Custom CA
+
+```bash
+httptape record \
+  --upstream https://internal-api.corp:8443 \
+  --fixtures ./fixtures \
+  --tls-ca /path/to/internal-ca.pem
+```
+
+### Mutual TLS (mTLS)
+
+```bash
+httptape proxy \
+  --upstream https://secure-api.corp:8443 \
+  --fixtures ./fixtures \
+  --tls-cert /path/to/client.crt \
+  --tls-key  /path/to/client.key \
+  --tls-ca   /path/to/internal-ca.pem
+```
+
+### Skip TLS verification (dev only)
+
+```bash
+httptape record \
+  --upstream https://localhost:8443 \
+  --fixtures ./fixtures \
+  --tls-insecure
+```
+
+!!! warning
+    `--tls-insecure` disables all certificate verification. **Never use this in
+    production.** A warning is printed to stderr when this flag is active.
+
+## Go library usage
+
+### BuildTLSConfig helper
+
+The `BuildTLSConfig` function converts file paths into a `*tls.Config`:
+
+```go
+import "github.com/VibeWarden/httptape"
+
+// Custom CA only
+tlsCfg, err := httptape.BuildTLSConfig("", "", "/path/to/ca.pem", false)
+
+// mTLS with custom CA
+tlsCfg, err := httptape.BuildTLSConfig(
+    "/path/to/client.crt",
+    "/path/to/client.key",
+    "/path/to/ca.pem",
+    false,
+)
+
+// Skip verification (dev only)
+tlsCfg, err := httptape.BuildTLSConfig("", "", "", true)
+```
+
+When all arguments are zero-valued, `BuildTLSConfig` returns `nil, nil` (use Go
+defaults).
+
+### Recorder with TLS
+
+```go
+tlsCfg, err := httptape.BuildTLSConfig("", "", "ca.pem", false)
+if err != nil {
+    log.Fatal(err)
+}
+
+store, _ := httptape.NewFileStore(httptape.WithDirectory("fixtures"))
+rec := httptape.NewRecorder(store, httptape.WithRecorderTLSConfig(tlsCfg))
+defer rec.Close()
+
+client := &http.Client{Transport: rec}
+resp, err := client.Get("https://internal-api.corp:8443/v1/data")
+```
+
+### Proxy with TLS
+
+```go
+tlsCfg, err := httptape.BuildTLSConfig("client.crt", "client.key", "ca.pem", false)
+if err != nil {
+    log.Fatal(err)
+}
+
+l1 := httptape.NewMemoryStore()
+l2, _ := httptape.NewFileStore(httptape.WithDirectory("fixtures"))
+proxy := httptape.NewProxy(l1, l2, httptape.WithProxyTLSConfig(tlsCfg))
+
+client := &http.Client{Transport: proxy}
+```
+
+## Docker
+
+When running httptape in Docker, mount your certificate files into the
+container:
+
+```bash
+docker run -v /host/certs:/certs:ro \
+  httptape record \
+  --upstream https://backend:8443 \
+  --fixtures /data/fixtures \
+  --tls-cert /certs/client.crt \
+  --tls-key  /certs/client.key \
+  --tls-ca   /certs/ca.pem
+```
+
+## Troubleshooting
+
+### "x509: certificate signed by unknown authority"
+
+The upstream certificate is not trusted. Provide the CA certificate with
+`--tls-ca`, or use `--tls-insecure` as a temporary workaround.
+
+### "x509: certificate has expired or is not yet valid"
+
+The upstream (or client) certificate is outside its validity window. Check the
+`NotBefore` and `NotAfter` fields with:
+
+```bash
+openssl x509 -in cert.pem -noout -dates
+```
+
+### "tls: private key does not match public key"
+
+The `--tls-cert` and `--tls-key` files do not form a valid pair. Verify with:
+
+```bash
+openssl x509 -in client.crt -noout -modulus | md5
+openssl ec    -in client.key -noout         -modulus 2>/dev/null | md5
+# (Use openssl rsa for RSA keys)
+```
+
+### "--tls-cert requires --tls-key" (or vice versa)
+
+Client certificate and key must be provided together. Supply both or neither.
 # API Reference
 
 Quick reference of all exported types, functions, and options in the `httptape` package. httptape follows the 3 Rs: **Record, Redact, Replay**.
@@ -3850,11 +4856,12 @@ Quick reference of all exported types, functions, and options in the `httptape` 
 
 ```go
 type Tape struct {
-    ID         string       `json:"id"`
-    Route      string       `json:"route"`
-    RecordedAt time.Time    `json:"recorded_at"`
-    Request    RecordedReq  `json:"request"`
-    Response   RecordedResp `json:"response"`
+    ID         string         `json:"id"`
+    Route      string         `json:"route"`
+    RecordedAt time.Time      `json:"recorded_at"`
+    Request    RecordedReq    `json:"request"`
+    Response   RecordedResp   `json:"response"`
+    Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
 func NewTape(route string, req RecordedReq, resp RecordedResp) Tape
@@ -3864,40 +4871,57 @@ func NewTape(route string, req RecordedReq, resp RecordedResp) Tape
 
 ```go
 type RecordedReq struct {
-    Method           string       `json:"method"`
-    URL              string       `json:"url"`
-    Headers          http.Header  `json:"headers"`
-    Body             []byte       `json:"body"`
-    BodyHash         string       `json:"body_hash"`
-    BodyEncoding     BodyEncoding `json:"body_encoding,omitempty"`
-    Truncated        bool         `json:"truncated,omitempty"`
-    OriginalBodySize int64        `json:"original_body_size,omitempty"`
+    Method           string      `json:"method"`
+    URL              string      `json:"url"`
+    Headers          http.Header `json:"headers"`
+    Body             []byte      `json:"-"`
+    BodyHash         string      `json:"body_hash"`
+    Truncated        bool        `json:"truncated,omitempty"`
+    OriginalBodySize int64       `json:"original_body_size,omitempty"`
 }
 ```
+
+Implements `json.Marshaler` and `json.Unmarshaler`. The `Body` field is serialized
+based on the Content-Type header: native JSON for `application/json`, string for `text/*`,
+base64 for binary, and `null` for nil/empty.
 
 ### RecordedResp
 
 ```go
 type RecordedResp struct {
-    StatusCode       int          `json:"status_code"`
-    Headers          http.Header  `json:"headers"`
-    Body             []byte       `json:"body"`
-    BodyEncoding     BodyEncoding `json:"body_encoding,omitempty"`
-    Truncated        bool         `json:"truncated,omitempty"`
-    OriginalBodySize int64        `json:"original_body_size,omitempty"`
+    StatusCode       int         `json:"status_code"`
+    Headers          http.Header `json:"headers"`
+    Body             []byte      `json:"-"`
+    Truncated        bool        `json:"truncated,omitempty"`
+    OriginalBodySize int64       `json:"original_body_size,omitempty"`
+    SSEEvents        []SSEEvent  `json:"sse_events,omitempty"`
 }
 ```
 
-### BodyEncoding
+Implements `json.Marshaler` and `json.Unmarshaler` with the same Content-Type-driven
+body shape as `RecordedReq`.
+
+### MediaType
 
 ```go
-type BodyEncoding string
+type MediaType struct {
+    Type    string            // e.g., "application"
+    Subtype string            // e.g., "json"
+    Suffix  string            // e.g., "json" (from "+json" structured syntax suffix)
+    Params  map[string]string // e.g., {"charset": "utf-8"}
+    QValue  float64           // quality factor from Accept header (0.0-1.0, default 1.0)
+}
 
-const (
-    BodyEncodingIdentity BodyEncoding = "identity" // UTF-8 text
-    BodyEncodingBase64   BodyEncoding = "base64"   // binary content
-)
+func ParseMediaType(s string) (MediaType, error)
+func ParseAccept(accept string) []MediaType
+func IsJSON(mt MediaType) bool
+func IsText(mt MediaType) bool
+func IsBinary(mt MediaType) bool
+func MatchesMediaRange(accept, contentType MediaType) bool
+func Specificity(mt MediaType) int
 ```
+
+Utilities for Content-Type-driven body encoding and content negotiation matching.
 
 ### Utility
 
@@ -3917,6 +4941,8 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) // imple
 func (r *Recorder) Close() error
 ```
 
+Panics if `store` is nil.
+
 ### RecorderOption
 
 | Option | Signature | Default |
@@ -3930,6 +4956,7 @@ func (r *Recorder) Close() error
 | WithMaxBodySize | `WithMaxBodySize(n int)` | `0` (no limit) |
 | WithSkipRedirects | `WithSkipRedirects(skip bool)` | `false` |
 | WithOnError | `WithOnError(fn func(error))` | no-op |
+| WithRecorderTLSConfig | `WithRecorderTLSConfig(cfg *tls.Config)` | nil |
 
 **Details:** [Recording](recording.md)
 
@@ -3944,6 +4971,8 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
 func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
 ```
 
+Panics if `l1` or `l2` is nil.
+
 ### ProxyOption
 
 | Option | Signature | Default |
@@ -3954,6 +4983,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implemen
 | WithProxyRoute | `WithProxyRoute(route string)` | `""` |
 | WithProxyOnError | `WithProxyOnError(fn func(error))` | nil |
 | WithProxyFallbackOn | `WithProxyFallbackOn(fn func(error, *http.Response) bool)` | transport errors only |
+| WithProxyTLSConfig | `WithProxyTLSConfig(cfg *tls.Config)` | nil |
 
 **Details:** [Proxy Mode](proxy.md)
 
@@ -3967,6 +4997,8 @@ type Server struct { /* unexported */ }
 func NewServer(store Store, opts ...ServerOption) *Server
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements http.Handler
 ```
+
+Panics if `store` is nil.
 
 ### ServerOption
 
@@ -3982,6 +5014,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements
 | WithReplayHeaders | `WithReplayHeaders(key, value string)` | none |
 
 **Details:** [Replay](replay.md)
+
+---
+
+## TLS helpers
+
+```go
+func BuildTLSConfig(certFile, keyFile, caFile string, insecure bool) (*tls.Config, error)
+```
+
+Constructs a `*tls.Config` from optional PEM file paths and an insecure flag. Returns `(nil, nil)` when all parameters are zero-valued (use Go defaults). `certFile` and `keyFile` must be supplied together for mTLS; `caFile` overrides the system root CAs; `insecure` sets `InsecureSkipVerify`. Used internally by the CLI's `--tls-*` flags and exposed for embedders that build their own `*tls.Config` from the same inputs.
+
+**Details:** [TLS](tls.md)
 
 ---
 
@@ -4013,6 +5057,38 @@ func (p *Pipeline) Sanitize(t Tape) Tape // implements Sanitizer
 | RedactHeaders | `RedactHeaders(names ...string) SanitizeFunc` |
 | RedactBodyPaths | `RedactBodyPaths(paths ...string) SanitizeFunc` |
 | FakeFields | `FakeFields(seed string, paths ...string) SanitizeFunc` |
+| FakeFieldsWith | `FakeFieldsWith(seed string, fields map[string]Faker) SanitizeFunc` |
+
+### Faker interface
+
+```go
+type Faker interface {
+    Fake(seed string, original any) any
+}
+```
+
+`FakeFieldsWith` wires explicit `Faker` implementations to JSONPath-like paths, in contrast to `FakeFields` which auto-detects the strategy from each value's runtime type.
+
+### Built-in fakers
+
+All twelve are exported struct types and are constructed as struct literals (no `NewXFaker` constructors).
+
+| Type | Construction | Output |
+|---|---|---|
+| `RedactedFaker` | `RedactedFaker{}` | strings -> `"[REDACTED]"`, numbers -> `0`, bools -> `false` |
+| `FixedFaker` | `FixedFaker{Value: any}` | always returns `Value` |
+| `HMACFaker` | `HMACFaker{}` | strings -> `"fake_<hex>"`, numbers -> positive int |
+| `EmailFaker` | `EmailFaker{}` | `"user_<hex>@example.com"` |
+| `PhoneFaker` | `PhoneFaker{}` | digits replaced, format preserved |
+| `CreditCardFaker` | `CreditCardFaker{}` | `XXXX-XXXX-XXXX-XXXX`, prefix preserved, valid Luhn |
+| `NumericFaker` | `NumericFaker{Length: int}` | string of N HMAC-derived digits |
+| `DateFaker` | `DateFaker{Format: string}` | date in Go layout (default `"2006-01-02"`) |
+| `PatternFaker` | `PatternFaker{Pattern: string}` | `#` -> digit, `?` -> letter, others literal |
+| `PrefixFaker` | `PrefixFaker{Prefix: string}` | `"<Prefix><16-hex>"` |
+| `NameFaker` | `NameFaker{}` | `"<First> <Last>"` from internal lists |
+| `AddressFaker` | `AddressFaker{}` | `"<num> <street> <suffix>, <city>, <ST> <zip>"` |
+
+PII-shaped and generic fakers leave non-string inputs unchanged. `RedactedFaker` and `HMACFaker` additionally handle numbers (and `RedactedFaker` handles booleans).
 
 ### Constants and helpers
 
@@ -4022,7 +5098,7 @@ const Redacted = "[REDACTED]"
 func DefaultSensitiveHeaders() []string
 ```
 
-**Details:** [Redaction](sanitization.md)
+**Details:** [Redaction](sanitization.md#typed-fakers)
 
 ---
 
@@ -4058,14 +5134,15 @@ func NewCompositeMatcher(criteria ...Criterion) *CompositeMatcher
 
 ### Built-in criteria
 
-| Type | Construction | Score |
-|------|-------------|-------|
+| Criterion | Construction | Score |
+|-----------|-------------|-------|
 | MethodCriterion | `MethodCriterion{}` | 1 |
 | PathCriterion | `PathCriterion{}` | 2 |
 | PathRegexCriterion | `NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error)` | 1 |
 | RouteCriterion | `RouteCriterion{Route: route}` | 1 |
 | HeadersCriterion | `HeadersCriterion{Key: key, Value: value}` | 3 |
 | QueryParamsCriterion | `QueryParamsCriterion{}` | 4 |
+| ContentNegotiationCriterion | `ContentNegotiationCriterion{}` | 3-5 |
 | BodyFuzzyCriterion | `NewBodyFuzzyCriterion(paths ...string) *BodyFuzzyCriterion` | 6 |
 | BodyHashCriterion | `BodyHashCriterion{}` | 8 |
 
@@ -4146,21 +5223,54 @@ type Manifest struct {
 
 ```go
 type Config struct {
-    Version string `json:"version"`
-    Rules   []Rule `json:"rules"`
+    Version string         `json:"version"`
+    Matcher *MatcherConfig `json:"matcher,omitempty"`
+    Rules   []Rule         `json:"rules"`
+}
+
+type MatcherConfig struct {
+    Criteria []CriterionConfig `json:"criteria"`
+}
+
+type CriterionConfig struct {
+    Type  string   `json:"type"`
+    Paths []string `json:"paths,omitempty"`
 }
 
 type Rule struct {
-    Action  string   `json:"action"`
-    Headers []string `json:"headers,omitempty"`
-    Paths   []string `json:"paths,omitempty"`
-    Seed    string   `json:"seed,omitempty"`
+    Action  string         `json:"action"`
+    Headers []string       `json:"headers,omitempty"`
+    Paths   []string       `json:"paths,omitempty"`
+    Seed    string         `json:"seed,omitempty"`
+    Fields  map[string]any `json:"fields,omitempty"`
 }
 
 func LoadConfig(r io.Reader) (*Config, error)
 func LoadConfigFile(path string) (*Config, error)
 func (c *Config) Validate() error
 func (c *Config) BuildPipeline() *Pipeline
+func (c *Config) BuildMatcher() *CompositeMatcher // returns nil when no matcher section
+```
+
+For `fake` rules, set either `Paths` (for auto-detect, mapping to `FakeFields`) or `Fields` (for typed fakers, mapping to `FakeFieldsWith`) -- the two are mutually exclusive. Each value in `Fields` is either a string shorthand (for example `"email"`) or an object (for example `{"type": "numeric", "length": 3}`). See [Config -> Typed fake fields](config.md#typed-fake-fields) for the full syntax.
+
+Programmatic example:
+
+```go
+cfg := &httptape.Config{
+    Version: "1",
+    Rules: []httptape.Rule{
+        {
+            Action: httptape.ActionFake,
+            Seed:   "my-seed",
+            Fields: map[string]any{
+                "$.user.email": "email",
+                "$.user.cvv":   map[string]any{"type": "numeric", "length": 3},
+            },
+        },
+    },
+}
+pipeline := cfg.BuildPipeline()
 ```
 
 ### Action constants

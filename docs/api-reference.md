@@ -61,6 +61,7 @@ type MediaType struct {
     Subtype string            // e.g., "json"
     Suffix  string            // e.g., "json" (from "+json" structured syntax suffix)
     Params  map[string]string // e.g., {"charset": "utf-8"}
+    QValue  float64           // quality factor from Accept header (0.0-1.0, default 1.0)
 }
 
 func ParseMediaType(s string) (MediaType, error)
@@ -374,8 +375,18 @@ type Manifest struct {
 
 ```go
 type Config struct {
-    Version string `json:"version"`
-    Rules   []Rule `json:"rules"`
+    Version string         `json:"version"`
+    Matcher *MatcherConfig `json:"matcher,omitempty"`
+    Rules   []Rule         `json:"rules"`
+}
+
+type MatcherConfig struct {
+    Criteria []CriterionConfig `json:"criteria"`
+}
+
+type CriterionConfig struct {
+    Type  string   `json:"type"`
+    Paths []string `json:"paths,omitempty"`
 }
 
 type Rule struct {
@@ -390,6 +401,7 @@ func LoadConfig(r io.Reader) (*Config, error)
 func LoadConfigFile(path string) (*Config, error)
 func (c *Config) Validate() error
 func (c *Config) BuildPipeline() *Pipeline
+func (c *Config) BuildMatcher() *CompositeMatcher // returns nil when no matcher section
 ```
 
 For `fake` rules, set either `Paths` (for auto-detect, mapping to `FakeFields`) or `Fields` (for typed fakers, mapping to `FakeFieldsWith`) -- the two are mutually exclusive. Each value in `Fields` is either a string shorthand (for example `"email"`) or an object (for example `{"type": "numeric", "length": 3}`). See [Config -> Typed fake fields](config.md#typed-fake-fields) for the full syntax.

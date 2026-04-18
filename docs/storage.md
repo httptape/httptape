@@ -106,7 +106,7 @@ Each tape is stored as pretty-printed JSON with a trailing newline:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJ1c2VyIjoib2N0b2NhdCJ9"
+    "body": {"user": "octocat"}
   },
   "metadata": {}
 }

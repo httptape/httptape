@@ -10,9 +10,14 @@ on write, and replays them as a mock server. Zero dependencies (stdlib only).
 SSE streams (e.g., LLM streaming completions) are recorded as discrete events
 with per-event timing metadata and replayed with configurable speed.
 
+Fixture bodies use Content-Type-driven serialization (v0.12+): JSON bodies are
+stored as native JSON objects, text bodies as strings, and binary bodies as base64.
+No manual encoding -- the Content-Type header determines the shape automatically.
+
 ## Core Types
 
-- Tape: recorded HTTP request/response pair (JSON-serializable)
+- Tape: recorded HTTP request/response pair (JSON-serializable, Content-Type-aware body marshaling)
+- MediaType: parsed media type with Type, Subtype, Suffix, Params, QValue fields
 - SSEEvent: a single Server-Sent Event with offset timing (OffsetMS, Type, Data, ID, Retry)
 - SSETimingMode: sealed interface controlling SSE replay timing (Realtime, Accelerated, Instant)
 - Recorder: http.RoundTripper that records traffic to a Store
@@ -21,6 +26,16 @@ with per-event timing metadata and replayed with configurable speed.
 - Pipeline: ordered chain of SanitizeFunc transformations (implements Sanitizer)
 - Store: persistence interface (MemoryStore, FileStore, or custom)
 - Matcher: request-to-tape matching (CompositeMatcher with scored criteria)
+
+## Fixture body shape (v0.12+)
+
+Body fields use Content-Type-aware serialization:
+- application/json, +json suffix: native JSON object/array
+- text/*, application/xml, application/javascript: JSON string
+- binary (image/*, application/octet-stream, etc.): base64-encoded string
+- nil/empty: null
+
+RecordedReq and RecordedResp implement json.Marshaler/json.Unmarshaler.
 
 ## Recording
 
@@ -86,14 +101,31 @@ replays cached SSE events using WithProxySSETiming (default: instant).
 ## Matching
 
 CompositeMatcher with scored criteria:
-- MethodCriterion (1), PathCriterion (2), HeadersCriterion (3), QueryParamsCriterion (4),
+- MethodCriterion (1), PathCriterion (2), HeadersCriterion (3),
+  ContentNegotiationCriterion (3-5), QueryParamsCriterion (4),
   BodyFuzzyCriterion (6), BodyHashCriterion (8), PathRegexCriterion (1), RouteCriterion (1)
+
+ContentNegotiationCriterion: RFC 7231 content negotiation. Matches request Accept
+header against tape response Content-Type. Score varies by specificity (exact=5,
+subtype wildcard=4, full wildcard=3). Enables multi-format fixtures at same path.
 
 ## Storage
 
 - MemoryStore: in-memory, for tests
 - FileStore: one JSON file per tape, atomic writes, WithDirectory option
 - Store interface: Save, Load, List, Delete
+
+## Media type utilities
+
+```go
+func ParseMediaType(s string) (MediaType, error)
+func ParseAccept(accept string) []MediaType
+func IsJSON(mt MediaType) bool
+func IsText(mt MediaType) bool
+func IsBinary(mt MediaType) bool
+func MatchesMediaRange(accept, contentType MediaType) bool
+func Specificity(mt MediaType) int
+```
 
 ## Mock DSL
 
@@ -107,12 +139,16 @@ defer srv.Close()
 ## CLI Commands
 
 ```
-httptape serve   --fixtures <dir> [--port 8081] [--cors] [--delay 200ms]
-httptape record  --upstream <url> --fixtures <dir> [--config redact.json]
-httptape proxy   --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
-httptape export  --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
-httptape import  --fixtures <dir> [--input file.tar.gz]
+httptape serve             --fixtures <dir> [--port 8081] [--cors] [--delay 200ms] [--config config.json]
+httptape record            --upstream <url> --fixtures <dir> [--config redact.json]
+httptape proxy             --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
+httptape export            --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
+httptape import            --fixtures <dir> [--input file.tar.gz]
+httptape migrate-fixtures  [--recursive] <dir>
 ```
+
+migrate-fixtures: converts v0.11 fixtures (base64 bodies, body_encoding field)
+to v0.12 format (Content-Type-driven body shape). Idempotent. Skips non-tape files.
 
 ## Docker
 
@@ -121,15 +157,21 @@ docker pull ghcr.io/vibewarden/httptape:latest
 # ~3 MB scratch image, runs as non-root (65534)
 ```
 
-## JSON Config (redaction rules)
+## JSON Config (redaction rules + matcher)
 
 ```json
-{"version":"1","rules":[
+{"version":"1",
+ "matcher":{"criteria":[
+   {"type":"method"},{"type":"path"},{"type":"content_negotiation"}
+ ]},
+ "rules":[
   {"action":"redact_headers","headers":["Authorization"]},
   {"action":"redact_body","paths":["$.password"]},
   {"action":"fake","seed":"s","paths":["$.email"]}
 ]}
 ```
+
+Matcher criterion types: method, path, body_fuzzy (requires paths), content_negotiation.
 
 ## How it compares
 
@@ -139,6 +181,7 @@ docker pull ghcr.io/vibewarden/httptape:latest
 | Redaction on write | **yes** | no | no | no |
 | Embeddable in Go | **yes** | no (Java) | yes | no (browser) |
 | Proxy with fallback | **yes** | no | no | no |
+| Content negotiation | **yes** | yes | no | no |
 
 ## Key APIs
 
@@ -154,6 +197,8 @@ func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)
 func ExportBundle(ctx, store, opts...) (io.Reader, error)
 func ImportBundle(ctx, store, reader) error
 func LoadConfigFile(path string) (*Config, error)
+func ParseMediaType(s string) (MediaType, error)
+func ParseAccept(accept string) []MediaType
 func SSETimingRealtime() SSETimingMode
 func SSETimingAccelerated(factor float64) SSETimingMode
 func SSETimingInstant() SSETimingMode

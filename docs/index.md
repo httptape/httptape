@@ -106,10 +106,10 @@ httptape proxy --upstream https://api.github.com --fixtures ./cache
 | [Replay](replay.md) | Server options, fallback behavior, request handling |
 | [Redaction](sanitization.md) | RedactHeaders, RedactBodyPaths, FakeFields, Pipeline |
 | [Proxy Mode](proxy.md) | L1/L2 caching, fallback behavior, frontend dev |
-| [Matching](matching.md) | All matchers, CompositeMatcher, score weights |
+| [Matching](matching.md) | All matchers, CompositeMatcher, score weights, declarative config |
 | [Storage](storage.md) | MemoryStore, FileStore, custom Store implementations |
 | [Import/Export](import-export.md) | ExportBundle, ImportBundle, selective filters |
-| [Config](config.md) | Declarative JSON configuration for redaction |
+| [Config](config.md) | Declarative JSON configuration for redaction and matcher composition |
 | [CLI](cli.md) | serve, record, proxy, export, import commands |
 | [Docker](docker.md) | Container usage, docker-compose, volumes |
 | [Testcontainers](testcontainers.md) | Go Testcontainers module for integration tests |

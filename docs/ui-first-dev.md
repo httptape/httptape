@@ -166,16 +166,12 @@ Your frontend needs `GET /api/notifications`, which does not have a fixture yet.
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "W3siaWQiOjEsIm1lc3NhZ2UiOiJXZWxjb21lISIsInJlYWQiOmZhbHNlfV0="
+    "body": [{"id": 1, "message": "Welcome!", "read": false}]
   }
 }
 ```
 
-The body decodes to:
-
-```json
-[{"id":1,"message":"Welcome!","read":false}]
-```
+The response body is native JSON -- no encoding needed (Content-Type is `application/json`).
 
 Save the file. Refresh the frontend. The notification badge appears.
 
@@ -198,7 +194,7 @@ Frontend loading states (spinners, skeletons, progress bars) are hard to test ag
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJ3aWRnZXRzIjpbXX0="
+    "body": {"widgets": []}
   },
   "metadata": {
     "delay": "2s"
@@ -255,7 +251,7 @@ Return a specific error for a specific endpoint:
     "headers": {
       "Content-Type": ["application/json"]
     },
-    "body": "eyJpZCI6MX0="
+    "body": {"id": 1}
   },
   "metadata": {
     "error": {
