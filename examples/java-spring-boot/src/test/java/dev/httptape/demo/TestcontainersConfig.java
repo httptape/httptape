@@ -1,8 +1,11 @@
 package dev.httptape.demo;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -49,31 +52,44 @@ class TestcontainersConfig {
         // mount each into the container's flat /fixtures dir. Httptape's
         // FileStore is flat (no recursive subdirectory scanning), so we
         // collapse subdirs (openai/, users/, ...) into one container-side dir.
-        // Filename collisions across subdirs would be ambiguous -- detect and
-        // fail fast at config time rather than silently overwriting.
+        // Filename collisions across subdirs would be ambiguous -- the toMap
+        // merge function fails fast at config time rather than silently
+        // overwriting.
         PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
-        Resource[] fixtures = resolver.getResources("classpath:fixtures/**/*.json");
-        Map<String, String> seen = new HashMap<>();
-        for (Resource fixture : fixtures) {
-            String filename = fixture.getFilename();
-            if (filename == null || filename.isBlank()) {
-                continue;
-            }
-            String previousPath = seen.put(filename, fixture.getURI().toString());
-            if (previousPath != null) {
-                throw new IllegalStateException(
-                        "Fixture filename collision in flat /fixtures mount: '" + filename
-                                + "' appears in both '" + previousPath
-                                + "' and '" + fixture.getURI() + "'. "
-                                + "Rename one (e.g., add a subject prefix) so filenames are unique across all subdirs."
-                );
-            }
-            container.withCopyFileToContainer(
-                    MountableFile.forHostPath(fixture.getFile().toPath()),
-                    "/fixtures/" + filename
-            );
-        }
+        Arrays.stream(resolver.getResources("classpath:fixtures/**/*.json"))
+                .filter(f -> f.getFilename() != null && !f.getFilename().isBlank())
+                .collect(Collectors.toMap(
+                        Resource::getFilename,
+                        Function.identity(),
+                        TestcontainersConfig::collide))
+                .forEach((name, fixture) -> container.withCopyFileToContainer(
+                        MountableFile.forHostPath(toPath(fixture)),
+                        "/fixtures/" + name));
+
         return container;
+    }
+
+    private static Resource collide(Resource a, Resource b) {
+        throw new IllegalStateException(
+                "Fixture filename collision in flat /fixtures mount: '" + a.getFilename()
+                        + "' appears in both '" + uri(a) + "' and '" + uri(b) + "'. "
+                        + "Rename one (e.g., add a subject prefix) so filenames are unique across all subdirs.");
+    }
+
+    private static String uri(Resource r) {
+        try {
+            return r.getURI().toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static Path toPath(Resource r) {
+        try {
+            return r.getFile().toPath();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**
