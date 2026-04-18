@@ -113,10 +113,79 @@ Example of a good comment:
 > Interfaces should be defined in `store.go` — this is the project convention for
 > keeping ports separate from implementations. Move the interface to `store.go`.
 
+## Scope: library code vs example code
+
+The checklists above (architecture, Go idioms, dependencies) apply to **library code** at the repo root (`*.go`, `cmd/httptape/*`, `testcontainers/`).
+
+**Example PRs** (`examples/<demo>/*`) follow a different ruleset — the stdlib-only rule does NOT apply (examples can use any reasonable framework / library), and the architecture is whatever fits the language ecosystem. Apply the language-aware idiom checks below based on the file extensions present in the diff.
+
+## Language-aware idiom checks (for `examples/` PRs)
+
+When reviewing a PR touching `examples/<demo>/`, apply the relevant language section. Flag idiom issues as actionable inline comments — readability/idiom improvements that catch common anti-patterns. Tag with `Idiom` so the dev can distinguish from blockers.
+
+### TypeScript / TSX
+
+- [ ] `const` over `let` where the binding doesn't change
+- [ ] No `any` — use `unknown` if truly unknown, `never` for unreachable
+- [ ] Optional chaining `?.` and nullish coalescing `??` over nested `&&`/`||`
+- [ ] React: `useEffect` dep arrays complete and accurate
+- [ ] React: callbacks passed to memoized children wrapped in `useCallback`
+- [ ] React: side effects responding to user events go in event handlers, not `useEffect`
+- [ ] TSX: list items have stable `key` props (NOT array index for dynamic lists)
+- [ ] No inline object/array literals as React props that recreate every render
+
+### Java
+
+- [ ] **Use Streams API + `Collectors.joining()` over manual `StringBuilder`** for string accumulation
+- [ ] `record` over POJO classes for immutable data carriers
+- [ ] `var` for obvious local types (Java 10+)
+- [ ] Switch expressions (Java 14+) over chained `if`/`else if` for value mapping
+- [ ] `Optional` over `null` returns for single non-collection values
+- [ ] `try-with-resources` for `AutoCloseable`
+- [ ] Prefer immutability — `final` fields, defensive copies for collections
+- [ ] Spring: constructor injection over field/setter injection
+- [ ] Spring: `@Bean` in `@Configuration` over `@Service`/`@Component` when the project uses explicit configuration (match existing pattern)
+- [ ] Spring: `@DynamicPropertySource` (test class) vs `DynamicPropertyRegistrar` bean (runtime) — pick the right tool
+
+### Kotlin
+
+- [ ] `data class` for value objects
+- [ ] `val` over `var` where binding doesn't change
+- [ ] `?.let { }` over manual null checks
+- [ ] Scope functions (`also`, `apply`, `let`, `with`, `run`) where they make code more readable — NOT chained for showmanship
+- [ ] `sealed class` / `sealed interface` for finite state hierarchies
+- [ ] Extension functions over utility classes
+- [ ] String templates (`"value is $x"`) over concatenation
+- [ ] `when` expressions over chained `if`/`else if`
+
+### Python
+
+- [ ] Type hints on all function signatures (PEP 484)
+- [ ] f-strings over `.format()` or `%` formatting
+- [ ] `dataclasses` (or `pydantic` for validation) for data models
+- [ ] Context managers (`with`) for resources
+- [ ] List/dict/set comprehensions over manual loops where the result fits on one or two lines
+- [ ] pytest: fixtures over setUp/tearDown; `parametrize` for table-driven tests
+- [ ] No bare `except:` — catch specific exceptions
+- [ ] `pathlib.Path` over `os.path` string manipulation
+
+### Go (in `examples/`)
+
+The library Go rules above mostly apply. Notable difference: examples may have `go.mod` with third-party dependencies — that's fine. The stdlib-only rule is library-only.
+
+### Idiom comment style
+
+Frame idiom issues as recommendations, not defects. Example:
+
+> **Idiom — readability**: `StringBuilder` works but the canonical Java 8+ form is `stream.collect(Collectors.joining())`. Same performance (`StringJoiner` uses `StringBuilder` internally), one-line, declarative. Optional but recommended.
+
+Idiom comments are **non-blocking** unless they accumulate into a pattern (e.g., the entire file ignores Streams API in favor of imperative loops — that becomes a blocker because it's stylistically out of place in modern Java).
+
 ## What you must NOT do
 
 - Do not approve a PR with architecture violations
 - Do not approve a PR with missing tests
-- Do not approve a PR that adds external dependencies without an ADR
+- Do not approve a PR that adds external dependencies without an ADR (LIBRARY code only — examples can pull whatever)
 - Do not be vague — every comment must be actionable
 - Do not re-review things the human already approved in a previous cycle
+- Do not block a PR on idiom comments alone — flag them, recommend the fix, but approve if functionally correct (unless idiom violations are pervasive)
