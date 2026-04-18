@@ -43,7 +43,7 @@ httptape.WithRoute("users-api")
 Labels all tapes produced by this recorder with a route name. Routes are used for:
 - Logical grouping of fixtures
 - Filtering during [export](import-export.md)
-- Scoped matching with [MatchRoute](matching.md#matchroute)
+- Scoped matching with [RouteCriterion](matching.md#routecriterion)
 
 ### WithSanitizer
 

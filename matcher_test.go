@@ -14,7 +14,7 @@ import (
 // --- Individual criterion tests ---
 
 func TestMatchMethod(t *testing.T) {
-	criterion := MatchMethod()
+	criterion := MethodCriterion{}
 
 	tests := []struct {
 		name       string
@@ -33,16 +33,16 @@ func TestMatchMethod(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.reqMethod, "/test", nil)
 			tape := Tape{Request: RecordedReq{Method: tt.tapeMethod}}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.wantScore {
-				t.Errorf("MatchMethod() = %d, want %d", got, tt.wantScore)
+				t.Errorf("MethodCriterion.Score() = %d, want %d", got, tt.wantScore)
 			}
 		})
 	}
 }
 
 func TestMatchPath(t *testing.T) {
-	criterion := MatchPath()
+	criterion := PathCriterion{}
 
 	tests := []struct {
 		name      string
@@ -63,21 +63,21 @@ func TestMatchPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.reqPath, nil)
 			tape := Tape{Request: RecordedReq{URL: tt.tapeURL}}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.wantScore {
-				t.Errorf("MatchPath() = %d, want %d", got, tt.wantScore)
+				t.Errorf("PathCriterion.Score() = %d, want %d", got, tt.wantScore)
 			}
 		})
 	}
 }
 
 func TestMatchPath_UnparsableURL(t *testing.T) {
-	criterion := MatchPath()
+	criterion := PathCriterion{}
 	req := httptest.NewRequest("GET", "/users", nil)
 	tape := Tape{Request: RecordedReq{URL: "://not-a-url"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchPath() with unparsable URL = %d, want 0", got)
+		t.Errorf("PathCriterion.Score() with unparsable URL = %d, want 0", got)
 	}
 }
 
@@ -95,19 +95,19 @@ func TestMatchRoute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			criterion := MatchRoute(tt.route)
+			criterion := RouteCriterion{Route: tt.route}
 			req := httptest.NewRequest("GET", "/test", nil)
 			tape := Tape{Route: tt.tapeRoute}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.wantScore {
-				t.Errorf("MatchRoute(%q) = %d, want %d", tt.route, got, tt.wantScore)
+				t.Errorf("RouteCriterion{Route: %q}.Score() = %d, want %d", tt.route, got, tt.wantScore)
 			}
 		})
 	}
 }
 
 func TestMatchRoute_EmptyFilter(t *testing.T) {
-	criterion := MatchRoute("")
+	criterion := RouteCriterion{Route: ""}
 	req := httptest.NewRequest("GET", "/test", nil)
 
 	tests := []struct {
@@ -122,16 +122,16 @@ func TestMatchRoute_EmptyFilter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tape := Tape{Route: tt.tapeRoute}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != 1 {
-				t.Errorf("MatchRoute(\"\") with tape route %q = %d, want 1", tt.tapeRoute, got)
+				t.Errorf("RouteCriterion{Route: \"\"}.Score() with tape route %q = %d, want 1", tt.tapeRoute, got)
 			}
 		})
 	}
 }
 
 func TestMatchQueryParams(t *testing.T) {
-	criterion := MatchQueryParams()
+	criterion := QueryParamsCriterion{}
 
 	tests := []struct {
 		name      string
@@ -163,102 +163,102 @@ func TestMatchQueryParams(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", tt.reqURL, nil)
 			tape := Tape{Request: RecordedReq{URL: tt.tapeURL}}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.wantScore {
-				t.Errorf("MatchQueryParams() = %d, want %d", got, tt.wantScore)
+				t.Errorf("QueryParamsCriterion.Score() = %d, want %d", got, tt.wantScore)
 			}
 		})
 	}
 }
 
 func TestMatchQueryParams_NoRequestParams(t *testing.T) {
-	criterion := MatchQueryParams()
+	criterion := QueryParamsCriterion{}
 	req := httptest.NewRequest("GET", "/users", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users?page=1"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 4 {
-		t.Errorf("MatchQueryParams() with no request params = %d, want 4", got)
+		t.Errorf("QueryParamsCriterion.Score() with no request params = %d, want 4", got)
 	}
 }
 
 func TestMatchQueryParams_Missing(t *testing.T) {
-	criterion := MatchQueryParams()
+	criterion := QueryParamsCriterion{}
 	req := httptest.NewRequest("GET", "/users?page=1&sort=asc", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users?page=1"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchQueryParams() with missing tape param = %d, want 0", got)
+		t.Errorf("QueryParamsCriterion.Score() with missing tape param = %d, want 0", got)
 	}
 }
 
 func TestMatchQueryParams_UnparsableURL(t *testing.T) {
-	criterion := MatchQueryParams()
+	criterion := QueryParamsCriterion{}
 	req := httptest.NewRequest("GET", "/users?page=1", nil)
 	tape := Tape{Request: RecordedReq{URL: "://not-a-url"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchQueryParams() with unparsable URL = %d, want 0", got)
+		t.Errorf("QueryParamsCriterion.Score() with unparsable URL = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyHash_Match(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	body := []byte("hello world")
 	hash := BodyHashFromBytes(body)
 
 	req := httptest.NewRequest("POST", "/test", bytes.NewReader(body))
 	tape := Tape{Request: RecordedReq{BodyHash: hash}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 8 {
-		t.Errorf("MatchBodyHash() = %d, want 8", got)
+		t.Errorf("BodyHashCriterion.Score() = %d, want 8", got)
 	}
 }
 
 func TestMatchBodyHash_Mismatch(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	reqBody := []byte("hello world")
 	tapeHash := BodyHashFromBytes([]byte("different body"))
 
 	req := httptest.NewRequest("POST", "/test", bytes.NewReader(reqBody))
 	tape := Tape{Request: RecordedReq{BodyHash: tapeHash}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyHash() = %d, want 0", got)
+		t.Errorf("BodyHashCriterion.Score() = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyHash_BothEmpty(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	req := httptest.NewRequest("GET", "/test", nil)
 	tape := Tape{Request: RecordedReq{BodyHash: ""}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 8 {
-		t.Errorf("MatchBodyHash() both empty = %d, want 8", got)
+		t.Errorf("BodyHashCriterion.Score() both empty = %d, want 8", got)
 	}
 }
 
 func TestMatchBodyHash_RequestEmpty_TapeNot(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	req := httptest.NewRequest("GET", "/test", nil)
 	tape := Tape{Request: RecordedReq{BodyHash: "abc123"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyHash() request empty, tape not = %d, want 0", got)
+		t.Errorf("BodyHashCriterion.Score() request empty, tape not = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyHash_RequestNotEmpty_TapeEmpty(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	req := httptest.NewRequest("POST", "/test", strings.NewReader("some body"))
 	tape := Tape{Request: RecordedReq{BodyHash: ""}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyHash() request not empty, tape empty = %d, want 0", got)
+		t.Errorf("BodyHashCriterion.Score() request not empty, tape empty = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyHash_BodyRestored(t *testing.T) {
-	criterion := MatchBodyHash()
+	criterion := BodyHashCriterion{}
 	body := []byte("hello world")
 	hash := BodyHashFromBytes(body)
 
@@ -266,9 +266,9 @@ func TestMatchBodyHash_BodyRestored(t *testing.T) {
 	tape := Tape{Request: RecordedReq{BodyHash: hash}}
 
 	// First call should match.
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 8 {
-		t.Fatalf("MatchBodyHash() first call = %d, want 8", got)
+		t.Fatalf("BodyHashCriterion.Score() first call = %d, want 8", got)
 	}
 
 	// Body should still be readable after criterion runs.
@@ -281,10 +281,10 @@ func TestMatchBodyHash_BodyRestored(t *testing.T) {
 	}
 }
 
-// --- MatchHeaders tests ---
+// --- HeadersCriterion tests ---
 
 func TestMatchHeaders_SingleHeader(t *testing.T) {
-	criterion := MatchHeaders("Content-Type", "application/json")
+	criterion := HeadersCriterion{Key: "Content-Type", Value: "application/json"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Content-Type", "application/json")
@@ -294,9 +294,9 @@ func TestMatchHeaders_SingleHeader(t *testing.T) {
 		Headers: http.Header{"Content-Type": {"application/json"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 3 {
-		t.Errorf("MatchHeaders() = %d, want 3", got)
+		t.Errorf("HeadersCriterion.Score() = %d, want 3", got)
 	}
 }
 
@@ -313,7 +313,7 @@ func TestMatchHeaders_CaseInsensitiveName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			criterion := MatchHeaders(tt.key, "application/json")
+			criterion := HeadersCriterion{Key: tt.key, Value: "application/json"}
 
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.Header.Set("Content-Type", "application/json")
@@ -321,16 +321,16 @@ func TestMatchHeaders_CaseInsensitiveName(t *testing.T) {
 				Headers: http.Header{"Content-Type": {"application/json"}},
 			}}
 
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != 3 {
-				t.Errorf("MatchHeaders(%q, ...) = %d, want 3", tt.key, got)
+				t.Errorf("HeadersCriterion{Key: %q}.Score() = %d, want 3", tt.key, got)
 			}
 		})
 	}
 }
 
 func TestMatchHeaders_CaseSensitiveValue(t *testing.T) {
-	criterion := MatchHeaders("Accept", "Application/JSON")
+	criterion := HeadersCriterion{Key: "Accept", Value: "Application/JSON"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Accept", "application/json")
@@ -338,14 +338,14 @@ func TestMatchHeaders_CaseSensitiveValue(t *testing.T) {
 		Headers: http.Header{"Accept": {"application/json"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() with case mismatch value = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() with case mismatch value = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_HeaderNotInRequest(t *testing.T) {
-	criterion := MatchHeaders("X-Custom", "value")
+	criterion := HeadersCriterion{Key: "X-Custom", Value: "value"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	// No X-Custom header set on request.
@@ -353,14 +353,14 @@ func TestMatchHeaders_HeaderNotInRequest(t *testing.T) {
 		Headers: http.Header{"X-Custom": {"value"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() header not in request = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() header not in request = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_HeaderNotInTape(t *testing.T) {
-	criterion := MatchHeaders("X-Custom", "value")
+	criterion := HeadersCriterion{Key: "X-Custom", Value: "value"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("X-Custom", "value")
@@ -368,14 +368,14 @@ func TestMatchHeaders_HeaderNotInTape(t *testing.T) {
 		Headers: http.Header{},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() header not in tape = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() header not in tape = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_WrongValueInRequest(t *testing.T) {
-	criterion := MatchHeaders("Accept", "application/xml")
+	criterion := HeadersCriterion{Key: "Accept", Value: "application/xml"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Accept", "application/json")
@@ -383,14 +383,14 @@ func TestMatchHeaders_WrongValueInRequest(t *testing.T) {
 		Headers: http.Header{"Accept": {"application/xml"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() wrong value in request = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() wrong value in request = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_WrongValueInTape(t *testing.T) {
-	criterion := MatchHeaders("Accept", "application/xml")
+	criterion := HeadersCriterion{Key: "Accept", Value: "application/xml"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Accept", "application/xml")
@@ -398,14 +398,14 @@ func TestMatchHeaders_WrongValueInTape(t *testing.T) {
 		Headers: http.Header{"Accept": {"application/json"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() wrong value in tape = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() wrong value in tape = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_MultiValuedHeader_AnyOf(t *testing.T) {
-	criterion := MatchHeaders("Accept", "application/json")
+	criterion := HeadersCriterion{Key: "Accept", Value: "application/json"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Add("Accept", "text/html")
@@ -414,14 +414,14 @@ func TestMatchHeaders_MultiValuedHeader_AnyOf(t *testing.T) {
 		Headers: http.Header{"Accept": {"text/html", "application/json"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 3 {
-		t.Errorf("MatchHeaders() multi-valued any-of = %d, want 3", got)
+		t.Errorf("HeadersCriterion.Score() multi-valued any-of = %d, want 3", got)
 	}
 }
 
 func TestMatchHeaders_MultiValuedHeader_NotPresent(t *testing.T) {
-	criterion := MatchHeaders("Accept", "application/xml")
+	criterion := HeadersCriterion{Key: "Accept", Value: "application/xml"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Add("Accept", "text/html")
@@ -430,31 +430,31 @@ func TestMatchHeaders_MultiValuedHeader_NotPresent(t *testing.T) {
 		Headers: http.Header{"Accept": {"text/html", "application/json"}},
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() multi-valued not present = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() multi-valued not present = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_NilTapeHeaders(t *testing.T) {
-	criterion := MatchHeaders("X-Custom", "value")
+	criterion := HeadersCriterion{Key: "X-Custom", Value: "value"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("X-Custom", "value")
 	tape := Tape{Request: RecordedReq{}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchHeaders() nil tape headers = %d, want 0", got)
+		t.Errorf("HeadersCriterion.Score() nil tape headers = %d, want 0", got)
 	}
 }
 
 func TestMatchHeaders_MultipleCriteria_AND(t *testing.T) {
 	m := NewCompositeMatcher(
-		MatchMethod(),
-		MatchPath(),
-		MatchHeaders("Accept", "application/json"),
-		MatchHeaders("X-Api-Version", "v2"),
+		MethodCriterion{},
+		PathCriterion{},
+		HeadersCriterion{Key: "Accept", Value: "application/json"},
+		HeadersCriterion{Key: "X-Api-Version", Value: "v2"},
 	)
 
 	candidates := []Tape{
@@ -499,8 +499,8 @@ func TestMatchHeaders_MultipleCriteria_AND(t *testing.T) {
 
 func TestMatchHeaders_ScoreStacking(t *testing.T) {
 	// Two header criteria should contribute 6 total (3 + 3).
-	c1 := MatchHeaders("Accept", "application/json")
-	c2 := MatchHeaders("X-Api-Version", "v2")
+	c1 := HeadersCriterion{Key: "Accept", Value: "application/json"}
+	c2 := HeadersCriterion{Key: "X-Api-Version", Value: "v2"}
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.Header.Set("Accept", "application/json")
@@ -512,8 +512,8 @@ func TestMatchHeaders_ScoreStacking(t *testing.T) {
 		},
 	}}
 
-	s1 := c1(req, tape)
-	s2 := c2(req, tape)
+	s1 := c1.Score(req, tape)
+	s2 := c2.Score(req, tape)
 	if s1+s2 != 6 {
 		t.Errorf("stacked header scores = %d, want 6", s1+s2)
 	}
@@ -602,7 +602,7 @@ func TestCompositeMatcher_Priority(t *testing.T) {
 	body := []byte("request body")
 	hash := BodyHashFromBytes(body)
 
-	m := NewCompositeMatcher(MatchMethod(), MatchPath(), MatchBodyHash())
+	m := NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, BodyHashCriterion{})
 
 	candidates := []Tape{
 		{
@@ -646,13 +646,13 @@ func TestCompositeMatcher_StableOrdering(t *testing.T) {
 
 func TestCompositeMatcher_ShortCircuit(t *testing.T) {
 	called := false
-	trackingCriterion := MatchCriterion(func(_ *http.Request, _ Tape) int {
+	trackingCriterion := CriterionFunc(func(_ *http.Request, _ Tape) int {
 		called = true
 		return 1
 	})
 
 	// Put a criterion that always returns 0 first, then a tracking one.
-	alwaysFail := MatchCriterion(func(_ *http.Request, _ Tape) int { return 0 })
+	alwaysFail := CriterionFunc(func(_ *http.Request, _ Tape) int { return 0 })
 	m := NewCompositeMatcher(alwaysFail, trackingCriterion)
 
 	req := httptest.NewRequest("GET", "/users", nil)
@@ -669,11 +669,11 @@ func TestCompositeMatcher_FullComposition(t *testing.T) {
 	hash := BodyHashFromBytes(body)
 
 	m := NewCompositeMatcher(
-		MatchMethod(),
-		MatchPath(),
-		MatchRoute("users-api"),
-		MatchQueryParams(),
-		MatchBodyHash(),
+		MethodCriterion{},
+		PathCriterion{},
+		RouteCriterion{Route: "users-api"},
+		QueryParamsCriterion{},
+		BodyHashCriterion{},
 	)
 
 	candidates := []Tape{
@@ -806,66 +806,66 @@ func TestStringSlicesEqual(t *testing.T) {
 	}
 }
 
-// --- MatchPathRegex tests ---
+// --- PathRegexCriterion tests ---
 
 func TestMatchPathRegex_Match(t *testing.T) {
-	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	criterion, err := NewPathRegexCriterion(`^/users/\d+/orders$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/users/456/orders", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users/123/orders"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 1 {
-		t.Errorf("MatchPathRegex() = %d, want 1", got)
+		t.Errorf("PathRegexCriterion.Score() = %d, want 1", got)
 	}
 }
 
 func TestMatchPathRegex_RequestNoMatch(t *testing.T) {
-	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	criterion, err := NewPathRegexCriterion(`^/users/\d+/orders$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/products/1", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/users/123/orders"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchPathRegex() = %d, want 0", got)
+		t.Errorf("PathRegexCriterion.Score() = %d, want 0", got)
 	}
 }
 
 func TestMatchPathRegex_TapeNoMatch(t *testing.T) {
-	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	criterion, err := NewPathRegexCriterion(`^/users/\d+/orders$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/users/456/orders", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/products/42"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchPathRegex() = %d, want 0", got)
+		t.Errorf("PathRegexCriterion.Score() = %d, want 0", got)
 	}
 }
 
 func TestMatchPathRegex_UnparsableTapeURL(t *testing.T) {
-	criterion, err := MatchPathRegex(`^/users/\d+$`)
+	criterion, err := NewPathRegexCriterion(`^/users/\d+$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/users/123", nil)
 	tape := Tape{Request: RecordedReq{URL: "://not-a-url"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchPathRegex() with unparsable URL = %d, want 0", got)
+		t.Errorf("PathRegexCriterion.Score() with unparsable URL = %d, want 0", got)
 	}
 }
 
 func TestMatchPathRegex_InvalidPattern(t *testing.T) {
-	criterion, err := MatchPathRegex("[invalid")
+	criterion, err := NewPathRegexCriterion("[invalid")
 	if err == nil {
 		t.Fatal("expected error for invalid regex pattern")
 	}
@@ -875,16 +875,16 @@ func TestMatchPathRegex_InvalidPattern(t *testing.T) {
 }
 
 func TestMatchPathRegex_BroadPattern(t *testing.T) {
-	criterion, err := MatchPathRegex(`.*`)
+	criterion, err := NewPathRegexCriterion(`.*`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/anything/at/all", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/something/else"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 1 {
-		t.Errorf("MatchPathRegex(\".*\") = %d, want 1", got)
+		t.Errorf("PathRegexCriterion.Score(\".*\") = %d, want 1", got)
 	}
 }
 
@@ -921,41 +921,41 @@ func TestMatchPathRegex_AnchoredPattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			criterion, err := MatchPathRegex(tt.pattern)
+			criterion, err := NewPathRegexCriterion(tt.pattern)
 			if err != nil {
-				t.Fatalf("MatchPathRegex(%q) error = %v", tt.pattern, err)
+				t.Fatalf("NewPathRegexCriterion(%q) error = %v", tt.pattern, err)
 			}
 			req := httptest.NewRequest("GET", tt.reqPath, nil)
 			tape := Tape{Request: RecordedReq{URL: tt.tapeURL}}
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.wantScore {
-				t.Errorf("MatchPathRegex(%q) = %d, want %d", tt.pattern, got, tt.wantScore)
+				t.Errorf("PathRegexCriterion.Score(%q) = %d, want %d", tt.pattern, got, tt.wantScore)
 			}
 		})
 	}
 }
 
 func TestMatchPathRegex_EmptyPattern(t *testing.T) {
-	criterion, err := MatchPathRegex("")
+	criterion, err := NewPathRegexCriterion("")
 	if err != nil {
-		t.Fatalf("MatchPathRegex(\"\") error = %v", err)
+		t.Fatalf("NewPathRegexCriterion(\"\") error = %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/anything", nil)
 	tape := Tape{Request: RecordedReq{URL: "https://api.example.com/whatever"}}
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 1 {
-		t.Errorf("MatchPathRegex(\"\") = %d, want 1", got)
+		t.Errorf("PathRegexCriterion.Score(\"\") = %d, want 1", got)
 	}
 }
 
 func TestCompositeMatcher_RegexPath(t *testing.T) {
-	criterion, err := MatchPathRegex(`^/users/\d+/orders$`)
+	criterion, err := NewPathRegexCriterion(`^/users/\d+/orders$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
 
-	m := NewCompositeMatcher(MatchMethod(), criterion)
+	m := NewCompositeMatcher(MethodCriterion{}, criterion)
 
 	candidates := []Tape{
 		{ID: "user-orders", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/users/123/orders"}},
@@ -974,15 +974,15 @@ func TestCompositeMatcher_RegexPath(t *testing.T) {
 }
 
 func TestCompositeMatcher_ExactBeatsRegex(t *testing.T) {
-	// Exact matcher: MatchMethod (1) + MatchPath (2) = 3
-	exactMatcher := NewCompositeMatcher(MatchMethod(), MatchPath())
+	// Exact matcher: MethodCriterion (1) + PathCriterion (2) = 3
+	exactMatcher := NewCompositeMatcher(MethodCriterion{}, PathCriterion{})
 
-	// Regex matcher: MatchMethod (1) + MatchPathRegex (1) = 2
-	regexCriterion, err := MatchPathRegex(`^/users/\d+$`)
+	// Regex matcher: MethodCriterion (1) + PathRegexCriterion (1) = 2
+	regexCriterion, err := NewPathRegexCriterion(`^/users/\d+$`)
 	if err != nil {
-		t.Fatalf("MatchPathRegex() error = %v", err)
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
 	}
-	regexMatcher := NewCompositeMatcher(MatchMethod(), regexCriterion)
+	regexMatcher := NewCompositeMatcher(MethodCriterion{}, regexCriterion)
 
 	candidates := []Tape{
 		{ID: "user-123", Request: RecordedReq{Method: "GET", URL: "https://api.example.com/users/123"}},
@@ -1006,18 +1006,18 @@ func TestCompositeMatcher_ExactBeatsRegex(t *testing.T) {
 	}
 
 	// Verify scores directly by running criteria.
-	exactPathScore := MatchPath()(req, candidates[0])
-	regexPathScore := regexCriterion(req, candidates[0])
+	exactPathScore := PathCriterion{}.Score(req, candidates[0])
+	regexPathScore := regexCriterion.Score(req, candidates[0])
 	if exactPathScore <= regexPathScore {
-		t.Errorf("MatchPath score (%d) should be greater than MatchPathRegex score (%d)",
+		t.Errorf("PathCriterion score (%d) should be greater than PathRegexCriterion score (%d)",
 			exactPathScore, regexPathScore)
 	}
 }
 
-// --- MatchBodyFuzzy tests ---
+// --- BodyFuzzyCriterion tests ---
 
 func TestMatchBodyFuzzy_SingleField(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create","timestamp":"2026-01-01T00:00:00Z"}`))
@@ -1025,14 +1025,14 @@ func TestMatchBodyFuzzy_SingleField(t *testing.T) {
 		Body: []byte(`{"action":"create","timestamp":"2025-06-15T12:00:00Z"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_MultipleFields(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action", "$.user")
+	criterion := NewBodyFuzzyCriterion("$.action", "$.user")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create","user":"alice","nonce":"abc123"}`))
@@ -1040,14 +1040,14 @@ func TestMatchBodyFuzzy_MultipleFields(t *testing.T) {
 		Body: []byte(`{"action":"create","user":"alice","nonce":"xyz789"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_NestedField(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.user.id")
+	criterion := NewBodyFuzzyCriterion("$.user.id")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"user":{"id":42,"session":"s1"}}`))
@@ -1055,14 +1055,14 @@ func TestMatchBodyFuzzy_NestedField(t *testing.T) {
 		Body: []byte(`{"user":{"id":42,"session":"s2"}}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() nested = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() nested = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_ArrayWildcard(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.items[*].sku")
+	criterion := NewBodyFuzzyCriterion("$.items[*].sku")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"items":[{"sku":"A1","qty":5},{"sku":"B2","qty":3}]}`))
@@ -1070,14 +1070,14 @@ func TestMatchBodyFuzzy_ArrayWildcard(t *testing.T) {
 		Body: []byte(`{"items":[{"sku":"A1","qty":10},{"sku":"B2","qty":7}]}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() array wildcard = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() array wildcard = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_FieldValueDiffers(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1085,14 +1085,14 @@ func TestMatchBodyFuzzy_FieldValueDiffers(t *testing.T) {
 		Body: []byte(`{"action":"delete"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() mismatch = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() mismatch = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_NonJSONRequestBody(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader("not json"))
@@ -1100,14 +1100,14 @@ func TestMatchBodyFuzzy_NonJSONRequestBody(t *testing.T) {
 		Body: []byte(`{"action":"create"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() non-JSON request = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() non-JSON request = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_NonJSONTapeBody(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1115,14 +1115,14 @@ func TestMatchBodyFuzzy_NonJSONTapeBody(t *testing.T) {
 		Body: []byte("not json"),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() non-JSON tape = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() non-JSON tape = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_EmptyPaths(t *testing.T) {
-	criterion := MatchBodyFuzzy()
+	criterion := NewBodyFuzzyCriterion()
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1130,14 +1130,14 @@ func TestMatchBodyFuzzy_EmptyPaths(t *testing.T) {
 		Body: []byte(`{"action":"create"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() empty paths = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() empty paths = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_PathInRequestNotInTape(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action", "$.extra")
+	criterion := NewBodyFuzzyCriterion("$.action", "$.extra")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create","extra":"value"}`))
@@ -1146,14 +1146,14 @@ func TestMatchBodyFuzzy_PathInRequestNotInTape(t *testing.T) {
 	}}
 
 	// "extra" is skipped (not in tape), "action" matches => score 6
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() path in req not tape = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() path in req not tape = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_PathInTapeNotInRequest(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action", "$.extra")
+	criterion := NewBodyFuzzyCriterion("$.action", "$.extra")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1162,26 +1162,26 @@ func TestMatchBodyFuzzy_PathInTapeNotInRequest(t *testing.T) {
 	}}
 
 	// "extra" is skipped (not in request), "action" matches => score 6
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() path in tape not req = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() path in tape not req = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_BothBodiesEmpty(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	req := httptest.NewRequest("POST", "/test", nil)
 	tape := Tape{Request: RecordedReq{Body: nil}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 1 {
-		t.Errorf("MatchBodyFuzzy() both empty = %d, want 1", got)
+		t.Errorf("BodyFuzzyCriterion.Score() both empty = %d, want 1", got)
 	}
 }
 
 func TestMatchBodyFuzzy_VacuousTrue(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	tests := []struct {
 		name     string
@@ -1278,9 +1278,9 @@ func TestMatchBodyFuzzy_VacuousTrue(t *testing.T) {
 			req := httptest.NewRequest("POST", "/test", body)
 			tape := Tape{Request: RecordedReq{Body: tt.tapeBody}}
 
-			got := criterion(req, tape)
+			got := criterion.Score(req, tape)
 			if got != tt.want {
-				t.Errorf("MatchBodyFuzzy() = %d, want %d", got, tt.want)
+				t.Errorf("BodyFuzzyCriterion.Score() = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -1288,13 +1288,13 @@ func TestMatchBodyFuzzy_VacuousTrue(t *testing.T) {
 
 func TestMatchBodyFuzzy_VacuousTrueComposability(t *testing.T) {
 	// Integration test: validates the real user story from issue #178.
-	// A CompositeMatcher with MatchMethod, MatchPath, and MatchBodyFuzzy
+	// A CompositeMatcher with MethodCriterion, PathCriterion, and BodyFuzzyCriterion
 	// must correctly match a body-less GET request against a body-less
-	// GET tape, without MatchBodyFuzzy eliminating the candidate via score 0.
+	// GET tape, without BodyFuzzyCriterion eliminating the candidate via score 0.
 	matcher := NewCompositeMatcher(
-		MatchMethod(),
-		MatchPath(),
-		MatchBodyFuzzy("$.action"),
+		MethodCriterion{},
+		PathCriterion{},
+		NewBodyFuzzyCriterion("$.action"),
 	)
 
 	// Candidate tapes: one body-less GET and one bodied POST.
@@ -1330,7 +1330,7 @@ func TestMatchBodyFuzzy_VacuousTrueComposability(t *testing.T) {
 
 func TestMatchBodyFuzzy_InvalidPaths(t *testing.T) {
 	// All paths invalid => parsed list is empty => returns 0
-	criterion := MatchBodyFuzzy("not-a-path", "also-bad")
+	criterion := NewBodyFuzzyCriterion("not-a-path", "also-bad")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1338,15 +1338,15 @@ func TestMatchBodyFuzzy_InvalidPaths(t *testing.T) {
 		Body: []byte(`{"action":"create"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() invalid paths = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() invalid paths = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_AllPathsMissing(t *testing.T) {
 	// Valid paths but none exist in either body => matched=0 => returns 0
-	criterion := MatchBodyFuzzy("$.nonexistent")
+	criterion := NewBodyFuzzyCriterion("$.nonexistent")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"action":"create"}`))
@@ -1354,14 +1354,14 @@ func TestMatchBodyFuzzy_AllPathsMissing(t *testing.T) {
 		Body: []byte(`{"action":"create"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() all paths missing = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() all paths missing = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_BodyRestored(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.action")
+	criterion := NewBodyFuzzyCriterion("$.action")
 
 	body := `{"action":"create"}`
 	req := httptest.NewRequest("POST", "/test", strings.NewReader(body))
@@ -1369,7 +1369,7 @@ func TestMatchBodyFuzzy_BodyRestored(t *testing.T) {
 		Body: []byte(`{"action":"create"}`),
 	}}
 
-	criterion(req, tape)
+	criterion.Score(req, tape)
 
 	// Body should be restored for subsequent reads.
 	restored, err := io.ReadAll(req.Body)
@@ -1382,7 +1382,7 @@ func TestMatchBodyFuzzy_BodyRestored(t *testing.T) {
 }
 
 func TestMatchBodyFuzzy_DeepNestedObject(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.a.b.c")
+	criterion := NewBodyFuzzyCriterion("$.a.b.c")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"a":{"b":{"c":"deep"}}}`))
@@ -1390,14 +1390,14 @@ func TestMatchBodyFuzzy_DeepNestedObject(t *testing.T) {
 		Body: []byte(`{"a":{"b":{"c":"deep"}}}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() deep nested = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() deep nested = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_NumericValue(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.count")
+	criterion := NewBodyFuzzyCriterion("$.count")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"count":42}`))
@@ -1405,14 +1405,14 @@ func TestMatchBodyFuzzy_NumericValue(t *testing.T) {
 		Body: []byte(`{"count":42}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() numeric = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() numeric = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_BooleanValue(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.active")
+	criterion := NewBodyFuzzyCriterion("$.active")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"active":true}`))
@@ -1420,14 +1420,14 @@ func TestMatchBodyFuzzy_BooleanValue(t *testing.T) {
 		Body: []byte(`{"active":true}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() boolean = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() boolean = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_NullValue(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.data")
+	criterion := NewBodyFuzzyCriterion("$.data")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"data":null}`))
@@ -1435,15 +1435,15 @@ func TestMatchBodyFuzzy_NullValue(t *testing.T) {
 		Body: []byte(`{"data":null}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() null = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() null = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_ObjectValue(t *testing.T) {
 	// Comparing an entire nested object
-	criterion := MatchBodyFuzzy("$.config")
+	criterion := NewBodyFuzzyCriterion("$.config")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"config":{"retries":3,"timeout":30},"id":"abc"}`))
@@ -1451,14 +1451,14 @@ func TestMatchBodyFuzzy_ObjectValue(t *testing.T) {
 		Body: []byte(`{"config":{"retries":3,"timeout":30},"id":"xyz"}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 6 {
-		t.Errorf("MatchBodyFuzzy() object value = %d, want 6", got)
+		t.Errorf("BodyFuzzyCriterion.Score() object value = %d, want 6", got)
 	}
 }
 
 func TestMatchBodyFuzzy_ArrayWildcard_DifferentValues(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.items[*].sku")
+	criterion := NewBodyFuzzyCriterion("$.items[*].sku")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`))
@@ -1466,14 +1466,14 @@ func TestMatchBodyFuzzy_ArrayWildcard_DifferentValues(t *testing.T) {
 		Body: []byte(`{"items":[{"sku":"A1"},{"sku":"C3"}]}`),
 	}}
 
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() array wildcard mismatch = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() array wildcard mismatch = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_ArrayWildcard_DifferentLengths(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.items[*].sku")
+	criterion := NewBodyFuzzyCriterion("$.items[*].sku")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"items":[{"sku":"A1"},{"sku":"B2"}]}`))
@@ -1482,17 +1482,17 @@ func TestMatchBodyFuzzy_ArrayWildcard_DifferentLengths(t *testing.T) {
 	}}
 
 	// Different array lengths produce different collected slices
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() array different lengths = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() array different lengths = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_Composability(t *testing.T) {
 	m := NewCompositeMatcher(
-		MatchMethod(),
-		MatchPath(),
-		MatchBodyFuzzy("$.action"),
+		MethodCriterion{},
+		PathCriterion{},
+		NewBodyFuzzyCriterion("$.action"),
 	)
 
 	candidates := []Tape{
@@ -1526,7 +1526,7 @@ func TestMatchBodyFuzzy_Composability(t *testing.T) {
 }
 
 func TestMatchBodyFuzzy_WildcardNotArray(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.items[*].sku")
+	criterion := NewBodyFuzzyCriterion("$.items[*].sku")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"items":"not-an-array"}`))
@@ -1535,14 +1535,14 @@ func TestMatchBodyFuzzy_WildcardNotArray(t *testing.T) {
 	}}
 
 	// items is not an array, so path extraction fails => skipped => matched=0 => 0
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() wildcard not array = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() wildcard not array = %d, want 0", got)
 	}
 }
 
 func TestMatchBodyFuzzy_WildcardMissingFieldInElement(t *testing.T) {
-	criterion := MatchBodyFuzzy("$.items[*].sku")
+	criterion := NewBodyFuzzyCriterion("$.items[*].sku")
 
 	req := httptest.NewRequest("POST", "/test",
 		strings.NewReader(`{"items":[{"sku":"A1"},{"name":"B2"}]}`))
@@ -1551,9 +1551,9 @@ func TestMatchBodyFuzzy_WildcardMissingFieldInElement(t *testing.T) {
 	}}
 
 	// Second element in request doesn't have "sku" => extractAtPath returns false (all-or-nothing)
-	got := criterion(req, tape)
+	got := criterion.Score(req, tape)
 	if got != 0 {
-		t.Errorf("MatchBodyFuzzy() wildcard missing field = %d, want 0", got)
+		t.Errorf("BodyFuzzyCriterion.Score() wildcard missing field = %d, want 0", got)
 	}
 }
 
@@ -1650,9 +1650,9 @@ func TestExactMatcher_FullURLMatch(t *testing.T) {
 	matcher := ExactMatcher()
 
 	tests := []struct {
-		name      string
-		reqMethod string
-		reqPath   string
+		name       string
+		reqMethod  string
+		reqPath    string
 		tapeMethod string
 		tapeURL    string
 		wantMatch  bool
@@ -1792,6 +1792,47 @@ func TestServer_UsesDefaultMatcher(t *testing.T) {
 	}
 }
 
+// --- Criterion Name() tests ---
+
+func TestCriterionFunc_Name(t *testing.T) {
+	f := CriterionFunc(func(_ *http.Request, _ Tape) int { return 1 })
+	if got := f.Name(); got != "custom" {
+		t.Errorf("CriterionFunc.Name() = %q, want %q", got, "custom")
+	}
+}
+
+func TestCriterion_Names(t *testing.T) {
+	regexCriterion, err := NewPathRegexCriterion(`^/test$`)
+	if err != nil {
+		t.Fatalf("NewPathRegexCriterion() error = %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		c        Criterion
+		wantName string
+	}{
+		{"MethodCriterion", MethodCriterion{}, "method"},
+		{"PathCriterion", PathCriterion{}, "path"},
+		{"PathRegexCriterion", regexCriterion, "path_regex"},
+		{"RouteCriterion", RouteCriterion{Route: "test"}, "route"},
+		{"QueryParamsCriterion", QueryParamsCriterion{}, "query_params"},
+		{"HeadersCriterion", HeadersCriterion{Key: "X-Test", Value: "v"}, "headers"},
+		{"BodyHashCriterion", BodyHashCriterion{}, "body_hash"},
+		{"BodyFuzzyCriterion", NewBodyFuzzyCriterion("$.action"), "body_fuzzy"},
+		{"CriterionFunc", CriterionFunc(func(_ *http.Request, _ Tape) int { return 0 }), "custom"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.c.Name()
+			if got != tt.wantName {
+				t.Errorf("%s.Name() = %q, want %q", tt.name, got, tt.wantName)
+			}
+		})
+	}
+}
+
 // --- Benchmarks ---
 
 // generateCandidates creates n candidate tapes. The matching tape for
@@ -1872,10 +1913,10 @@ func BenchmarkCompositeMatcher_Match(b *testing.B) {
 				matchIdx := n / 2
 				candidates := generateCandidates(n, matchIdx)
 				matcher := NewCompositeMatcher(
-					MatchMethod(),
-					MatchPath(),
-					MatchQueryParams(),
-					MatchBodyHash(),
+					MethodCriterion{},
+					PathCriterion{},
+					QueryParamsCriterion{},
+					BodyHashCriterion{},
 				)
 
 				body := []byte(`{"action":"find"}`)
@@ -1883,7 +1924,7 @@ func BenchmarkCompositeMatcher_Match(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					// Reset request body for each iteration since MatchBodyHash reads it.
+					// Reset request body for each iteration since BodyHashCriterion reads it.
 					req.Body = io.NopCloser(bytes.NewReader(body))
 					tape, ok := matcher.Match(req, candidates)
 					if !ok {

@@ -43,9 +43,9 @@
 //
 // The [Matcher] interface controls how incoming requests are matched to
 // recorded tapes. [DefaultMatcher] provides method + path matching via a
-// [CompositeMatcher]. Individual [MatchCriterion] functions (e.g.,
-// [MatchMethod], [MatchPath], [MatchQueryParams], [MatchBodyHash]) can be
-// composed for custom matching strategies.
+// [CompositeMatcher]. Individual [Criterion] implementations (e.g.,
+// [MethodCriterion], [PathCriterion], [QueryParamsCriterion], [BodyHashCriterion])
+// can be composed for custom matching strategies.
 //
 // # Health endpoints (proxy mode)
 //

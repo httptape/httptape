@@ -86,8 +86,8 @@ replays cached SSE events using WithProxySSETiming (default: instant).
 ## Matching
 
 CompositeMatcher with scored criteria:
-- MatchMethod (1), MatchPath (2), MatchHeaders (3), MatchQueryParams (4),
-  MatchBodyFuzzy (6), MatchBodyHash (8), MatchPathRegex (1), MatchRoute (1)
+- MethodCriterion (1), PathCriterion (2), HeadersCriterion (3), QueryParamsCriterion (4),
+  BodyFuzzyCriterion (6), BodyHashCriterion (8), PathRegexCriterion (1), RouteCriterion (1)
 
 ## Storage
 

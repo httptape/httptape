@@ -426,7 +426,7 @@ func TestProxy_RequestBodyPreservedForMatching(t *testing.T) {
 
 	proxy := NewProxy(l1, l2,
 		WithProxyTransport(failingTransport(errors.New("down"))),
-		WithProxyMatcher(NewCompositeMatcher(MatchMethod(), MatchPath(), MatchBodyHash())),
+		WithProxyMatcher(NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, BodyHashCriterion{})),
 	)
 
 	req, _ := http.NewRequest("POST", "http://example.com/api/items", bytes.NewReader(postBody))

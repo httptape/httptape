@@ -43,13 +43,13 @@ Every fixture file is a single JSON object with these fields:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | string | Yes | Unique identifier. Used as the filename (`<id>.json`). Must not contain `/`, `\`, or `..`. |
-| `route` | string | No | Logical grouping label (e.g., `"users-api"`). Used by `Filter.Route` and `MatchRoute`. |
+| `route` | string | No | Logical grouping label (e.g., `"users-api"`). Used by `Filter.Route` and `RouteCriterion`. |
 | `recorded_at` | string (RFC 3339) | No | UTC timestamp. Informational only -- not used for matching. |
 | `request.method` | string | Yes | HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`). |
 | `request.url` | string | Yes | Full URL. The path component is used for matching (e.g., `http://mock/api/users`). |
 | `request.headers` | object | No | Request headers. Each key maps to an array of strings. |
 | `request.body` | string/null | No | Base64-encoded request body, or `null` for bodiless requests. |
-| `request.body_hash` | string | No | Hex-encoded SHA-256 hash of the original request body. Required for `MatchBodyHash`. |
+| `request.body_hash` | string | No | Hex-encoded SHA-256 hash of the original request body. Required for `BodyHashCriterion`. |
 | `request.body_encoding` | string | No | `"identity"` for UTF-8 text, `"base64"` for binary. Defaults to identity if omitted. |
 | `response.status_code` | int | Yes | HTTP status code (200, 201, 204, 404, 500, etc.). |
 | `response.headers` | object | No | Response headers. Each key maps to an array of strings. |
@@ -78,7 +78,7 @@ The `request.url` field stores a full URL, but the `DefaultMatcher` (used by the
 
 - `http://mock/api/users` and `https://production.example.com/api/users` match the same `GET /api/users` request
 - Use `http://mock` as the host for hand-written fixtures -- it is a convention, not a requirement
-- Query parameters are ignored by the default matcher. Use `MatchQueryParams` in a `CompositeMatcher` if you need them.
+- Query parameters are ignored by the default matcher. Use `QueryParamsCriterion{}` in a `CompositeMatcher` if you need them.
 
 ## Example fixtures
 

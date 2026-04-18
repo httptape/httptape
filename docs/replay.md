@@ -38,9 +38,9 @@ See [Matching](matching.md) for all available matchers.
 ```go
 srv := httptape.NewServer(store,
     httptape.WithMatcher(httptape.NewCompositeMatcher(
-        httptape.MatchMethod(),
-        httptape.MatchPath(),
-        httptape.MatchQueryParams(),
+        httptape.MethodCriterion{},
+        httptape.PathCriterion{},
+        httptape.QueryParamsCriterion{},
     )),
 )
 ```

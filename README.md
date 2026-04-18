@@ -204,11 +204,11 @@ Composable matching with weighted scoring:
 ```go
 srv := httptape.NewServer(store,
     httptape.WithMatcher(httptape.NewCompositeMatcher(
-        httptape.MatchMethod(),      // score: 1
-        httptape.MatchPath(),        // score: 2
-        httptape.MatchHeaders("Accept", "application/json"), // score: 3
-        httptape.MatchQueryParams(), // score: 4
-        httptape.MatchBodyHash(),    // score: 8
+        httptape.MethodCriterion{},                                        // score: 1
+        httptape.PathCriterion{},                                          // score: 2
+        httptape.HeadersCriterion{Key: "Accept", Value: "application/json"}, // score: 3
+        httptape.QueryParamsCriterion{},                                   // score: 4
+        httptape.BodyHashCriterion{},                                      // score: 8
     )),
 )
 ```

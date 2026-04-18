@@ -249,29 +249,36 @@ type Matcher interface {
 type MatcherFunc func(req *http.Request, candidates []Tape) (Tape, bool)
 func (f MatcherFunc) Match(req *http.Request, candidates []Tape) (Tape, bool)
 
-type MatchCriterion func(req *http.Request, candidate Tape) int
+type Criterion interface {
+    Score(req *http.Request, candidate Tape) int
+    Name() string
+}
+
+type CriterionFunc func(req *http.Request, candidate Tape) int
+func (f CriterionFunc) Score(req *http.Request, candidate Tape) int
+func (f CriterionFunc) Name() string  // returns "custom"
 ```
 
 ### Matchers
 
 ```go
-func DefaultMatcher() *CompositeMatcher          // MatchMethod + MatchPath
+func DefaultMatcher() *CompositeMatcher          // MethodCriterion + PathCriterion
 func ExactMatcher() Matcher                       // first method+path match
-func NewCompositeMatcher(criteria ...MatchCriterion) *CompositeMatcher
+func NewCompositeMatcher(criteria ...Criterion) *CompositeMatcher
 ```
 
 ### Built-in criteria
 
-| Function | Signature | Score |
-|----------|-----------|-------|
-| MatchMethod | `MatchMethod() MatchCriterion` | 1 |
-| MatchPath | `MatchPath() MatchCriterion` | 2 |
-| MatchPathRegex | `MatchPathRegex(pattern string) (MatchCriterion, error)` | 1 |
-| MatchRoute | `MatchRoute(route string) MatchCriterion` | 1 |
-| MatchHeaders | `MatchHeaders(key, value string) MatchCriterion` | 3 |
-| MatchQueryParams | `MatchQueryParams() MatchCriterion` | 4 |
-| MatchBodyFuzzy | `MatchBodyFuzzy(paths ...string) MatchCriterion` | 6 |
-| MatchBodyHash | `MatchBodyHash() MatchCriterion` | 8 |
+| Criterion | Construction | Score |
+|-----------|-------------|-------|
+| MethodCriterion | `MethodCriterion{}` | 1 |
+| PathCriterion | `PathCriterion{}` | 2 |
+| PathRegexCriterion | `NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error)` | 1 |
+| RouteCriterion | `RouteCriterion{Route: route}` | 1 |
+| HeadersCriterion | `HeadersCriterion{Key: key, Value: value}` | 3 |
+| QueryParamsCriterion | `QueryParamsCriterion{}` | 4 |
+| BodyFuzzyCriterion | `NewBodyFuzzyCriterion(paths ...string) *BodyFuzzyCriterion` | 6 |
+| BodyHashCriterion | `BodyHashCriterion{}` | 8 |
 
 **Details:** [Matching](matching.md)
 

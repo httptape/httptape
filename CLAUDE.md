@@ -57,7 +57,7 @@ httptape/
   sanitizer_test.go
   server.go            # Mock HTTP server (http.Handler, includes ServerOption)
   server_test.go
-  matcher.go           # Matcher interface, MatchCriterion, CompositeMatcher, ExactMatcher
+  matcher.go           # Matcher interface, Criterion, CompositeMatcher, ExactMatcher
   matcher_test.go
   store.go             # Storage port (interface)
   store_file.go        # Filesystem storage adapter (includes FileStoreOption)
