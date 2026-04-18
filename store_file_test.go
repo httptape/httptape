@@ -1363,6 +1363,166 @@ func TestFileStore_EmptyStrategyFallback(t *testing.T) {
 	}
 }
 
+func TestFilenameStrategy_PathTraversalSanitized(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		strategyStem string
+	}{
+		{"dot-dot-slash", "../escape"},
+		{"nested traversal", "../../etc/passwd"},
+		{"slash prefix", "/etc/passwd"},
+		{"backslash traversal", `..\..\escape`},
+		{"embedded slash", "sub/dir"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			maliciousStrategy := func(tape Tape) string {
+				return tt.strategyStem
+			}
+
+			store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(maliciousStrategy))
+			if err != nil {
+				t.Fatalf("NewFileStore() error = %v", err)
+			}
+
+			tape := makeTape("route", "GET", "http://example.com")
+			if err := store.Save(ctx, tape); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+
+			// Verify the file landed inside the base directory, not outside.
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir() error = %v", err)
+			}
+			found := false
+			for _, entry := range entries {
+				if strings.HasSuffix(entry.Name(), ".json") {
+					found = true
+					// Verify the file contains the correct tape ID.
+					data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+					if err != nil {
+						t.Fatalf("ReadFile() error = %v", err)
+					}
+					fileID, err := extractIDFromJSON(data)
+					if err != nil {
+						t.Fatalf("extractIDFromJSON() error = %v", err)
+					}
+					if fileID != tape.ID {
+						t.Errorf("file ID = %q, want %q", fileID, tape.ID)
+					}
+				}
+			}
+			if !found {
+				t.Error("no JSON file found in base directory")
+			}
+
+			// Verify no file was written to the parent directory.
+			parentDir := filepath.Dir(dir)
+			parentEntries, err := os.ReadDir(parentDir)
+			if err != nil {
+				t.Fatalf("ReadDir(parent) error = %v", err)
+			}
+			for _, entry := range parentEntries {
+				if entry.Name() == "escape.json" || entry.Name() == "passwd.json" {
+					t.Errorf("file %q escaped to parent directory", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestFilenameStrategy_EmptyOrDotResultFallsBack(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		strategyStem string
+	}{
+		{"empty string", ""},
+		{"dot", "."},
+		{"dot-dot", ".."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			strategy := func(tape Tape) string {
+				return tt.strategyStem
+			}
+
+			store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(strategy))
+			if err != nil {
+				t.Fatalf("NewFileStore() error = %v", err)
+			}
+
+			tape := makeTape("route", "GET", "http://example.com")
+			if err := store.Save(ctx, tape); err != nil {
+				t.Fatalf("Save() error = %v", err)
+			}
+
+			// Should fall back to <id>.json.
+			path := filepath.Join(dir, tape.ID+".json")
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("expected fallback file %q to exist: %v", tape.ID+".json", err)
+			}
+
+			// Verify file contains the correct tape.
+			loaded, err := store.Load(ctx, tape.ID)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if loaded.ID != tape.ID {
+				t.Errorf("Load().ID = %q, want %q", loaded.ID, tape.ID)
+			}
+		})
+	}
+}
+
+func TestFileStore_Delete_ScanFallback_ContextCancelled(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Use readable strategy so Delete will use scan fallback.
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save a tape so there is something to scan for.
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Cancel the context before calling Delete to force the cancellation check.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = store.Delete(cancelledCtx, tape.ID)
+	if err == nil {
+		t.Fatal("Delete() with cancelled context: error = nil, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Delete() with cancelled context: error = %v, want context.Canceled", err)
+	}
+
+	// Verify the tape was NOT deleted (context was cancelled).
+	loaded, err := store.Load(context.Background(), tape.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v, tape should still exist", err)
+	}
+	if loaded.ID != tape.ID {
+		t.Errorf("Load().ID = %q, want %q", loaded.ID, tape.ID)
+	}
+}
+
 func TestFileStore_ReadableStrategy_SaveAndLoad(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()

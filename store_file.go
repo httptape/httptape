@@ -249,8 +249,13 @@ func (fs *FileStore) Save(ctx context.Context, tape Tape) error {
 
 	// Determine the target filename using the strategy.
 	stem := fs.strategy(tape)
-	if stem == "" {
-		// Defensive fallback: empty strategy output -> use tape ID.
+
+	// Sanitize strategy output to prevent path traversal from custom strategies.
+	// Built-in strategies (UUIDFilenames, ReadableFilenames) produce safe values,
+	// but user-provided strategies could return "../escape" or similar.
+	stem = filepath.Base(stem)
+	if stem == "" || stem == "." || stem == ".." {
+		// Defensive fallback: empty, ".", or ".." strategy output -> use tape ID.
 		stem = tape.ID
 	}
 
@@ -364,6 +369,8 @@ func (fs *FileStore) removeOldFile(tapeID, newFilename string) {
 			continue // corrupt JSON, skip
 		}
 		if id == tapeID {
+			// Best-effort: if removal fails (e.g., concurrent delete), the orphan
+			// file is left behind but Save still succeeds with the new file.
 			os.Remove(filepath.Join(fs.dir, name))
 			return // found and removed; IDs are unique
 		}
@@ -494,6 +501,10 @@ func (fs *FileStore) Delete(ctx context.Context, id string) error {
 	}
 
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("httptape: filestore delete %s: %w", id, err)
+		}
+
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
@@ -562,9 +573,10 @@ func (fs *FileStore) scanForID(ctx context.Context, id string) (Tape, bool, erro
 	return Tape{}, false, nil
 }
 
-// extractIDFromJSON extracts the "id" field from a JSON byte slice without
-// fully unmarshalling the entire structure. This is used for efficient
-// scanning of directory contents.
+// extractIDFromJSON extracts the "id" field from a JSON byte slice by
+// unmarshalling into a minimal struct with only the ID field. The rest of
+// the document is parsed but discarded. This is used for scanning directory
+// contents when only the tape ID is needed.
 func extractIDFromJSON(data []byte) (string, error) {
 	var partial struct {
 		ID string `json:"id"`

@@ -8934,6 +8934,140 @@ This eliminates duplicated SSE wire-format code across the codebase.
 
 ---
 
+### ADR-36: Pluggable FileStore filename strategy
+
+**Date**: 2026-04-16
+**Issue**: #132
+**Status**: Accepted
+
+#### Context
+
+FileStore previously hard-coded filenames as `<tape.ID>.json` (UUID-based).
+While functional, these names are opaque when browsing fixture directories.
+Developers frequently requested human-readable filenames such as
+`get_api-users.json` that convey the HTTP method and URL at a glance.
+
+At the same time, any filename strategy must preserve backward compatibility
+(existing UUID-named fixtures must continue to work), support arbitrary custom
+strategies, and guard against security issues when users provide their own
+`FilenameStrategy` implementations.
+
+#### Decision
+
+##### FilenameStrategy type
+
+A function type `FilenameStrategy func(tape Tape) string` computes the filename
+stem (without `.json` extension) for a tape. Two built-in constructors are
+provided:
+
+- `UUIDFilenames()` -- returns `tape.ID` (default, backward-compatible).
+- `ReadableFilenames()` -- format: `<method>_<url-slug>[_q-<query-hash>][_<body-hash>].json`.
+
+Users inject a strategy via `WithFilenameStrategy(s FilenameStrategy)` option on
+`NewFileStore`.
+
+##### Lookup mechanism
+
+Since filenames are no longer predictable from the tape ID alone, all lookup
+methods (Load, Delete) use a two-phase approach:
+
+1. **Fast path**: try `<id>.json` directly (works for UUID strategy and manual
+   overrides).
+2. **Scan fallback**: iterate all `.json` files in the directory, extract the
+   `id` field from each, and match.
+
+This ensures Load/Delete work regardless of which strategy was used when the
+tape was saved.
+
+##### URL slug generation
+
+`slugifyURL` aggressively normalizes URL paths to `[a-z0-9-]`:
+- Strip leading/trailing slashes
+- Replace any non-alphanumeric character with a dash
+- Collapse consecutive dashes
+- Trim trailing dashes
+- Return `"root"` for empty or `/` paths
+
+##### Query string handling
+
+Query strings are represented as a short hash with `q-` prefix: 4 hex characters
+of SHA-256 of the raw query string. This is deterministic (same query produces
+the same hash) and avoids exposing potentially sensitive query parameters in
+filenames.
+
+##### Body hash prefix
+
+The first 4 characters of the tape's `BodyHash` field are appended when the body
+hash is non-empty. This disambiguates requests to the same URL with different
+bodies (e.g., different POST payloads).
+
+##### Filename length cap
+
+Filenames are capped at 200 characters before the `.json` extension. This keeps
+total filename length under typical filesystem limits (255 bytes). Truncation
+cleans up trailing dashes.
+
+##### Collision resolution
+
+When the strategy produces a stem that is already taken by a different tape,
+counter suffixes `_2` through `_99` are tried. If all 99 slots are exhausted,
+`ErrFilenameCollision` is returned. This is generous enough for practical use
+while preventing runaway file creation.
+
+##### Save overwrite cleanup
+
+When a tape is re-saved (same ID, possibly different strategy), `removeOldFile`
+scans for and removes the previous file to prevent duplicates. This is
+best-effort: if removal fails (e.g., concurrent delete or permission issue), the
+new file is still written and Save succeeds. The orphan file may cause ambiguity
+but does not corrupt data.
+
+##### Empty strategy fallback
+
+If a strategy returns an empty string, `"."`, or `".."`, the stem falls back to
+`tape.ID`. This ensures a valid filename is always produced.
+
+##### Path-traversal sanitization
+
+Strategy output is sanitized with `filepath.Base()` before use as a path
+component. This strips any directory traversal (`../`, `/`, `\`) from custom
+strategy results. After `filepath.Base`, empty / `"."` / `".."` results trigger
+the fallback to `tape.ID`. The built-in strategies already produce safe values;
+this guards against malicious or buggy custom strategies only.
+
+##### Corrupt JSON handling
+
+Corrupt `.json` files in the directory are silently skipped during scan
+operations (List, Load scan fallback, Delete scan fallback). A single corrupt
+file does not break the store.
+
+##### Context cancellation in scan loops
+
+All scan loops (scanForID, List, Delete scan fallback) check `ctx.Err()` between
+iterations to respect context cancellation. A cancelled context stops the scan
+and returns the cancellation error.
+
+#### Consequences
+
+**Positive**
+
+- Human-readable fixture filenames improve developer experience when browsing
+  directories.
+- Full backward compatibility: existing UUID-named fixtures work without
+  migration.
+- Pluggable design allows custom strategies for specialized naming schemes.
+- Path-traversal sanitization prevents security issues from custom strategies.
+
+**Negative / trade-offs**
+
+- Scan fallback is O(n) in the number of files when the fast path misses.
+  Acceptable for typical fixture counts (tens to hundreds).
+- Collision counter has a hard cap at 99. Exceeding this returns an error rather
+  than silently generating longer names.
+- `removeOldFile` is best-effort; a failed removal leaves an orphan file.
+
+---
+
 ## PM Log
 
 ### 2026-04-16
