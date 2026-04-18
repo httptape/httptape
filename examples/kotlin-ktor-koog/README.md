@@ -63,9 +63,20 @@ Drop a JSON file under `src/test/resources/fixtures/` and add a `copyFixture(...
 
 The httptape Tape JSON schema (and how to record real upstream traffic into one) is documented at [vibewarden.dev/docs/httptape](https://vibewarden.dev/docs/httptape/).
 
-## Dev workflow
+## Development workflow -- run with the same Testcontainers setup
 
-For local debugging, boot the app with httptape via Docker Compose:
+For local debugging or manual `curl`-ing, boot the app with the same Testcontainers
+wiring the integration tests use:
+
+```bash
+./gradlew testRun
+```
+
+In IntelliJ: right-click `TestApplication.kt` -> Run. Set breakpoints, step through the agent flow interactively, no separate `docker compose up` needed.
+
+## Dev workflow (Docker Compose alternative)
+
+For local debugging without Testcontainers, boot the app with httptape via Docker Compose:
 
 ```bash
 docker compose up -d httptape
@@ -104,7 +115,7 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | JDK | 25 |
 | Ktor | 3.4.2 (Netty server + CIO client) |
 | Koog | 0.8.0 (AI agent framework, Apache 2.0) |
-| Kotest | 6.1.11 (BehaviorSpec) |
+| Kotest | 6.1.11 (FreeSpec) |
 | Testcontainers | 2.0.4 (single shared container) |
 | Gradle | 9.4.1 (wrapper committed) |
 | httptape | v0.11.0 (`ghcr.io/vibewarden/httptape:0.11.0`) |

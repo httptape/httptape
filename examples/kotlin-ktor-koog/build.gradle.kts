@@ -55,3 +55,10 @@ dependencies {
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
 }
+
+tasks.register<JavaExec>("testRun") {
+    group = "application"
+    description = "Run the application against the Testcontainers httptape (debugging / manual curl)"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.httptape.demo.TestApplicationKt")
+}

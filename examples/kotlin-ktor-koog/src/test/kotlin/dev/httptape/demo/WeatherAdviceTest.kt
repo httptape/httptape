@@ -1,6 +1,6 @@
 package dev.httptape.demo
 
-import io.kotest.core.spec.style.BehaviorSpec
+import io.kotest.core.spec.style.FreeSpec
 import io.kotest.matchers.string.shouldContain
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
@@ -23,35 +23,37 @@ import io.ktor.server.testing.*
  * #179 (Criterion interface), and #180 (declarative config) work
  * together end-to-end.
  */
-class WeatherAdviceTest : BehaviorSpec({
+class WeatherAdviceTest : FreeSpec({
 
-    given("a Koog agent backed by httptape and the weather tool") {
-        val httptapeBaseUrl = HttptapeContainer.baseUrl
+    "weather-advice endpoint" - {
+        "with a Koog agent backed by httptape" - {
+            "when the user asks about Berlin" - {
+                "streams the expected umbrella advice" {
+                    val httptapeBaseUrl = HttptapeContainer.baseUrl
 
-        `when`("the user asks for weather advice for Berlin") {
-            then("the response contains weather-based advice including umbrella") {
-                testApplication {
-                    application {
-                        configureApp(
-                            openAiBaseUrl = httptapeBaseUrl,
-                            openAiApiKey = "sk-test-key",
-                            weatherBaseUrl = httptapeBaseUrl
-                        )
-                    }
-
-                    val client = createClient {
-                        install(SSE)
-                    }
-
-                    val events = mutableListOf<String>()
-                    client.sse("/weather-advice?city=Berlin") {
-                        incoming.collect { event ->
-                            event.data?.let { events.add(it) }
+                    testApplication {
+                        application {
+                            configureApp(
+                                openAiBaseUrl = httptapeBaseUrl,
+                                openAiApiKey = "sk-test-key",
+                                weatherBaseUrl = httptapeBaseUrl
+                            )
                         }
-                    }
 
-                    val fullResponse = events.joinToString("")
-                    fullResponse shouldContain "umbrella"
+                        val client = createClient {
+                            install(SSE)
+                        }
+
+                        val events = mutableListOf<String>()
+                        client.sse("/weather-advice?city=Berlin") {
+                            incoming.collect { event ->
+                                event.data?.let { events.add(it) }
+                            }
+                        }
+
+                        val fullResponse = events.joinToString("")
+                        fullResponse shouldContain "umbrella"
+                    }
                 }
             }
         }
