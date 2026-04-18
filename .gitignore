@@ -7,7 +7,10 @@
 *.dll
 *.so
 *.dylib
-httptape
+# Anchored to repo root so it only matches the compiled CLI binary,
+# not nested paths containing "httptape" (e.g., dev/httptape/demo/ in
+# the Java example, or any other contributor's package path).
+/httptape
 
 # Test binary, built with `go test -c`
 *.test

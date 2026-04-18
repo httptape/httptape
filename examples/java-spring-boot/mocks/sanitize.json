@@ -1,0 +1,13 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "fake",
+      "seed": "spring-boot-demo",
+      "fields": {
+        "$.name": "name",
+        "$.email": "email"
+      }
+    }
+  ]
+}

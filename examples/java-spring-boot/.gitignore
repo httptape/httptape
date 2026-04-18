@@ -1,0 +1,49 @@
+# === Maven ===
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+.flattened-pom.xml
+
+# === httptape ===
+.httptape-cache/
+
+# === IntelliJ IDEA ===
+# Project-level settings — user-specific, IDE regenerates on open.
+.idea/
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+out/
+# IntelliJ legacy
+atlassian-ide-plugin.xml
+
+# === Eclipse / VS Code / other JVM IDEs ===
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+.springBeans
+.sts4-cache/
+bin/
+
+# === Editor swap files ===
+*.swp
+*.swo
+*~
+
+# === HotSpot crash logs ===
+hs_err_pid*
+replay_pid*
+
+# === OS files ===
+.DS_Store
+Thumbs.db

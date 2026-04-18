@@ -14,10 +14,12 @@
 #   1. Add an entry to the `matrix.example` list. Required keys:
 #        name              - human-readable check label
 #        path              - directory under examples/
-#        node-version      - Node.js major to install
+#        build-command     - shell command run inside `path`
+#      Optional keys (pick one toolchain):
+#        node-version      - Node.js major to install (triggers setup-node)
 #        lockfile          - relative path to the npm lockfile
 #                            (used by setup-node cache)
-#        build-command     - shell command run inside `path`
+#        java-version      - JDK major to install (triggers setup-java)
 #   2. Add matching dependabot.yml blocks for the example's ecosystems
 #      (see .github/dependabot.yml for the pattern).
 #   3. Append a row to examples/README.md.
@@ -56,6 +58,11 @@ jobs:
             node-version: "20"
             lockfile: examples/ts-frontend-first/package-lock.json
             build-command: npm run build
+
+          - name: java-spring-boot
+            path: examples/java-spring-boot
+            java-version: "25"
+            build-command: ./mvnw -B test
     defaults:
       run:
         working-directory: ${{ matrix.example.path }}
@@ -63,15 +70,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # --- Node.js toolchain (ts-frontend-first and future JS examples) ---
       - name: Set up Node.js
+        if: matrix.example.node-version
         uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.example.node-version }}
           cache: npm
           cache-dependency-path: ${{ matrix.example.lockfile }}
 
-      - name: Install dependencies
+      - name: Install npm dependencies
+        if: matrix.example.node-version
         run: npm ci
 
+      # --- Java toolchain (java-spring-boot and future JVM examples) ---
+      - name: Set up JDK
+        if: matrix.example.java-version
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.example.java-version }}
+          cache: maven
+
+      # --- Build / test (all examples) ---
       - name: Build
         run: ${{ matrix.example.build-command }}

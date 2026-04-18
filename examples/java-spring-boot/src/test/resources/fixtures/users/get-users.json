@@ -1,0 +1,19 @@
+{
+  "id": "b2c3d4e5-0002-4000-8000-000000000002",
+  "route": "users",
+  "recorded_at": "2026-04-16T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "/users",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSBKb2huc29uIiwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9LHsiaWQiOjIsIm5hbWUiOiJCb2IgU21pdGgiLCJlbWFpbCI6ImJvYkBleGFtcGxlLmNvbSJ9XQ=="
+  }
+}

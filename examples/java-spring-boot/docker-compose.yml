@@ -1,0 +1,22 @@
+services:
+  httptape:
+    image: ghcr.io/vibewarden/httptape:0.10.1
+    command: ["serve", "--fixtures", "/fixtures", "--sse-timing=realtime"]
+    volumes:
+      # All fixtures must be in a single flat directory for FileStore.
+      # Individual files are bind-mounted from their test subdirectories.
+      - ./src/test/resources/fixtures/openai/chat-completion-headphones.json:/fixtures/chat-completion-headphones.json:ro
+      - ./src/test/resources/fixtures/users/get-user-1.json:/fixtures/get-user-1.json:ro
+      - ./src/test/resources/fixtures/users/get-users.json:/fixtures/get-users.json:ro
+      - ./src/test/resources/fixtures/users/get-user-999.json:/fixtures/get-user-999.json:ro
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_EXTERNAL_API_BASE_URL=http://httptape:8081
+      - SPRING_AI_OPENAI_BASE_URL=http://httptape:8081
+      - SPRING_AI_OPENAI_API_KEY=sk-placeholder
+    depends_on:
+      - httptape

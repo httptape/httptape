@@ -1,0 +1,19 @@
+{
+  "id": "b2c3d4e5-0001-4000-8000-000000000001",
+  "route": "users",
+  "recorded_at": "2026-04-16T10:00:00Z",
+  "request": {
+    "method": "GET",
+    "url": "/users/1",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJpZCI6MSwibmFtZSI6IkFsaWNlIEpvaG5zb24iLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIn0="
+  }
+}

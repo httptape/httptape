@@ -140,3 +140,43 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # ----- Example: java-spring-boot (Maven) -----
+  - package-ecosystem: "maven"
+    directory: "/examples/java-spring-boot"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "java"
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Example: java-spring-boot (Dockerfile, eclipse-temurin) -----
+  - package-ecosystem: "docker"
+    directory: "/examples/java-spring-boot"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
