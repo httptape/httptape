@@ -718,12 +718,20 @@ func migrateLegacyFixture(data []byte) ([]byte, error) {
 	hasLegacy := false
 	var reqLE, respLE legacyEndpoint
 	if len(env.Request) > 0 {
+		// Unmarshal errors are intentionally ignored here: if the request
+		// sub-object does not parse into legacyEndpoint, it simply means
+		// there is no legacy body_encoding field to migrate. We fall
+		// through to the hasLegacy=false path and skip the legacy
+		// pre-processing, letting the standard Tape unmarshal handle it.
 		_ = json.Unmarshal(env.Request, &reqLE)
 		if reqLE.BodyEncoding != "" {
 			hasLegacy = true
 		}
 	}
 	if len(env.Response) > 0 {
+		// Same rationale as the request unmarshal above: errors mean
+		// "no legacy body_encoding present", not "corrupt data". Corrupt
+		// data is caught later by the full Tape unmarshal below.
 		_ = json.Unmarshal(env.Response, &respLE)
 		if respLE.BodyEncoding != "" {
 			hasLegacy = true
