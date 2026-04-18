@@ -9068,6 +9068,633 @@ and returns the cancellation error.
 
 ---
 
+### ADR-37: MatchBodyFuzzy vacuous-true for body-less requests
+
+**Date**: 2026-04-18
+**Issue**: #178
+**Status**: Accepted
+
+#### Context
+
+`MatchBodyFuzzy` (ADR-14, `matcher.go` lines 421-477) returns score 0 whenever
+neither the incoming request nor the candidate tape has a JSON-parseable body.
+This is correct for the "no evidence of a match" case when both sides _should_
+have bodies but happens to eliminate body-less requests (e.g., `GET /users/1`
+matched against a recorded `GET /users/1`).
+
+The root cause is that `json.Unmarshal` on nil or empty bytes fails, causing the
+criterion to return 0. Even if both bodies were valid but empty JSON (`{}`), no
+paths would match, so `matched == 0` triggers the final `return 0`.
+
+This makes `MatchBodyFuzzy` unsafe to compose globally in a `CompositeMatcher`
+alongside REST-style routes that include body-less methods (GET, DELETE, HEAD).
+Users who add `MatchBodyFuzzy("$.action")` to handle POST-heavy routes
+inadvertently eliminate all their GET routes.
+
+The semantically correct behavior: when both the request body and the tape body
+are absent (or not parseable as JSON), the criterion should be vacuously true --
+return a small positive score so the candidate stays alive without dominating
+any real body-match score.
+
+This follows the same pattern as `MatchQueryParams`, which returns its full
+score (4) when the incoming request has no query parameters (vacuously true --
+all zero params match). However, `MatchBodyFuzzy` should return a _reduced_
+score (1 instead of 6) for the vacuous case, because "neither side has a body"
+is weaker evidence than "both sides have bodies and the specified fields match."
+
+#### Decision
+
+##### Vacuous-true score: 1
+
+When both bodies are absent, `MatchBodyFuzzy` returns 1 instead of 0.
+
+Score 1 is the minimum positive value. It keeps the candidate alive in the
+`CompositeMatcher` scoring loop (not eliminated) without inflating its total
+score. A candidate that matches on actual body fields (score 6) will always
+outscore one that passes only vacuously (score 1), preserving correct ranking.
+
+Verification against the score-weight table (from ADR-4 / ADR-14):
+
+| Criterion        | Score | Vacuous-true behavior |
+|------------------|-------|-----------------------|
+| MatchMethod      | 1     | N/A (always checks)   |
+| MatchPath        | 2     | N/A (always checks)   |
+| MatchRoute       | 1     | Returns 1 if route="" |
+| MatchPathRegex   | 1     | N/A (always checks)   |
+| MatchHeaders     | 3     | N/A (always checks)   |
+| MatchQueryParams | 4     | Returns 4 if no query params |
+| MatchBodyFuzzy   | 6     | **Returns 1 if both bodies absent (NEW)** |
+| MatchBodyHash    | 8     | Returns 8 if both empty |
+
+The dominance ordering is preserved:
+- A real body-fuzzy match (6) always beats a vacuous body-fuzzy pass (1).
+- `MatchBodyHash` both-empty (8) > `MatchBodyFuzzy` vacuous (1). No conflict.
+- `MatchMethod(1) + MatchPath(2) + MatchBodyFuzzy-vacuous(1) = 4` does not
+  accidentally outscore any higher-specificity criterion.
+
+##### Definition of "body absent"
+
+A body is considered **absent** if any of the following is true:
+- The byte slice is `nil`
+- The byte slice has length 0
+- The byte slice fails `json.Unmarshal`
+
+In Go, `len(nil) == 0`, so the nil and zero-length cases collapse into a single
+`len(body) == 0` check. The unmarshal-failure case catches non-JSON content
+(e.g., plain text, XML, binary) which cannot participate in field-level
+comparison.
+
+Bodies that ARE valid JSON -- including `{}`, `null`, `[]`, `"string"`, `0`,
+`true` -- are NOT considered absent. They proceed through the existing
+field-extraction logic. For `{}` vs `{}`, no paths will be found in either body,
+so `matched == 0` and the criterion returns 0. This is correct: both sides
+explicitly sent empty JSON objects, which is different from "no body at all."
+
+Edge case summary:
+
+| Request body | Tape body   | Result | Rationale |
+|-------------|-------------|--------|-----------|
+| nil         | nil         | 1      | Vacuous-true: both absent |
+| nil         | `[]byte{}`  | 1      | Vacuous-true: both absent |
+| `[]byte{}`  | nil         | 1      | Vacuous-true: both absent |
+| `[]byte{}`  | `[]byte{}`  | 1      | Vacuous-true: both absent |
+| nil         | `{"a":1}`   | 0      | Mismatch: one absent, one present |
+| `{"a":1}`   | nil         | 0      | Mismatch: one absent, one present |
+| `not json`  | `not json`  | 1      | Vacuous-true: both fail unmarshal |
+| `not json`  | `{"a":1}`   | 0      | Mismatch: one absent, one present |
+| `{"a":1}`   | `not json`  | 0      | Mismatch: one absent, one present |
+| `{}`        | `{}`        | 0      | Both valid JSON, no paths match, matched=0 |
+| `null`      | `null`      | 0      | Both valid JSON, paths fail extraction, matched=0 |
+| `{"a":1}`   | `{"a":1}`   | 6      | Fields match (assuming path `$.a`) |
+| `{"a":1}`   | `{"a":2}`   | 0      | Fields differ |
+
+##### Sequence of checks inside the criterion
+
+The modified `MatchBodyFuzzy` closure follows this sequence:
+
+1. **No valid paths**: If `len(parsed) == 0`, return 0 (unchanged).
+2. **Read and restore request body**: Read `req.Body` into `reqBody` bytes,
+   replace `req.Body` with a new reader over the same bytes (unchanged).
+3. **Determine absence**: Attempt `json.Unmarshal` on both `reqBody` and
+   `candidate.Request.Body`. Track whether each side is "absent":
+   - `reqAbsent = len(reqBody) == 0 || json.Unmarshal(reqBody, &reqData) != nil`
+   - `tapeAbsent = len(candidate.Request.Body) == 0 || json.Unmarshal(candidate.Request.Body, &tapeData) != nil`
+4. **Vacuous-true short-circuit**: If both absent, return 1.
+5. **Asymmetric mismatch**: If one absent and the other not, return 0.
+6. **Field comparison**: Proceed with existing path-extraction and
+   `reflect.DeepEqual` logic (unchanged). If `matched == 0`, return 0.
+   If all matched fields are equal, return 6.
+
+This approach avoids duplicating unmarshal calls. The `json.Unmarshal` side
+effects (populating `reqData` / `tapeData`) are preserved for step 6 when both
+sides are present.
+
+##### Godoc update
+
+The `MatchBodyFuzzy` godoc comment must be updated to document the vacuous-true
+behavior. Add the following to the "Matching semantics" list:
+
+```
+//   - If both the incoming request body and the tape body are absent
+//     (nil, empty, or not valid JSON), the criterion returns 1 (vacuous
+//     match — the body dimension is irrelevant for this request/tape
+//     pair). If exactly one side is absent, the criterion returns 0.
+```
+
+#### File layout
+
+Only two files are modified:
+
+| File | Change |
+|------|--------|
+| `matcher.go` | Modify `MatchBodyFuzzy` closure: add vacuous-true check, update godoc |
+| `matcher_test.go` | Update `TestMatchBodyFuzzy_BothBodiesEmpty` (expect 1 not 0), add new test cases |
+
+No new files. No new types. No new exported functions. No new imports.
+
+#### Error cases
+
+No new error cases are introduced. The existing error handling is unchanged:
+- `io.ReadAll` failure on request body: return 0 (unchanged).
+- `json.Unmarshal` failure: now classified as "absent" rather than being
+  an implicit early-return-0. The only behavioral change is when BOTH sides
+  fail unmarshal (return 1 instead of 0).
+
+#### Test strategy
+
+Modify and add tests in `matcher_test.go` using the existing table-driven
+pattern. All tests use the same style as the existing `TestMatchBodyFuzzy_*`
+tests.
+
+**Modified test:**
+
+- `TestMatchBodyFuzzy_BothBodiesEmpty`: Change expected score from 0 to 1.
+  This is the existing test at line 1171. The test name accurately describes
+  the scenario; only the assertion changes.
+
+**New tests (add as a single table-driven test `TestMatchBodyFuzzy_VacuousTrue`):**
+
+| Sub-test name | Request body | Tape body | Want score | Notes |
+|--------------|-------------|-----------|-----------|-------|
+| both nil | nil | nil | 1 | Core fix case |
+| both empty bytes | `[]byte{}` | `[]byte{}` | 1 | Empty but non-nil |
+| req nil tape empty | nil | `[]byte{}` | 1 | Mixed nil/empty |
+| req empty tape nil | `[]byte{}` | nil | 1 | Mixed nil/empty |
+| both invalid JSON | `not json` | `also not json` | 1 | Both fail unmarshal |
+| req nil tape has body | nil | `{"a":1}` | 0 | Asymmetric |
+| req has body tape nil | `{"a":1}` | nil | 0 | Asymmetric |
+| req invalid tape has body | `not json` | `{"a":1}` | 0 | Asymmetric |
+| req has body tape invalid | `{"a":1}` | `not json` | 0 | Asymmetric |
+| both empty JSON objects | `{}` | `{}` | 0 | Valid JSON, no paths match |
+| both JSON null | `null` | `null` | 0 | Valid JSON, paths fail extraction |
+| both bodied fields match | `{"action":"create"}` | `{"action":"create"}` | 6 | Unchanged behavior |
+| both bodied fields differ | `{"action":"create"}` | `{"action":"delete"}` | 0 | Unchanged behavior |
+
+All tests use `MatchBodyFuzzy("$.action")` as the criterion (at least one valid
+parsed path) to avoid triggering the `len(parsed) == 0` early return.
+
+**Existing tests that must continue to pass unchanged:**
+
+- `TestMatchBodyFuzzy_SingleField`
+- `TestMatchBodyFuzzy_MultipleFields`
+- `TestMatchBodyFuzzy_NestedField`
+- `TestMatchBodyFuzzy_ArrayWildcard`
+- `TestMatchBodyFuzzy_FieldValueDiffers`
+- `TestMatchBodyFuzzy_NonJSONRequestBody`
+- `TestMatchBodyFuzzy_NonJSONTapeBody`
+- `TestMatchBodyFuzzy_EmptyPaths`
+- `TestMatchBodyFuzzy_PathInRequestNotInTape`
+- `TestMatchBodyFuzzy_PathInTapeNotInRequest`
+- `TestMatchBodyFuzzy_InvalidPaths`
+- `TestMatchBodyFuzzy_AllPathsMissing`
+- `TestMatchBodyFuzzy_BodyRestored`
+- `TestMatchBodyFuzzy_DeepNestedObject`
+- `TestMatchBodyFuzzy_NumericValue`
+- `TestMatchBodyFuzzy_BooleanValue`
+- `TestMatchBodyFuzzy_NullValue`
+- `TestMatchBodyFuzzy_ObjectValue`
+- `TestMatchBodyFuzzy_ArrayWildcard_DifferentValues`
+- `TestMatchBodyFuzzy_ArrayWildcard_DifferentLengths`
+- `TestMatchBodyFuzzy_Composability`
+- `TestMatchBodyFuzzy_WildcardNotArray`
+- `TestMatchBodyFuzzy_WildcardMissingFieldInElement`
+
+Note: `TestMatchBodyFuzzy_NonJSONRequestBody` (line 1094) and
+`TestMatchBodyFuzzy_NonJSONTapeBody` (line 1109) both expect 0 and remain
+correct. In both cases, exactly one side has valid JSON and the other does not,
+so the asymmetric mismatch rule applies (return 0).
+
+**Composability integration test (new):**
+
+Add `TestMatchBodyFuzzy_VacuousTrueComposability` that creates a
+`CompositeMatcher` with `MatchMethod()`, `MatchPath()`, and
+`MatchBodyFuzzy("$.action")`, then verifies that a `GET /users` request
+(no body) correctly matches a recorded `GET /users` tape (no body) while a
+`POST /users` tape with a body is not incorrectly selected. This directly
+validates the user story from the issue.
+
+#### Alternatives considered
+
+1. **Return 6 (full score) for vacuous-true**: Rejected. A vacuous match is
+   weaker evidence than an actual field match. Returning the full score would
+   let body-less candidates compete equally with body-matched candidates, which
+   is incorrect when both types of candidates exist for the same path.
+
+2. **Return the full score only when both bodies are nil (not just absent)**:
+   Rejected. This would not handle the case where a body is empty bytes
+   (Content-Length: 0) or contains non-JSON content. The "absent" definition
+   should be broad enough to cover all cases where field-level comparison is
+   impossible.
+
+3. **Skip the criterion entirely for body-less requests (return the full score
+   like MatchQueryParams does)**: Rejected for the same reason as alternative 1.
+   `MatchQueryParams` returns its full score (4) for the vacuous case because
+   "no query params" is a common, well-defined state. For bodies, the distinction
+   between "no body" and "empty body" is less clear-cut, and returning a reduced
+   score (1) is more conservative and safer.
+
+4. **Change MatchCriterion signature to support a "skip" sentinel**: Rejected.
+   This would require changing the `MatchCriterion` type and `CompositeMatcher`
+   scoring loop, which is out of scope for this bug fix. Issue #179 may
+   address this as part of a broader `MatchCriterion` refactor.
+
+#### Consequences
+
+- **Bug fixed**: `MatchBodyFuzzy` is now safe to compose globally in a
+  `CompositeMatcher` alongside body-less routes. GET, DELETE, HEAD, and OPTIONS
+  requests no longer get eliminated.
+- **Backward-compatible**: The only behavioral change is for the "both bodies
+  absent" case, which previously returned 0 (eliminating the candidate) and now
+  returns 1 (keeping it alive with minimal score). All other cases are unchanged.
+- **One existing test modified**: `TestMatchBodyFuzzy_BothBodiesEmpty` changes
+  its expected value from 0 to 1. This is intentional and reflects the bug fix.
+- **Score 1 is conservative**: If a future ADR introduces a "skip" sentinel for
+  criteria (issue #179), the vacuous-true logic could be revisited to use it
+  instead of a positive score. The current approach is the minimal fix.
+- **No new dependencies**: stdlib only.
+
+---
+
+
+### ADR-38: Promote MatchCriterion from function type to Criterion interface
+
+**Date**: 2026-04-18
+**Issue**: #179
+**Status**: Accepted
+
+> **Note**: Issue #178 is being architected in parallel and may also produce an ADR.
+> If both land with the same number, the orchestrator will renumber during merge.
+
+#### Context
+
+`MatchCriterion` is currently a function type:
+
+```go
+type MatchCriterion func(req *http.Request, candidate Tape) int
+```
+
+This was chosen in ADR-4 for simplicity. However, the function type has limitations
+that block upcoming work:
+
+1. **Config-driven matcher composition** (issue #180) needs to dispatch on criterion
+   identity — e.g., a JSON config `{"type": "body_fuzzy", "paths": ["$.action"]}`
+   must resolve to the correct struct. A function type has no identity; an interface
+   with a `Name()` method does.
+2. **Debugging and logging**: when a candidate is eliminated, it is useful to report
+   *which* criterion eliminated it. A function type provides no introspection.
+3. **Consistency**: the top-level `Matcher` is already an interface. Having its
+   sub-components be function types is inconsistent.
+
+This ADR promotes criteria to an interface, converts each existing criterion from a
+closure-returning function to a struct implementing the interface, and updates
+`CompositeMatcher` to accept the new type.
+
+The project is pre-1.0, so breaking changes to the public API are acceptable. This
+refactor changes no matching behavior — it is a pure structural change.
+
+#### Decision
+
+##### Open decision 1: Back-compat shim policy
+
+**Decision: Option B — Remove the old constructor functions; breaking change.**
+
+Rationale:
+- The project is pre-1.0. There are no stability guarantees.
+- Keeping wrapper functions that return the old type is impossible once `CompositeMatcher`
+  accepts `[]Criterion` instead of `[]MatchCriterion`. The wrappers would need to return
+  `Criterion`, which changes their signature anyway — no back-compat is preserved.
+- Option C (deprecate) doubles the API surface for a library with zero external users
+  yet. The cost of maintaining deprecated wrappers outweighs the benefit.
+- The `cmd/httptape` CLI does not use any criterion constructors directly (verified by
+  grep). The only Go call sites are `matcher.go`, `matcher_test.go`, `proxy_test.go`,
+  and the `DefaultMatcher()` function. All are in-repo.
+
+The old `MatchCriterion` function type is removed entirely. `CriterionFunc` serves as
+the adapter for ad-hoc functional criteria (same role `MatcherFunc` plays for `Matcher`).
+
+##### Open decision 2: Name() string method on Criterion
+
+**Decision: Include `Name()` in the `Criterion` interface in this issue.**
+
+Rationale:
+- Issue #180 (config-driven composition) directly depends on being able to identify a
+  criterion by name. If we defer `Name()` to #180, that issue would need to change the
+  interface (another breaking change to all implementations).
+- The cost is low: each struct adds a one-line method returning a string constant.
+- `CriterionFunc` returns `"custom"` as its name — ad-hoc criteria are not
+  config-dispatchable, which is correct and expected.
+- Names follow a consistent convention: lowercase, underscore-separated, matching the
+  JSON config `type` field that #180 will use (e.g., `"method"`, `"path"`,
+  `"path_regex"`, `"route"`, `"query_params"`, `"headers"`, `"body_hash"`,
+  `"body_fuzzy"`).
+
+##### Open decision 3: Field exposure / construction ergonomics
+
+**Decision: Public fields for config-visible state + constructor for criteria that
+need validation or pre-processing.**
+
+Specific shapes:
+
+- **Zero-config criteria** (`MethodCriterion`, `PathCriterion`, `QueryParamsCriterion`,
+  `BodyHashCriterion`): zero-value structs, no fields, no constructor needed. Usage:
+  `MethodCriterion{}`.
+
+- **Simple-field criteria** (`RouteCriterion`, `HeadersCriterion`): public fields,
+  no constructor needed. Usage: `HeadersCriterion{Key: "Accept", Value: "application/json"}`.
+  `HeadersCriterion.Score()` canonicalizes the key at call time (cheap — `http.CanonicalHeaderKey`
+  is a simple string manipulation). Alternatively, a `NewHeadersCriterion` constructor
+  could pre-canonicalize, but the per-call cost is negligible and keeping struct literal
+  construction maximizes ergonomics for both Go code and config-driven construction.
+
+- **Validation-required criteria** (`PathRegexCriterion`): constructor
+  `NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error)` compiles the
+  regex once. The struct has a public `Pattern string` field (for serialization/debugging)
+  and a private `re *regexp.Regexp` field. Direct struct-literal construction is not
+  useful because `re` would be nil; the constructor is required.
+
+- **Pre-processing criteria** (`BodyFuzzyCriterion`): constructor
+  `NewBodyFuzzyCriterion(paths ...string) *BodyFuzzyCriterion`. The struct has public
+  `Paths []string` (for serialization/config round-tripping) and private
+  `parsed []parsedPath` (populated by constructor). No error return — invalid paths are
+  silently skipped, matching the current behavior of `MatchBodyFuzzy`. Config-driven
+  construction (#180) calls `NewBodyFuzzyCriterion(config.Paths...)`.
+
+##### Open decision 4: PathRegexCriterion constructor error handling
+
+**Decision: `NewPathRegexCriterion` returns `(*PathRegexCriterion, error)` — no panic.**
+
+Rationale:
+- The CLAUDE.md panic exception is scoped to "nil required dependencies" — programming
+  errors where a caller passes `nil` for a non-optional argument. An invalid regex
+  pattern is a *value* error: the caller provided a non-nil string that happens to be
+  syntactically invalid. This is a runtime validation failure, not a programming error.
+- The current `MatchPathRegex` already returns `(MatchCriterion, error)`. Changing to
+  panic would be a behavior regression and would surprise existing callers.
+- Config-driven construction (#180) will deserialize regex patterns from JSON — panicking
+  on user-provided config values would violate the "no panics in a library" principle.
+
+##### Types
+
+```go
+// Criterion evaluates how well a candidate Tape matches an incoming request
+// for a single dimension (method, path, body, etc.).
+type Criterion interface {
+    // Score returns a match score:
+    //   - 0 means the candidate does not match on this dimension (eliminates it).
+    //   - A positive value means the candidate matches, with higher values
+    //     indicating a stronger/more specific match.
+    //
+    // Implementations must not modify the candidate tape. They may read and
+    // restore the request body but must leave the request otherwise unchanged.
+    Score(req *http.Request, candidate Tape) int
+
+    // Name returns a stable identifier for this criterion type.
+    // Used for debugging, logging, and config-driven dispatch.
+    // Built-in criteria use lowercase underscore-separated names
+    // (e.g., "method", "path", "body_hash").
+    Name() string
+}
+
+// CriterionFunc is an adapter to allow the use of ordinary functions as
+// Criterion implementations. Its Name() method returns "custom".
+type CriterionFunc func(req *http.Request, candidate Tape) int
+
+func (f CriterionFunc) Score(req *http.Request, candidate Tape) int {
+    return f(req, candidate)
+}
+
+func (f CriterionFunc) Name() string {
+    return "custom"
+}
+```
+
+##### Struct implementations
+
+```go
+// MethodCriterion matches on HTTP method. Score: 1.
+type MethodCriterion struct{}
+
+func (MethodCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (MethodCriterion) Name() string { return "method" }
+
+// PathCriterion matches on URL path (exact). Score: 2.
+type PathCriterion struct{}
+
+func (PathCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (PathCriterion) Name() string { return "path" }
+
+// PathRegexCriterion matches the URL path against a compiled regex. Score: 1.
+type PathRegexCriterion struct {
+    // Pattern is the original regex pattern string.
+    Pattern string
+    re      *regexp.Regexp
+}
+
+// NewPathRegexCriterion compiles the pattern and returns a PathRegexCriterion.
+// Returns an error if the pattern is not a valid regular expression.
+func NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error) { ... }
+
+func (c *PathRegexCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (c *PathRegexCriterion) Name() string { return "path_regex" }
+
+// RouteCriterion matches on the tape's Route field. Score: 1.
+// If Route is empty, the criterion always returns 1 (matches any tape).
+type RouteCriterion struct {
+    Route string
+}
+
+func (c RouteCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (c RouteCriterion) Name() string { return "route" }
+
+// QueryParamsCriterion matches on query parameters (subset match). Score: 4.
+type QueryParamsCriterion struct{}
+
+func (QueryParamsCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (QueryParamsCriterion) Name() string { return "query_params" }
+
+// HeadersCriterion matches a specific header key-value pair. Score: 3.
+type HeadersCriterion struct {
+    Key   string
+    Value string
+}
+
+func (c HeadersCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (c HeadersCriterion) Name() string { return "headers" }
+
+// BodyHashCriterion matches on SHA-256 body hash. Score: 8.
+type BodyHashCriterion struct{}
+
+func (BodyHashCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (BodyHashCriterion) Name() string { return "body_hash" }
+
+// BodyFuzzyCriterion compares specific JSON fields in request bodies. Score: 6.
+type BodyFuzzyCriterion struct {
+    // Paths contains the JSONPath-like expressions to compare.
+    Paths  []string
+    parsed []parsedPath
+}
+
+// NewBodyFuzzyCriterion creates a BodyFuzzyCriterion with the given paths.
+// Invalid paths are silently skipped (same behavior as the previous MatchBodyFuzzy).
+func NewBodyFuzzyCriterion(paths ...string) *BodyFuzzyCriterion { ... }
+
+func (c *BodyFuzzyCriterion) Score(req *http.Request, candidate Tape) int { ... }
+func (c *BodyFuzzyCriterion) Name() string { return "body_fuzzy" }
+```
+
+##### Functions and methods
+
+Exported functions and methods (new or changed):
+
+| Function / Method | Signature | Notes |
+|---|---|---|
+| `NewPathRegexCriterion` | `func NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error)` | Replaces `MatchPathRegex` |
+| `NewBodyFuzzyCriterion` | `func NewBodyFuzzyCriterion(paths ...string) *BodyFuzzyCriterion` | Replaces `MatchBodyFuzzy` |
+| `NewCompositeMatcher` | `func NewCompositeMatcher(criteria ...Criterion) *CompositeMatcher` | Signature changes from `...MatchCriterion` to `...Criterion` |
+| `CriterionFunc.Score` | `func (f CriterionFunc) Score(req *http.Request, candidate Tape) int` | New |
+| `CriterionFunc.Name` | `func (f CriterionFunc) Name() string` | New |
+| `MethodCriterion.Score` | `func (MethodCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `MethodCriterion.Name` | `func (MethodCriterion) Name() string` | New |
+| `PathCriterion.Score` | `func (PathCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `PathCriterion.Name` | `func (PathCriterion) Name() string` | New |
+| `PathRegexCriterion.Score` | `func (c *PathRegexCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `PathRegexCriterion.Name` | `func (c *PathRegexCriterion) Name() string` | New |
+| `RouteCriterion.Score` | `func (c RouteCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `RouteCriterion.Name` | `func (c RouteCriterion) Name() string` | New |
+| `QueryParamsCriterion.Score` | `func (QueryParamsCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `QueryParamsCriterion.Name` | `func (QueryParamsCriterion) Name() string` | New |
+| `HeadersCriterion.Score` | `func (c HeadersCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `HeadersCriterion.Name` | `func (c HeadersCriterion) Name() string` | New |
+| `BodyHashCriterion.Score` | `func (BodyHashCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `BodyHashCriterion.Name` | `func (BodyHashCriterion) Name() string` | New |
+| `BodyFuzzyCriterion.Score` | `func (c *BodyFuzzyCriterion) Score(req *http.Request, candidate Tape) int` | New |
+| `BodyFuzzyCriterion.Name` | `func (c *BodyFuzzyCriterion) Name() string` | New |
+
+Removed:
+
+| Function | Notes |
+|---|---|
+| `MatchMethod()` | Replaced by `MethodCriterion{}` |
+| `MatchPath()` | Replaced by `PathCriterion{}` |
+| `MatchPathRegex(pattern)` | Replaced by `NewPathRegexCriterion(pattern)` |
+| `MatchRoute(route)` | Replaced by `RouteCriterion{Route: route}` |
+| `MatchQueryParams()` | Replaced by `QueryParamsCriterion{}` |
+| `MatchHeaders(key, value)` | Replaced by `HeadersCriterion{Key: key, Value: value}` |
+| `MatchBodyHash()` | Replaced by `BodyHashCriterion{}` |
+| `MatchBodyFuzzy(paths...)` | Replaced by `NewBodyFuzzyCriterion(paths...)` |
+
+##### File layout
+
+| File | Changes |
+|---|---|
+| `matcher.go` | Remove `MatchCriterion` type and all `Match*()` constructor functions. Add `Criterion` interface, `CriterionFunc` adapter, all eight criterion structs and their constructors. Update `CompositeMatcher` to use `[]Criterion`. Update `DefaultMatcher` to use struct literals. All criterion-related types stay in `matcher.go` per CLAUDE.md package structure convention. |
+| `matcher_test.go` | Update all tests: replace `criterion(req, tape)` calls with `criterion.Score(req, tape)`. Replace `MatchMethod()` with `MethodCriterion{}`, etc. Replace `MatchCriterion(func(...) int { ... })` casts with `CriterionFunc(func(...) int { ... })`. Add `TestCriterionFunc_Name` and `TestCriterion_Names`. No behavioral changes to test assertions. |
+| `proxy_test.go` | Line 429: update `NewCompositeMatcher(MatchMethod(), MatchPath(), MatchBodyHash())` to `NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, BodyHashCriterion{})`. |
+| `doc.go` | Update godoc references from `MatchCriterion` to `Criterion`, and from `MatchMethod`/`MatchPath` etc. to struct names. |
+| `docs/api-reference.md` | Update the matcher criterion table to reflect struct types and `Criterion` interface. |
+| `docs/matching.md` | Update examples and type references. |
+| `CLAUDE.md` | Line 60: update comment from `MatchCriterion, CompositeMatcher, ExactMatcher` to `Criterion, CompositeMatcher, ExactMatcher`. |
+
+No new files are created.
+
+##### Sequence
+
+This is a pure refactor with no behavioral changes. The request/response flow through
+`CompositeMatcher.Match` is unchanged:
+
+1. For each candidate tape, iterate over `m.criteria`.
+2. Call `criterion.Score(req, tape)` (was `criterion(req, tape)`).
+3. If score is 0, eliminate candidate (short-circuit).
+4. Otherwise, accumulate score.
+5. Return candidate with highest total score.
+
+The only mechanical change is method dispatch (`criterion.Score(...)`) instead of
+function call (`criterion(...)`).
+
+##### Error cases
+
+No new error cases are introduced. The only existing error case is regex compilation
+in `NewPathRegexCriterion`, which preserves the `(*PathRegexCriterion, error)` return
+signature from the current `MatchPathRegex`.
+
+All other criteria remain infallible at construction time:
+- `MethodCriterion{}`, `PathCriterion{}`, `QueryParamsCriterion{}`, `BodyHashCriterion{}` — zero-value structs, cannot fail.
+- `RouteCriterion{Route: "..."}` — any string is valid.
+- `HeadersCriterion{Key: "...", Value: "..."}` — any strings are valid; key is canonicalized at score time.
+- `NewBodyFuzzyCriterion(paths...)` — invalid paths silently skipped (no error return), matching current behavior.
+
+##### Test strategy
+
+**Approach**: mechanical rename, no new test logic needed except for `Name()`.
+
+1. **Individual criterion tests** (e.g., `TestMatchMethod`, `TestMatchPath`):
+   - Replace `criterion := MatchMethod()` with `criterion := MethodCriterion{}`.
+   - Replace `criterion(req, tape)` with `criterion.Score(req, tape)`.
+   - For parameterized criteria: `MatchRoute(tt.route)` becomes `RouteCriterion{Route: tt.route}`.
+   - For `MatchPathRegex`: `criterion, err := MatchPathRegex(...)` becomes `criterion, err := NewPathRegexCriterion(...)`.
+   - For `MatchBodyFuzzy`: `criterion := MatchBodyFuzzy("$.action")` becomes `criterion := NewBodyFuzzyCriterion("$.action")`.
+   - For `MatchHeaders`: `criterion := MatchHeaders("Accept", "application/json")` becomes `criterion := HeadersCriterion{Key: "Accept", Value: "application/json"}`.
+
+2. **CompositeMatcher tests**: replace all `MatchMethod()`, `MatchPath()`, etc. with struct literals in `NewCompositeMatcher(...)` calls.
+
+3. **Short-circuit test** (`TestCompositeMatcher_ShortCircuit`):
+   - Replace `MatchCriterion(func(...) int { ... })` with `CriterionFunc(func(...) int { ... })`.
+
+4. **Benchmark tests**: same mechanical rename pattern.
+
+5. **New tests to add**:
+   - `TestCriterionFunc_Name`: verify `CriterionFunc(...).Name()` returns `"custom"`.
+   - `TestCriterion_Names`: table-driven test verifying each built-in criterion's `Name()` returns the expected string constant. This prevents regressions when #180 depends on these names for config dispatch.
+
+6. **proxy_test.go**: one line change (line 429), mechanical rename.
+
+7. All existing table-driven test structures and assertions remain identical. Score values are unchanged.
+
+#### Consequences
+
+**Benefits:**
+- `Criterion` interface enables clean config-driven dispatch in #180 — a config
+  `{"type": "body_fuzzy", "paths": [...]}` can resolve to `NewBodyFuzzyCriterion(paths...)`
+  and verify via `Name()`.
+- Struct types enable inspection (e.g., `PathRegexCriterion.Pattern` for debugging).
+- Consistency with `Matcher` interface.
+- `CriterionFunc` preserves the ability to create ad-hoc criteria from closures.
+
+**Costs / trade-offs:**
+- **Breaking change**: all external callers using `MatchMethod()`, `NewCompositeMatcher(MatchMethod(), ...)`, etc. must update. Mitigated by pre-1.0 status and zero known external consumers.
+- **Slightly more verbose construction**: `MethodCriterion{}` vs `MatchMethod()`. The verbosity is minimal and the struct literal is actually more explicit about what is being constructed.
+- **`Name()` method on every implementation**: small cost per struct (one-line method), justified by #180 requirements.
+- **`HeadersCriterion` canonicalizes key at score time**: `http.CanonicalHeaderKey` is called per `Score()` invocation rather than once at construction. The function is cheap (simple ASCII case conversion) and the alternative (constructor with pre-canonicalization) would prevent struct-literal construction, which hurts config-driven ergonomics. If profiling shows this matters, a `NewHeadersCriterion` constructor can be added later without changing the interface.
+
+**Documentation impact:**
+- `doc.go`, `docs/api-reference.md`, `docs/matching.md`, `CLAUDE.md` reference the old function names and `MatchCriterion` type. These need updating as part of this PR.
+
+**Future implications:**
+- #180 (config-driven composition) can use `Name()` as a registry key and construct criteria from a `map[string]func(json.RawMessage) (Criterion, error)` factory.
+- Additional criteria (future) implement the `Criterion` interface with their own `Name()` and `Score()`.
+
+---
+
 ## PM Log
 
 ### 2026-04-16
@@ -9125,3 +9752,44 @@ and returns the cancellation error.
   - Open questions flagged for the architect: (1) single consolidated PR vs. 2–3 split PRs (PM recommendation: single, for cohesion); (2) whether `gh repo edit --enable-private-vulnerability-reporting` is available in the installed `gh` (SECURITY.md content branches on the answer — PVR vs. private email); (3) whether to publish Scorecard results to the OpenSSF dashboard (requires `id-token: write`, makes the badge meaningfully clickable) vs. private (Actions-log only); (4) CI badge label ("CI" vs. "Tests").
   - File-level coordination noted with #122 (Docker hub registry polish): #122 touches `docker.yml` and `release.yml`; #129 adds new `test.yml` and `scorecard.yml`. No conflict, but reviewers of either PR should know the other is in flight.
   - Status comment posted: `READY_FOR_ARCH`.
+
+### 2026-04-18 — Matcher improvements for Koog agent demo
+
+Context: the next planned demo is Kotlin + Ktor + Koog + Kotest + Testcontainers. The headline scenario is a multi-step Koog agent that makes two `POST /v1/chat/completions` calls in one test, identical URL/method/headers, distinguished only by the `messages` array in the JSON body. This requires body-aware matching, which exposed one bug and two gaps.
+
+- **Created #178** — `fix: MatchBodyFuzzy eliminates body-less requests (both-empty should be vacuously true)`.
+  - Labels: `priority:medium`, `type:bug`. No milestone.
+  - Bug: when both incoming request and candidate tape have no body, `MatchBodyFuzzy` returns 0 and eliminates the candidate. Fix: return a small positive score (1) when both sides are empty (vacuously true). Field-mismatch and one-sided-empty cases unchanged.
+  - 7 acceptance criteria, all testable. Table-driven tests covering both-empty, one-empty, both-match, both-differ.
+  - No dependencies on other issues.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #179** — `refactor: promote MatchCriterion from function type to Criterion interface`.
+  - Labels: `priority:high`, `type:refactor`. No milestone.
+  - Promotes `MatchCriterion` (bare function type) to a `Criterion` interface with `Score()` method. All 8 existing criteria become exported structs. `CriterionFunc` adapter retained for ad-hoc use. Old `MatchCriterion` type removed (pre-1.0, breaking is acceptable).
+  - 10 acceptance criteria. Pure refactor, no behavioral change.
+  - 3 open questions flagged for the architect: (1) back-compat shims for constructor functions; (2) optional `Name()` method; (3) exported vs. unexported fields on criterion structs.
+  - #180 depends on this issue.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+- **Created #180** — `feat: CLI --match-body-fuzzy flag for httptape serve`.
+  - Labels: `priority:high`, `type:feature`. No milestone.
+  - Adds a repeatable `--match-body-fuzzy <path>` flag to `httptape serve`. When provided, server matcher becomes `NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, BodyFuzzyCriterion{Paths: ...})`. When absent, default behavior unchanged.
+  - 6 acceptance criteria including CLI tests, integration test with two same-URL different-body fixtures, and help text update.
+  - Depends on #179 (Criterion interface). Architect should NOT start until #179 is approved and merged.
+  - Independent of #178 (the demo's requests all have bodies, but the fix improves robustness for mixed route sets).
+  - Out of scope: `--match-headers`, `--match-query-params`, `--match-body-hash`, declarative config-file form.
+  - Status comment posted: `READY_FOR_ARCH`.
+
+Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179 to be merged.
+
+### 2026-04-18 — #180 revision: CLI flag -> declarative config
+
+- **Revised #180** — title changed from `feat: CLI --match-body-fuzzy flag for httptape serve` to `feat: declarative matcher composition via config file (and wire --config into serve)`.
+  - **Rationale for the pivot:** The original `--match-body-fuzzy` repeatable CLI flag design was rejected because (1) it leads to flag explosion as more criteria are exposed, (2) it bypasses the existing JSON config infrastructure (`Config` in `config.go`, `config.schema.json`), and (3) the `--config` flag already exists on `serve` in `cmd/httptape/main.go` line 157 but is currently unused ("accepted but not used by serve"). Extending `Config` with an optional `matcher` field reuses all existing validation, schema, and loading infrastructure.
+  - **New design:** `Config` gains an optional top-level `matcher` field with a `criteria` array. Each entry has a `type` discriminator (`method`, `path`, `body_fuzzy`) and type-specific fields (`paths` for `body_fuzzy`). A factory function (`BuildMatcher`) constructs the `CompositeMatcher`. `runServe` in `main.go` now loads the config and passes `WithMatcher(...)` to `NewServer` when `--config` is provided. The TODO comment is removed.
+  - **Scope tightened:** only `method`, `path`, and `body_fuzzy` criterion types in this issue. Other types (`path_regex`, `route`, `headers`, `query_params`, `body_hash`) are follow-up issues. Per-criterion CLI flags are explicitly out of scope (rejected design).
+  - **Dependencies unchanged:** still depends on #179 (Criterion interface). Independent of #178 (vacuous-true fix).
+  - 11 acceptance criteria covering: Config struct changes, BuildMatcher factory, LoadConfig validation, schema update, CLI wiring, help text, config_test.go, main_test.go, integration test, backward compatibility.
+  - Body and labels updated. Design-pivot rationale comment posted. Status re-set to `READY_FOR_ARCH`.
+  - #178 and #179 were NOT modified.
