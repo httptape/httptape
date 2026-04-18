@@ -32,17 +32,16 @@ public class RecommendationService {
      * @return the LLM's recommendation as a plain text string
      */
     public String recommend(String product) {
-        Flux<String> stream = chatClient.prompt()
+        // Reactor-native: Flux.collect(Collector) returns Mono<String>;
+        // .block() waits for completion. Acceptable here because we're in
+        // a blocking Spring MVC controller path (not WebFlux).
+        return chatClient.prompt()
                 .user("Recommend the best " + product + " for office use. "
                         + "Keep the answer to 2-3 sentences.")
                 .stream()
-                .content();
-
-        // Collect all streamed tokens into a single response string.
-        // .toStream() keeps the calling code blocking and readable;
-        // Collectors.joining() is the canonical Streams-API form (StringJoiner
-        // uses StringBuilder under the hood — same performance, declarative read).
-        return stream.toStream().collect(Collectors.joining());
+                .content()
+                .collect(Collectors.joining())
+                .block();
     }
 
     /**
