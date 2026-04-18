@@ -389,8 +389,9 @@ func headerContains(h http.Header, canonicalKey, value string) bool {
 //     (nil, empty, or not valid JSON), the criterion returns 1 (vacuous
 //     match — the body dimension is irrelevant for this request/tape
 //     pair). If exactly one side is absent, the criterion returns 0.
-//   - Both bodies are unmarshaled as JSON. If either body is not valid JSON,
-//     the criterion returns 0 (no match).
+//   - When both bodies are present (not absent per the rule above),
+//     they are unmarshaled as JSON. Path extraction and comparison
+//     proceeds on the unmarshaled values.
 //   - For each specified path, the value is extracted from both the request
 //     and the tape body. If a path does not exist in both bodies, it is
 //     skipped (does not cause a mismatch).

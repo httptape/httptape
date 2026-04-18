@@ -1286,6 +1286,48 @@ func TestMatchBodyFuzzy_VacuousTrue(t *testing.T) {
 	}
 }
 
+func TestMatchBodyFuzzy_VacuousTrueComposability(t *testing.T) {
+	// Integration test: validates the real user story from issue #178.
+	// A CompositeMatcher with MatchMethod, MatchPath, and MatchBodyFuzzy
+	// must correctly match a body-less GET request against a body-less
+	// GET tape, without MatchBodyFuzzy eliminating the candidate via score 0.
+	matcher := NewCompositeMatcher(
+		MatchMethod(),
+		MatchPath(),
+		MatchBodyFuzzy("$.action"),
+	)
+
+	// Candidate tapes: one body-less GET and one bodied POST.
+	getTape := Tape{
+		ID: "get-tape",
+		Request: RecordedReq{
+			Method: "GET",
+			URL:    "http://example.com/test",
+			Body:   nil, // no body
+		},
+	}
+	postTape := Tape{
+		ID: "post-tape",
+		Request: RecordedReq{
+			Method: "POST",
+			URL:    "http://example.com/test",
+			Body:   []byte(`{"action":"create"}`),
+		},
+	}
+	candidates := []Tape{getTape, postTape}
+
+	// Incoming request: GET /test with no body.
+	req := httptest.NewRequest("GET", "/test", nil)
+
+	matched, ok := matcher.Match(req, candidates)
+	if !ok {
+		t.Fatal("CompositeMatcher.Match() returned ok=false, want a match")
+	}
+	if matched.ID != "get-tape" {
+		t.Errorf("CompositeMatcher.Match() matched tape ID = %q, want %q", matched.ID, "get-tape")
+	}
+}
+
 func TestMatchBodyFuzzy_InvalidPaths(t *testing.T) {
 	// All paths invalid => parsed list is empty => returns 0
 	criterion := MatchBodyFuzzy("not-a-path", "also-bad")
