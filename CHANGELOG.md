@@ -4,6 +4,23 @@ All notable changes to httptape are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.1] - 2026-04-18
+
+### Changed
+
+- `Proxy` now composes `CachingTransport` internally, completing ADR-44
+  Option B (deferred from v0.13.0 in PR #204). The L1 cache + fallback
+  remain Proxy concerns; L2 cache + SSE tee + stale fallback are
+  delegated to CachingTransport. **No observable behavior change for
+  CLI users or Go embedders** -- all existing `ProxyOption` functions
+  continue to work identically. Single-flight deduplication is now active
+  in proxy mode. See #205.
+
+### Fixed
+
+- Documentation previously claimed "Proxy composes CachingTransport"
+  as of v0.13.0; this is now actually true.
+
 ## [0.13.0] - 2026-04-18
 
 ### Added

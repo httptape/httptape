@@ -15,9 +15,15 @@ import (
 // records successful responses to a two-tier cache (L1 in-memory, L2 on disk),
 // and falls back to cached tapes on transport failure.
 //
+// Internally, Proxy composes a CachingTransport for upstream forwarding,
+// sanitization, and L2 recording. Fallback logic remains a Proxy concern.
+// An unexported l1RecordingTransport wraps the upstream to intercept
+// responses on the miss path, saving raw (unsanitized) tapes to L1
+// before CachingTransport sanitizes and saves to L2.
+//
 // On success:
-//   - Raw (unsanitized) tape saved to L1 (MemoryStore)
-//   - Sanitized tape saved to L2 (FileStore)
+//   - Raw (unsanitized) tape saved to L1 via l1RecordingTransport
+//   - Sanitized tape saved to L2 via CachingTransport
 //   - Real response returned to caller
 //
 // On failure:
@@ -27,20 +33,48 @@ import (
 //
 // Proxy is safe for concurrent use by multiple goroutines.
 type Proxy struct {
-	transport  http.RoundTripper                         // real backend transport
-	l1         Store                                     // raw/ephemeral (typically *MemoryStore)
-	l2         Store                                     // sanitized/persistent (typically *FileStore)
-	sanitizer  Sanitizer                                 // applied to L2 writes only
-	matcher    Matcher                                   // for fallback lookups
-	route      string                                    // logical route label
-	onError    func(error)                               // error callback
-	isFallback func(err error, resp *http.Response) bool // determines when to fall back
+	// ct is the composed CachingTransport that handles L2 cache lookup,
+	// upstream forwarding, sanitization, and recording. Constructed in
+	// NewProxy from the provided l2 store and relevant options.
+	ct *CachingTransport
 
-	// sseReplayTiming controls SSE replay timing for L2 fallback.
+	// l1 is the raw/ephemeral store for unsanitized tapes. Proxy manages
+	// L1 independently -- CachingTransport knows nothing about it.
+	l1 Store
+
+	// l2 is retained for direct fallback lookups (L2 fallback path).
+	// CachingTransport also holds a reference to l2 as its store.
+	l2 Store
+
+	// matcher is used for L1 and L2 fallback lookups.
+	matcher Matcher
+
+	// isFallback determines when to enter the fallback path.
+	// Proxy-specific: CachingTransport has staleFallback (bool) which
+	// only covers transport errors. Proxy's isFallback also handles
+	// 5xx-triggered fallback.
+	isFallback func(err error, resp *http.Response) bool
+
+	// route label for L1 tape creation.
+	route string
+
+	// onError callback for non-fatal errors.
+	onError func(error)
+
+	// sanitizer is captured during construction from WithProxySanitizer
+	// and routed to CachingTransport via WithCacheSanitizer. Not used
+	// after NewProxy returns.
+	sanitizer Sanitizer
+
+	// sseReplayTiming controls SSE replay timing for fallback responses.
 	sseReplayTiming SSETimingMode
 
+	// transport is retained solely for the health monitor's probe
+	// (which calls transport.RoundTrip directly, not via CachingTransport).
+	transport http.RoundTripper
+
 	// health is the optional HealthMonitor enabled via WithProxyHealthEndpoint.
-	// nil when the option is absent — every call site is nil-receiver-safe so
+	// nil when the option is absent -- every call site is nil-receiver-safe so
 	// the default behavior is byte-for-byte identical to a Proxy without the
 	// health surface.
 	health *HealthMonitor
@@ -53,6 +87,184 @@ type Proxy struct {
 	probePath       string
 	healthErrorFunc func(error)
 	upstreamURLHint string
+}
+
+// neverMatcher is a Matcher that never matches any request. It is used
+// by Proxy's internal CachingTransport to ensure every request is treated
+// as a cache miss and forwarded to upstream. Proxy handles its own
+// L1/L2 cache lookup in the fallback path with the user-configured matcher.
+type neverMatcher struct{}
+
+func (neverMatcher) Match(_ *http.Request, _ []Tape) (Tape, bool) {
+	return Tape{}, false
+}
+
+// l1RecordingTransport wraps an http.RoundTripper to intercept upstream
+// responses and save raw (unsanitized) tapes to the L1 store. This is
+// used by Proxy to inject L1 recording into CachingTransport's miss path
+// without CachingTransport knowing about L1.
+//
+// On cache miss, CachingTransport calls l1RecordingTransport.RoundTrip,
+// which forwards to the real upstream, captures the raw response, saves
+// it to L1, and returns the response unchanged. CachingTransport then
+// sanitizes and saves to L2.
+//
+// For SSE responses, the body is wrapped in an sseRecordingReader that
+// saves the raw SSE tape to L1 on stream completion. CachingTransport
+// then wraps the returned body again with its own SSE tee recording
+// reader for L2.
+//
+// Responses that would trigger Proxy's fallback (per isFallback) are
+// not recorded to L1.
+type l1RecordingTransport struct {
+	inner      http.RoundTripper
+	l1         Store
+	route      string
+	onError    func(error)
+	health     *HealthMonitor
+	isFallback func(err error, resp *http.Response) bool
+}
+
+// RoundTrip forwards the request to the real upstream and saves the raw
+// response to L1. For SSE responses, the body is wrapped in an
+// sseRecordingReader that saves the raw SSE tape to L1 on stream
+// completion. CachingTransport then wraps the returned body again with
+// its own SSE tee recording reader for L2. Returns the upstream response
+// (possibly with a wrapped body for SSE).
+func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if the response would trigger fallback. If so, skip L1 save --
+	// fallback responses should not pollute L1 (which would cause the
+	// fallback matcher to find the error response instead of the good one).
+	if t.isFallback(nil, resp) {
+		return resp, nil
+	}
+
+	// Retrieve request body via GetBody (set by Proxy.RoundTrip).
+	var reqBody []byte
+	if req.GetBody != nil {
+		body, gbErr := req.GetBody()
+		if gbErr == nil {
+			reqBody, _ = io.ReadAll(body)
+			body.Close()
+		}
+	}
+
+	// SSE responses: wrap body with an sseRecordingReader for L1 recording.
+	// CachingTransport will wrap the returned body again for L2 recording.
+	if isSSEContentType(resp.Header.Get("Content-Type")) {
+		return t.roundTripSSE(req, resp, reqBody), nil
+	}
+
+	// Non-SSE: read response body, build raw tape, save to L1, restore body.
+	var respBody []byte
+	if resp.Body != nil {
+		var readErr error
+		respBody, readErr = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		if readErr != nil {
+			t.onErrorSafe(fmt.Errorf("httptape: l1 recording read response body: %w", readErr))
+			// Update health state even on partial read.
+			t.health.observe(StateLive)
+			return resp, nil
+		}
+	}
+
+	recordedReq := RecordedReq{
+		Method:   req.Method,
+		URL:      req.URL.String(),
+		Headers:  req.Header.Clone(),
+		Body:     reqBody,
+		BodyHash: BodyHashFromBytes(reqBody),
+	}
+	recordedResp := RecordedResp{
+		StatusCode: resp.StatusCode,
+		Headers:    resp.Header.Clone(),
+		Body:       respBody,
+	}
+
+	rawTape := NewTape(t.route, recordedReq, recordedResp)
+
+	if saveErr := t.l1.Save(req.Context(), rawTape); saveErr != nil {
+		t.onErrorSafe(saveErr)
+	}
+
+	// Update health state for successful upstream call.
+	t.health.observe(StateLive)
+
+	return resp, nil
+}
+
+// roundTripSSE handles SSE responses in the L1 recording path. The body
+// is wrapped in an sseRecordingReader that accumulates events and saves a
+// raw tape to L1 when the stream completes.
+func (t *l1RecordingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) *http.Response {
+	startTime := time.Now()
+	respHeaders := resp.Header.Clone()
+
+	recordedReq := RecordedReq{
+		Method:   req.Method,
+		URL:      req.URL.String(),
+		Headers:  req.Header.Clone(),
+		Body:     reqBody,
+		BodyHash: BodyHashFromBytes(reqBody),
+	}
+
+	var mu sync.Mutex
+	var events []SSEEvent
+
+	onEvent := func(ev SSEEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	onDone := func(parseErr error) {
+		mu.Lock()
+		collectedEvents := make([]SSEEvent, len(events))
+		copy(collectedEvents, events)
+		mu.Unlock()
+
+		truncated := parseErr != nil
+		if truncated {
+			t.onErrorSafe(fmt.Errorf("httptape: l1 SSE stream truncated: %w", parseErr))
+		}
+
+		recordedResp := RecordedResp{
+			StatusCode: resp.StatusCode,
+			Headers:    respHeaders,
+			Body:       nil,
+			SSEEvents:  collectedEvents,
+			Truncated:  truncated,
+		}
+
+		rawTape := NewTape(t.route, recordedReq, recordedResp)
+
+		// Save raw to L1.
+		if saveErr := t.l1.Save(context.Background(), rawTape); saveErr != nil {
+			t.onErrorSafe(saveErr)
+		}
+
+		// Update health state.
+		t.health.observe(StateLive)
+	}
+
+	wrapper := newSSERecordingReader(resp.Body, startTime, onEvent, onDone)
+	resp.Body = wrapper
+
+	return resp
+}
+
+// onErrorSafe calls the error callback if it is set.
+func (t *l1RecordingTransport) onErrorSafe(err error) {
+	if t.onError != nil {
+		t.onError(err)
+	}
 }
 
 // ProxyOption configures a Proxy.
@@ -153,12 +365,12 @@ func WithProxyTLSConfig(cfg *tls.Config) ProxyOption {
 // (text/event-stream).
 //
 // The active probe loop (if configured via WithProxyProbeInterval) is started
-// the first time Proxy.Start is called — never at construction time, so
+// the first time Proxy.Start is called -- never at construction time, so
 // embedders that build a Proxy without ever serving HTTP do not leak
 // goroutines.
 //
 // With this option absent, Proxy.HealthHandler() returns nil and the request
-// path takes a no-op branch when recording state — preserving byte-for-byte
+// path takes a no-op branch when recording state -- preserving byte-for-byte
 // default behavior.
 //
 // opts may inject a clock, an error handler, or other HealthMonitor knobs.
@@ -219,6 +431,11 @@ func WithProxyUpstreamURL(url string) ProxyOption {
 // NewProxy creates a new Proxy with the given L1 (ephemeral) and L2 (persistent)
 // stores.
 //
+// Internally, NewProxy constructs a CachingTransport that uses l2 as its store
+// and routes the configured sanitizer, matcher, route, and onError callback.
+// The upstream transport is wrapped in an l1RecordingTransport that saves raw
+// tapes to L1 on the miss path.
+//
 // Defaults:
 //   - transport: http.DefaultTransport
 //   - sanitizer: NewPipeline() (no-op)
@@ -254,7 +471,7 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy {
 
 	if p.healthEnabled {
 		// Default the upstream URL to "" when the embedder didn't provide one.
-		// HealthMonitor's constructor guard panics on empty upstream — give a
+		// HealthMonitor's constructor guard panics on empty upstream -- give a
 		// clearer message here pointing at the right option.
 		if p.upstreamURLHint == "" {
 			panic("httptape: WithProxyHealthEndpoint requires WithProxyUpstreamURL")
@@ -291,12 +508,51 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy {
 		p.health = NewHealthMonitor(p.upstreamURLHint, p, hOpts...)
 	}
 
+	// Construct the l1RecordingTransport that wraps the upstream transport.
+	// This intercepts upstream responses on cache-miss and saves raw tapes
+	// to L1 before CachingTransport sanitizes and saves to L2.
+	l1RT := &l1RecordingTransport{
+		inner:      p.transport,
+		l1:         p.l1,
+		route:      p.route,
+		onError:    p.onError,
+		health:     p.health,
+		isFallback: p.isFallback,
+	}
+
+	// Construct CachingTransport with l1RecordingTransport as upstream.
+	// CachingTransport handles: upstream forwarding (via l1RecordingTransport),
+	// sanitization, L2 recording, SSE tee recording, single-flight dedup.
+	//
+	// neverMatcher ensures CachingTransport always treats requests as cache
+	// misses. Proxy handles its own L1/L2 lookup in the fallback path using
+	// the user-configured matcher. This preserves the original Proxy semantics
+	// where the upstream is always consulted first (caches are fallback-only).
+	//
+	// The cacheFilter prevents CachingTransport from recording responses that
+	// would trigger Proxy's fallback. In the original Proxy, fallback-triggering
+	// responses (e.g. 5xx when WithProxyFallbackOn is configured) were never
+	// saved to L2.
+	isFallback := p.isFallback
+	cacheFilter := func(resp *http.Response) bool {
+		return !isFallback(nil, resp)
+	}
+
+	p.ct = NewCachingTransport(l1RT, p.l2,
+		WithCacheMatcher(neverMatcher{}),
+		WithCacheSanitizer(p.sanitizer),
+		WithCacheRoute(p.route),
+		WithCacheOnError(p.onError),
+		WithCacheSSERecording(true),
+		WithCacheFilter(cacheFilter),
+	)
+
 	return p
 }
 
 // HealthHandler returns the http.Handler that serves /__httptape/health and
 // /__httptape/health/stream. Returns nil when WithProxyHealthEndpoint was not
-// set — callers should mount the handler conditionally.
+// set -- callers should mount the handler conditionally.
 //
 // The handler routes only the two health paths; any other path returns 404.
 // Callers compose it into their own mux.
@@ -322,7 +578,7 @@ func (p *Proxy) Start() {
 // to call zero or more times; idempotent. Returns when all goroutines spawned
 // by the Proxy have exited.
 //
-// Close does NOT close the L1/L2 stores — they are owned by the caller.
+// Close does NOT close the L1/L2 stores -- they are owned by the caller.
 func (p *Proxy) Close() error {
 	if p.health == nil {
 		return nil
@@ -330,16 +586,18 @@ func (p *Proxy) Close() error {
 	return p.health.Close()
 }
 
-// RoundTrip executes the HTTP request via the inner transport. On success,
-// the raw response is saved to L1 and a sanitized copy is saved to L2, then
-// the real response is returned. On failure (as determined by the isFallback
-// function), cached tapes are consulted: L1 first, then L2. If neither cache
-// has a match, the original transport error is returned.
+// RoundTrip implements http.RoundTripper. The request flow is:
 //
-// The response body is fully read into memory and replaced with a new
-// io.ReadCloser (same pattern as Recorder.RoundTrip).
+//  1. Capture request body (needed for fallback matching).
+//  2. Forward to CachingTransport.RoundTrip. CachingTransport always
+//     treats the request as a cache miss (neverMatcher) and forwards to
+//     upstream via l1RecordingTransport (saves raw to L1), then sanitizes
+//     and saves to L2.
+//  3. On success: check isFallback. If true (e.g., 5xx fallback), enter
+//     fallback path. Otherwise return response.
+//  4. On error: enter fallback path (L1 -> L2 -> original error).
 func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
-	// 1. Capture request body before forwarding (needed for tape + fallback matching).
+	// 1. Capture request body before forwarding (needed for L1 matching + fallback).
 	var reqBody []byte
 	if req.Body != nil {
 		var err error
@@ -355,8 +613,11 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	// 2. Forward to real backend.
-	resp, transportErr := p.transport.RoundTrip(req)
+	// 2. Forward to CachingTransport. CachingTransport uses a neverMatcher
+	// so it always treats the request as a cache miss and forwards to
+	// upstream via l1RecordingTransport (which saves raw to L1).
+	// CachingTransport then sanitizes and saves to L2.
+	resp, transportErr := p.ct.RoundTrip(req)
 
 	// 3. Decide: success or fallback?
 	if p.isFallback(transportErr, resp) {
@@ -379,55 +640,9 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		return p.fallback(req, resp, transportErr)
 	}
 
-	// 4. SSE detection on success path.
-	if isSSEContentType(resp.Header.Get("Content-Type")) {
-		return p.roundTripSSE(req, resp, reqBody)
-	}
-
-	// 5. Success path: capture response body (non-SSE).
-	var respBody []byte
-	if resp.Body != nil {
-		var err error
-		respBody, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		if err != nil {
-			p.onErrorSafe(fmt.Errorf("httptape: proxy read response body: %w", err))
-			return resp, nil
-		}
-	}
-
-	// 6. Build raw tape.
-	recordedReq := RecordedReq{
-		Method:   req.Method,
-		URL:      req.URL.String(),
-		Headers:  req.Header.Clone(),
-		Body:     reqBody,
-		BodyHash: BodyHashFromBytes(reqBody),
-	}
-	recordedResp := RecordedResp{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Header.Clone(),
-		Body:       respBody,
-	}
-
-	rawTape := NewTape(p.route, recordedReq, recordedResp)
-
-	// 8. Save raw to L1 (synchronous, in-memory, fast).
-	if saveErr := p.l1.Save(req.Context(), rawTape); saveErr != nil {
-		p.onErrorSafe(saveErr)
-	}
-
-	// 9. Sanitize and save to L2 (synchronous).
-	sanitizedTape := p.sanitizer.Sanitize(rawTape)
-	if saveErr := p.l2.Save(req.Context(), sanitizedTape); saveErr != nil {
-		p.onErrorSafe(saveErr)
-	}
-
-	// 10. Update health state (no-op when health surface disabled).
-	p.health.observe(StateLive)
-
-	// 11. Return real response (with body restored).
+	// 4. Success path: L1 save already happened in l1RecordingTransport
+	// (if this was a miss). L2 save already happened in CachingTransport.
+	// No additional action needed here.
 	return resp, nil
 }
 
@@ -478,73 +693,6 @@ func (p *Proxy) matchFromStore(ctx context.Context, req *http.Request, store Sto
 	return p.matcher.Match(req, tapes)
 }
 
-// roundTripSSE handles SSE responses in the proxy success path. The body
-// is wrapped in an sseRecordingReader that delivers bytes to the caller
-// unchanged while a background goroutine parses SSE events. When the
-// stream completes, the tape is saved to L1 and L2.
-func (p *Proxy) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) (*http.Response, error) {
-	startTime := time.Now()
-	respHeaders := resp.Header.Clone()
-
-	recordedReq := RecordedReq{
-		Method:   req.Method,
-		URL:      req.URL.String(),
-		Headers:  req.Header.Clone(),
-		Body:     reqBody,
-		BodyHash: BodyHashFromBytes(reqBody),
-	}
-
-	var mu sync.Mutex
-	var events []SSEEvent
-
-	onEvent := func(ev SSEEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	onDone := func(parseErr error) {
-		mu.Lock()
-		collectedEvents := make([]SSEEvent, len(events))
-		copy(collectedEvents, events)
-		mu.Unlock()
-
-		truncated := parseErr != nil
-		if truncated {
-			p.onErrorSafe(fmt.Errorf("httptape: proxy SSE stream truncated: %w", parseErr))
-		}
-
-		recordedResp := RecordedResp{
-			StatusCode: resp.StatusCode,
-			Headers:    respHeaders,
-			Body:       nil,
-			SSEEvents:  collectedEvents,
-			Truncated:  truncated,
-		}
-
-		rawTape := NewTape(p.route, recordedReq, recordedResp)
-
-		// Save raw to L1.
-		if saveErr := p.l1.Save(context.Background(), rawTape); saveErr != nil {
-			p.onErrorSafe(saveErr)
-		}
-
-		// Sanitize and save to L2.
-		sanitizedTape := p.sanitizer.Sanitize(rawTape)
-		if saveErr := p.l2.Save(context.Background(), sanitizedTape); saveErr != nil {
-			p.onErrorSafe(saveErr)
-		}
-
-		// Update health state.
-		p.health.observe(StateLive)
-	}
-
-	wrapper := newSSERecordingReader(resp.Body, startTime, onEvent, onDone)
-	resp.Body = wrapper
-
-	return resp, nil
-}
-
 // tapeToResponse synthesizes an *http.Response from a cached Tape.
 // The source parameter is set as the X-Httptape-Source header to indicate
 // where the response came from ("l1-cache" or "l2-cache"). The same value
@@ -555,7 +703,7 @@ func (p *Proxy) tapeToResponse(tape Tape, source string) *http.Response {
 		header = tape.Response.Headers.Clone()
 	}
 	header.Set("X-Httptape-Source", source)
-	// Remove stale Content-Length — the body may differ from the original
+	// Remove stale Content-Length -- the body may differ from the original
 	// due to sanitization. Let the HTTP stack set it from actual body size.
 	header.Del("Content-Length")
 

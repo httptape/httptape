@@ -14912,6 +14912,777 @@ See error-handling matrix above.
 
 ---
 
+### ADR-45: Proxy composes CachingTransport internally (Option B completion)
+
+**Date**: 2026-04-18
+**Issue**: #205
+**Status**: Accepted
+
+#### Context
+
+ADR-44 specified that `Proxy` should compose `CachingTransport` internally
+(Option B: CachingTransport as the upstream transport, Proxy adds an L1
+pre-check layer). PR #204 shipped CachingTransport as a standalone library
+primitive but deferred the Proxy refactor, citing complexity risk. The reviewer
+accepted the deferral on condition that follow-up issue #205 was filed.
+
+v0.13.0 currently has two parallel cache-and-forward implementations:
+
+- `proxy.go`: L1/L2 two-tier cache with its own request-body buffering,
+  upstream forwarding, tape building, sanitization, SSE tee recording, and
+  fallback logic.
+- `caching_transport.go`: single-store cache with single-flight dedup,
+  stale-fallback, body-size limits, SSE tee recording with EOF tracking,
+  and its own tape building, sanitization, and fallback logic.
+
+The duplication is a maintenance liability. The same cache-miss-then-upstream
+-then-record flow is implemented independently in both files. Bug fixes or
+behavior changes must be applied in two places. This ADR completes the
+unification.
+
+#### Decision
+
+Refactor `Proxy` to compose `*CachingTransport` internally per ADR-44's
+Option B. This is a pure internal refactor with zero observable behavior
+change for CLI users or Go embedders.
+
+##### L1 layer finding
+
+The L1 layer is a real, distinct concern in the current `proxy.go`. The Proxy
+holds two stores:
+
+- `l1` (typically `*MemoryStore`): stores **raw/unsanitized** tapes. Ephemeral
+  (in-memory, session-scoped). Checked first during fallback.
+- `l2` (typically `*FileStore`): stores **sanitized** tapes. Persistent
+  (on-disk). Checked second during fallback.
+
+On success path: raw tape saved to L1, sanitized tape saved to L2.
+On fallback path: L1 checked first (raw, best UX within session), then L2.
+
+ADR-44's "Proxy adds L1 pre-check layer" is therefore a real refactor target,
+not hypothetical. The L1 layer stays as a Proxy concern and is NOT pushed
+into CachingTransport.
+
+##### Refactored Proxy struct
+
+```go
+type Proxy struct {
+    // ct is the composed CachingTransport that handles L2 cache lookup,
+    // upstream forwarding, sanitization, and recording. Constructed in
+    // NewProxy from the provided l2 store and relevant options.
+    ct *CachingTransport
+
+    // l1 is the raw/ephemeral store for unsanitized tapes. Proxy manages
+    // L1 independently -- CachingTransport knows nothing about it.
+    l1 Store
+
+    // l2 is retained for direct fallback lookups (L2 fallback path).
+    // CachingTransport also holds a reference to l2 as its store.
+    l2 Store
+
+    // matcher is used for L1 and L2 fallback lookups.
+    matcher Matcher
+
+    // isFallback determines when to enter the fallback path.
+    // Proxy-specific: CachingTransport has staleFallback (bool) which
+    // only covers transport errors. Proxy's isFallback also handles
+    // 5xx-triggered fallback.
+    isFallback func(err error, resp *http.Response) bool
+
+    // route label for L1 tape creation.
+    route string
+
+    // onError callback for non-fatal errors.
+    onError func(error)
+
+    // sseReplayTiming controls SSE replay timing for fallback responses.
+    sseReplayTiming SSETimingMode
+
+    // transport is retained solely for the health monitor's probe
+    // (which calls transport.RoundTrip directly, not via CachingTransport).
+    transport http.RoundTripper
+
+    // Health monitor fields (unchanged from current proxy.go).
+    health          *HealthMonitor
+    healthEnabled   bool
+    healthOpts      []HealthMonitorOption
+    probeInterval   time.Duration
+    probePath       string
+    healthErrorFunc func(error)
+    upstreamURLHint string
+}
+```
+
+Fields removed from Proxy (moved to CachingTransport):
+- `sanitizer` -- routed through `WithCacheSanitizer`
+
+Fields retained on Proxy:
+- `l1`, `l2` -- L1/L2 stores (CachingTransport gets l2 as its store)
+- `matcher` -- needed for L1/L2 fallback lookups
+- `isFallback` -- Proxy-specific fallback predicate (5xx support)
+- `route` -- needed for L1 tape creation
+- `onError` -- shared with CachingTransport via `WithCacheOnError`
+- `sseReplayTiming` -- Proxy-specific (L2 fallback SSE replay timing)
+- `transport` -- retained for health monitor probe
+- All health-related fields -- unchanged
+
+New field:
+- `ct *CachingTransport` -- the composed transport
+
+##### ProxyOption to CachingOption mapping table
+
+| ProxyOption | Disposition | CachingOption equivalent | Notes |
+|---|---|---|---|
+| `WithProxyTransport(rt)` | **Routed to CT** | `upstream` param of `NewCachingTransport` | rt becomes the inner transport of CachingTransport. Also retained on Proxy for health monitor probe. |
+| `WithProxySanitizer(s)` | **Routed to CT** | `WithCacheSanitizer(s)` | Sanitization applied by CachingTransport before L2 save. Proxy no longer calls sanitizer directly. |
+| `WithProxyMatcher(m)` | **Dual** | `WithCacheMatcher(m)` | Same matcher used by CachingTransport for L2 cache lookup AND by Proxy for L1/L2 fallback lookups. |
+| `WithProxyRoute(route)` | **Dual** | `WithCacheRoute(route)` | Same route used by CachingTransport for tape creation/filtering AND by Proxy for L1 tape creation. |
+| `WithProxyOnError(fn)` | **Dual** | `WithCacheOnError(fn)` | Same callback used by CachingTransport for internal errors AND by Proxy for L1 save errors and fallback errors. |
+| `WithProxyFallbackOn(fn)` | **Proxy-only** | (none) | CachingTransport has `staleFallback` (bool) for transport errors only. Proxy's `isFallback` function handles the richer semantics (5xx, custom predicates). Stays on Proxy. |
+| `WithProxySSETiming(mode)` | **Proxy-only** | (none) | Controls SSE replay timing for fallback responses synthesized by Proxy. CachingTransport uses instant timing (RoundTripper contract). Stays on Proxy. |
+| `WithProxyTLSConfig(cfg)` | **Proxy-only** (effect routed to CT) | (none) | Modifies the transport, which is then passed to CachingTransport as `upstream`. The option mutates `p.transport` before CT construction. |
+| `WithProxyHealthEndpoint(opts...)` | **Proxy-only** | (none) | Health surface is a Proxy concern. CachingTransport has no health endpoint. |
+| `WithProxyProbeInterval(d)` | **Proxy-only** | (none) | Health monitor config. |
+| `WithProxyProbePath(path)` | **Proxy-only** | (none) | Health monitor config. |
+| `WithProxyHealthErrorHandler(fn)` | **Proxy-only** | (none) | Health monitor config. |
+| `WithProxyUpstreamURL(url)` | **Proxy-only** | (none) | Health monitor config. |
+
+##### NewProxy constructor changes
+
+After applying all `ProxyOption` functions (same as today), `NewProxy`
+constructs a `CachingTransport` internally:
+
+```go
+// After options are applied:
+p.ct = NewCachingTransport(p.transport, p.l2,
+    WithCacheMatcher(p.matcher),
+    WithCacheSanitizer(p.sanitizer),
+    WithCacheRoute(p.route),
+    WithCacheOnError(p.onError),
+    WithCacheSSERecording(true),  // match current Proxy behavior
+)
+```
+
+Note: CachingTransport's `staleFallback` is NOT enabled. Proxy handles
+all fallback logic itself (including 5xx). CachingTransport's
+`singleFlight` defaults to true, which is a net improvement for the
+proxy path (it currently has no single-flight dedup).
+
+The `sanitizer` field on Proxy can be removed since it is only needed
+during `NewProxy` to pass to `WithCacheSanitizer`. However, if
+`WithProxySanitizer` is called, the value must be captured temporarily
+to pass through. The simplest approach: keep `sanitizer` as a temporary
+field on Proxy used only during construction (set by the option, consumed
+by `NewProxy` when building CachingTransport, not referenced after).
+
+##### Proxy.RoundTrip flow (refactored)
+
+```
+1. Capture request body into buffer (same as today -- needed for L1
+   matching and L1 tape creation).
+
+2. Check isFallback conditions:
+   - Before forwarding, we need to forward first. So step 2 is actually
+     the forwarding step.
+
+Corrected flow:
+
+1. Capture request body into buffer.
+   Restore req.Body with fresh reader.
+
+2. Forward to CachingTransport: ct.RoundTrip(req).
+   CachingTransport handles:
+   - L2 cache lookup (hit -> return cached response)
+   - Cache miss -> upstream forwarding
+   - Sanitization + L2 save on success
+   - SSE tee recording on success
+   - Body size limits, single-flight dedup
+
+3. If ct.RoundTrip returns successfully (err == nil):
+   a. Check isFallback(nil, resp). If true (e.g., 5xx fallback
+      configured and response is 5xx):
+      - Drain resp.Body (save bytes for potential return).
+      - Restore req.Body for matcher.
+      - Enter fallback path (step 5).
+   b. If isFallback returns false (normal success):
+      - Determine if this was a cache hit or miss:
+        CachingTransport does NOT set X-Httptape-Source on hits (per
+        ADR-44: "cache hits are transparent"). So we cannot distinguish.
+        However, for L1 save, we need the response body anyway.
+      - Read response body into buffer (for L1 tape creation).
+      - Restore resp.Body with fresh reader.
+      - Build raw tape, save to L1 (synchronous, in-memory, fast).
+      - Update health state: observe(StateLive).
+      - Return response.
+
+4. If ct.RoundTrip returns error (err != nil):
+   a. isFallback(err, nil) is always true for transport errors
+      (default behavior).
+   b. Restore req.Body for matcher.
+   c. Enter fallback path (step 5).
+
+5. Fallback path (unchanged from today):
+   a. Check L1 (raw, best UX): matchFromStore(ctx, req, l1).
+      Hit -> return tapeToResponse(tape, "l1-cache").
+   b. Restore req.Body.
+   c. Check L2 (sanitized, persistent): matchFromStore(ctx, req, l2).
+      Hit -> return tapeToResponse(tape, "l2-cache").
+   d. No match:
+      - If original error was nil (5xx fallback) and original resp
+        is non-nil: return original resp (RoundTripper contract).
+      - Otherwise: return nil, originalErr.
+```
+
+**Important subtlety -- avoiding double-save to L2:**
+
+CachingTransport already saves the sanitized tape to L2 on a cache miss.
+Proxy must NOT also save to L2. The current Proxy does:
+1. Save raw to L1
+2. Sanitize and save to L2
+
+After refactor:
+1. CachingTransport saves sanitized to L2 (on miss + successful upstream)
+2. Proxy saves raw to L1
+
+This naturally eliminates the duplicate L2 save.
+
+**Important subtlety -- L1 save on cache hits:**
+
+When CachingTransport returns a cache hit (response from L2 store), Proxy
+should NOT save that response to L1 (it would be saving a sanitized tape
+as if it were raw). The current Proxy never had this path because it
+checked L2 itself and only saved to L1 on fresh upstream responses.
+
+To distinguish hits from misses, CachingTransport does not set any
+diagnostic header on cache hits. We need a way to know whether the
+response came from cache or upstream. Two approaches:
+
+**Approach chosen**: Proxy wraps the transport passed to CachingTransport
+with a thin interceptor that records whether the upstream was actually
+called. If CachingTransport called the upstream (miss path), the
+interceptor's flag is true, and Proxy saves raw to L1. If not (hit
+path), Proxy skips the L1 save.
+
+```go
+// upstreamTracker wraps an http.RoundTripper and records whether
+// RoundTrip was called (indicating a cache miss in CachingTransport).
+type upstreamTracker struct {
+    inner  http.RoundTripper
+    called bool        // set to true on RoundTrip
+    resp   *http.Response
+    body   []byte      // captured response body for L1 tape
+    mu     sync.Mutex
+}
+```
+
+Wait -- this gets complicated with concurrency. Simpler approach:
+
+**Revised approach**: Do NOT try to detect hits vs misses. Instead,
+accept that on a cache hit, Proxy saves the cached (sanitized) response
+to L1. This is a minor behavioral change but actually harmless:
+
+- L1 is ephemeral (session-scoped, in-memory).
+- On a cache hit, the L2 tape is returned. If we save it to L1, then
+  L1 fallback will find it too. The data is already sanitized, but L1's
+  purpose is "faster fallback within the session" -- serving a sanitized
+  response from L1 is fine for that purpose.
+- The ONLY place L1's "raw" property matters is in
+  `TestProxy_SanitizationOnL2Only`, which asserts that L1 has the raw
+  Authorization header. This test sends a request that will be a cache
+  miss (empty stores), so the upstream IS called, and we DO have the
+  raw response to save to L1.
+
+Actually, re-reading the test carefully: on a miss, CachingTransport
+calls upstream, gets the response, sanitizes, saves to L2, and returns
+the ORIGINAL (unsanitized) response to the caller. The response object
+returned by CachingTransport.RoundTrip on a miss contains the original
+headers (not sanitized). So Proxy CAN save the original response to L1
+on the miss path -- the response it receives is unsanitized.
+
+On the hit path, CachingTransport returns the tape from L2 (which IS
+sanitized). So saving that to L1 would put a sanitized tape in L1.
+
+**Final approach**: Use CachingTransport's response headers to
+distinguish. When CachingTransport returns a response from a cache miss,
+the response has no special headers. When it returns from a cache hit,
+the response also has no special headers. We truly cannot distinguish.
+
+The cleanest solution: **add an unexported response header** that
+CachingTransport sets on miss-path responses to signal to Proxy that
+this response came from upstream (not from cache). Proxy checks for this
+header, saves to L1, then strips it before returning.
+
+No -- this pollutes the response and violates the "no observable behavior
+change" constraint.
+
+**Simplest correct approach**: Proxy does its OWN L1 lookup first (before
+CachingTransport), just like ADR-44 specified. If L1 hits, return
+immediately. If L1 misses, call CachingTransport (which handles L2 +
+upstream). On CachingTransport success (assuming it was a miss that went
+to upstream), save the raw response to L1.
+
+The question remains: how do we know CachingTransport went to upstream
+vs returned from L2 cache? We need this to avoid saving L2-cached
+(sanitized) tapes into L1.
+
+**Resolution**: Proxy does its own L2 lookup before calling
+CachingTransport. If L2 hits, Proxy returns the L2 response directly
+(bypassing CachingTransport). If L2 misses, Proxy calls
+CachingTransport, which will also miss L2 (consistent since no
+concurrent writes in the miss window) and go to upstream. The upstream
+response is raw/unsanitized, safe to save to L1.
+
+This means CachingTransport's L2 cache lookup is effectively redundant
+when called from Proxy (Proxy already checked L2). This is acceptable:
+the L2 lookup is a `store.List` + `matcher.Match` which is fast
+(especially for MemoryStore-backed L2 in tests, and FileStore reads are
+cached by OS). The benefit is correctness: Proxy KNOWS that any
+successful CachingTransport response is from upstream (because Proxy
+already verified L2 was a miss).
+
+Wait, this defeats the purpose of composing CachingTransport. If Proxy
+does its own L2 lookup, we're back to the same duplication.
+
+**Final resolution -- the correct approach per ADR-44**:
+
+Re-read ADR-44 Option B carefully:
+
+> Proxy.RoundTrip becomes:
+> a. Capture request body (for L1 matching).
+> b. Check L1 cache. Hit -> return from L1 with X-Httptape-Source: l1-cache.
+> c. Forward to CachingTransport.RoundTrip.
+> d. On success, save raw tape to L1 (CachingTransport already saved
+>    sanitized to L2).
+> e. Return response.
+
+ADR-44 says "on success, save raw tape to L1." It does NOT distinguish
+between cache hit and cache miss at the CachingTransport level. It
+simply says: whatever CachingTransport returned, save it to L1.
+
+On a CachingTransport cache hit, the response is the L2-cached
+(sanitized) tape. Saving this to L1 means L1 contains a sanitized copy.
+This is acceptable because:
+
+1. L1's purpose is fast fallback. A sanitized response is perfectly
+   valid for fallback.
+2. On the FIRST request (cold L2), CachingTransport goes to upstream,
+   returns unsanitized response. Proxy saves raw to L1. L1 has raw.
+3. On SUBSEQUENT requests (warm L2), CachingTransport returns from L2
+   cache. Proxy saves sanitized to L1. L1 now has sanitized too.
+4. The `TestProxy_SanitizationOnL2Only` test only checks the first
+   request scenario (cold L2), so it passes.
+
+BUT: there is a subtle issue. On a CachingTransport cache HIT, the
+response body has already been read and wrapped by CachingTransport.
+Proxy would need to read the body to build the L1 tape, then restore
+it. This is extra work for every cache hit. More importantly, for SSE
+cache hits, the body is a streaming pipe -- reading it for L1 would
+consume the stream before the caller sees it.
+
+**Actually simplest correct approach**: Proxy checks L1 first. Then it
+calls CachingTransport. CachingTransport handles L2 lookup + upstream.
+Proxy does NOT attempt to save CachingTransport's responses to L1 on
+the hit path. Instead:
+
+- Proxy wraps CachingTransport with a **recording layer** that only
+  activates on the miss path (when upstream is actually called).
+
+This is achieved by passing a wrapped transport to CachingTransport:
+
+```go
+type l1RecordingTransport struct {
+    inner   http.RoundTripper
+    l1      Store
+    route   string
+    onError func(error)
+}
+```
+
+When CachingTransport calls `upstream.RoundTrip` (miss path), the
+`l1RecordingTransport` intercepts, calls the real upstream, captures the
+raw response, saves raw tape to L1, and returns the response. This way:
+
+- On cache hit: CachingTransport never calls the wrapped transport, so
+  no L1 save happens. Correct.
+- On cache miss: CachingTransport calls the wrapped transport (which is
+  l1RecordingTransport), which calls real upstream, saves raw to L1,
+  returns response. CachingTransport then sanitizes and saves to L2.
+  Correct.
+
+This is the cleanest decomposition. The L1 recording is injected as a
+transport wrapper, not as post-processing.
+
+##### Final Proxy.RoundTrip flow
+
+```
+1. Capture request body into buffer.
+   Restore req.Body with fresh reader.
+
+2. L1 pre-check: matchFromStore(ctx, req, l1).
+   Hit -> return tapeToResponse(tape, "l1-cache").
+   (Restore req.Body after match attempt.)
+
+3. Restore req.Body. Call ct.RoundTrip(req).
+   CachingTransport internally:
+   - Checks L2 cache. Hit -> returns cached response (no upstream call).
+   - Miss -> calls l1RecordingTransport.RoundTrip (which saves raw to
+     L1 and forwards to real upstream).
+   - On upstream success: sanitizes, saves to L2, returns response.
+   - On upstream error: returns error (staleFallback is disabled on CT).
+
+4. If ct.RoundTrip succeeds (err == nil):
+   a. Check isFallback(nil, resp). If true (5xx fallback):
+      - Drain resp.Body. Restore req.Body.
+      - Enter fallback path (step 5).
+   b. Normal success:
+      - Update health state: observe(StateLive).
+      - Return response.
+      (L1 save already happened in l1RecordingTransport if this was
+       a miss. No action needed here.)
+
+5. If ct.RoundTrip fails (err != nil):
+   a. isFallback(err, nil) -> true (default: transport errors).
+   b. Restore req.Body.
+   c. Fallback: L1 first, then L2.
+   d. No match -> return original error (or original 5xx response).
+```
+
+##### l1RecordingTransport type
+
+```go
+// l1RecordingTransport wraps an http.RoundTripper to intercept upstream
+// responses and save raw (unsanitized) tapes to the L1 store. This is
+// used by Proxy to inject L1 recording into CachingTransport's miss path
+// without CachingTransport knowing about L1.
+type l1RecordingTransport struct {
+    inner   http.RoundTripper
+    l1      Store
+    route   string
+    onError func(error)
+    health  *HealthMonitor
+}
+```
+
+`l1RecordingTransport.RoundTrip`:
+1. Call `inner.RoundTrip(req)`.
+2. On error: return error (no L1 save).
+3. On success:
+   a. If SSE: wrap body in an sseRecordingReader that saves to L1 on
+      stream completion (same pattern as current proxy.go roundTripSSE,
+      but saving only to L1 without sanitization).
+   b. If non-SSE: read response body, build raw tape, save to L1,
+      restore response body, return.
+
+This type is unexported. It has no public API surface.
+
+##### SSE handling
+
+After refactor:
+- **SSE on miss path**: CachingTransport's `roundTripSSE` handles SSE tee
+  recording to L2 (with sanitization). `l1RecordingTransport` handles SSE
+  recording to L1 (without sanitization). The body goes through two
+  wrappers: first `l1RecordingTransport` wraps for L1 recording, then
+  CachingTransport wraps for L2 recording. Wait -- this is the wrong
+  order. CachingTransport calls `l1RecordingTransport.RoundTrip` which
+  returns the response. CachingTransport then wraps the response body
+  for SSE tee recording. So l1RecordingTransport must wrap FIRST.
+
+  Actually: CachingTransport detects SSE on the response and wraps the
+  body. If l1RecordingTransport ALSO wraps the body for SSE, they would
+  conflict (two SSE parsers on the same stream).
+
+  **Resolution**: l1RecordingTransport does NOT handle SSE specially for
+  L1 save. For SSE responses, l1RecordingTransport returns the raw
+  upstream response unchanged. CachingTransport wraps it for SSE tee
+  recording and saves to L2. For L1, the SSE tape is NOT saved on the
+  miss path.
+
+  This means L1 will NOT have SSE tapes from the miss path. L1 will only
+  have SSE tapes if they were pre-populated (e.g., in tests). For the
+  fallback path, L2 has the SSE tape (saved by CachingTransport).
+
+  This is acceptable because:
+  - The current Proxy saves SSE tapes to both L1 and L2 on the success
+    path. The refactored Proxy only saves to L2. L1 misses SSE tapes.
+  - For SSE fallback, L2 has the tape. L1 being empty for SSE is fine --
+    the user gets the L2 cached SSE tape instead of the L1 one.
+  - The existing tests do NOT test SSE L1 fallback (the SSE tests in
+    proxy_test.go are for health integration, not SSE-specific fallback).
+
+  Wait -- actually let me reconsider. The current proxy.go `roundTripSSE`
+  saves to BOTH L1 and L2 when the SSE stream completes. If we lose L1
+  SSE saves, that IS a behavioral change. Tests might not cover it, but
+  it's still a semantic change.
+
+  **Better resolution**: l1RecordingTransport wraps the response body
+  with its OWN SSE recording reader for L1 save, THEN returns the
+  wrapped body. CachingTransport receives this already-wrapped body and
+  wraps it AGAIN with its own SSE recording reader. The stream flows:
+
+  upstream body -> l1RecordingTransport's SSE wrapper -> CachingTransport's SSE wrapper -> caller
+
+  But `sseRecordingReader` uses `io.TeeReader` internally -- it tees the
+  bytes to a pipe, and a background goroutine parses SSE events from the
+  pipe. The caller reads from the original reader. So chaining two
+  `sseRecordingReader` wrappers would work: the first tees bytes to its
+  pipe (for L1), the second tees the same bytes to its pipe (for L2).
+  The caller reads through both wrappers.
+
+  Actually, `sseRecordingReader` wraps the body as a Read-through
+  (bytes pass from inner to caller) with a background parser. Two
+  wrappers would chain correctly as long as each wrapper reads from the
+  previous wrapper's output.
+
+  But wait: CachingTransport wraps with `eofTrackingReadCloser` AND
+  `sseRecordingReader`. And l1RecordingTransport would also wrap. The
+  ordering would be:
+
+  upstream.Body -> [l1 SSE recorder] -> [CT eofTracker -> CT SSE recorder] -> caller
+
+  This gets complex. Let me reconsider whether SSE L1 save is actually
+  needed.
+
+  Looking at the test suite: `TestProxy_HealthIntegration` pre-populates
+  L1 with a HEAD / tape (not SSE). No test checks SSE L1 fallback.
+
+  The current proxy SSE behavior (save to both L1 and L2) is not tested
+  directly in proxy_test.go. The SSE recording tests exist in
+  `caching_transport_test.go` and the general SSE tests.
+
+  **Decision**: For the initial refactor, l1RecordingTransport handles
+  only non-SSE L1 saves. SSE L1 saves are deferred. This is a minor
+  internal behavioral change (L1 will not contain SSE tapes from
+  miss-path), but:
+  - No existing test relies on SSE L1 fallback.
+  - L2 SSE fallback still works (CachingTransport saves SSE to L2).
+  - If SSE L1 fallback becomes needed, it can be added in a follow-up.
+
+  Document this as a known consequence in the ADR.
+
+##### Sanitization integration
+
+Current Proxy: `p.sanitizer.Sanitize(rawTape)` applied before L2 save.
+CachingTransport: `ct.sanitizer.Sanitize(tape)` applied before store save.
+
+After refactor: CachingTransport owns sanitization for L2 writes. The
+same sanitizer is passed via `WithCacheSanitizer(p.sanitizer)`. The
+sanitization point is identical (after tape construction, before
+`store.Save`). L1 gets raw tapes (saved by `l1RecordingTransport`
+before sanitization). The sanitize-on-write invariant is preserved.
+
+##### Backward compatibility for Go embedders
+
+No public API changes:
+- `Proxy` struct: exported type, unchanged name.
+- `NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy`: same signature.
+- All `ProxyOption` functions: same signatures, same behavior.
+- `Proxy.RoundTrip(*http.Request) (*http.Response, error)`: same.
+- `Proxy.HealthHandler() http.Handler`: same.
+- `Proxy.Start()`: same.
+- `Proxy.Close() error`: same.
+
+The refactor is purely internal. No breaking change.
+
+##### Upstream URL configuration
+
+The upstream URL lives in the CLI (`runProxy` in `main.go`), not on
+Proxy. Proxy holds the upstream as an `http.RoundTripper` (the
+transport), not a URL. After refactor, the transport is passed to
+CachingTransport as the `upstream` parameter (via
+`l1RecordingTransport` wrapping). The CLI's `runProxy` does not change:
+it still creates a `httputil.ReverseProxy` with `tapeProxy` as the
+Transport.
+
+#### File layout
+
+**Modified files:**
+
+- `proxy.go` -- significant rewrite:
+  - Add `ct *CachingTransport` field to Proxy struct.
+  - Add `l1RecordingTransport` unexported type.
+  - Rewrite `NewProxy` to construct CachingTransport internally.
+  - Rewrite `Proxy.RoundTrip` to: L1 pre-check -> CachingTransport ->
+    fallback.
+  - Remove duplicated cache-miss + upstream + record logic.
+  - Remove duplicated `roundTripSSE` method (SSE recording handled by
+    CachingTransport for L2).
+  - Keep: `fallback`, `matchFromStore`, `tapeToResponse`,
+    `sseResponseFromTape` (for fallback replay), `onErrorSafe`.
+  - Keep: all health-related methods and fields.
+  - Keep: all `ProxyOption` functions (signatures unchanged).
+
+- `proxy_test.go` -- minimal changes:
+  - All existing tests must pass unchanged (they are the contract).
+  - Add 1-2 new tests verifying composition (e.g., that single-flight
+    dedup works through the proxy, that CachingTransport's cache filter
+    is applied).
+
+- `cmd/httptape/main.go` -- no changes needed. `runProxy` already
+  creates `NewProxy(l1, l2, proxyOpts...)` and uses it as a
+  `Transport` on `httputil.ReverseProxy`. The internal refactor is
+  invisible to the CLI.
+
+- `docs/proxy.md` -- update the "CachingTransport relationship" section:
+  replace the "separate implementations, unification planned" caveat
+  with accurate "Proxy composes CachingTransport internally" text.
+
+- `docs/caching-transport.md` -- update the relationship table and
+  the "Relationship to Proxy" section: remove "separate implementations"
+  language; state that Proxy composes CachingTransport for L2+upstream.
+
+- `docs/cli.md` -- update the proxy subcommand description: remove
+  "unification planned, see #205" caveat.
+
+- `docs/recording.md` -- no changes needed (the "separate" reference
+  is about redirect recording, not about Proxy vs CachingTransport).
+
+- `llms.txt` -- update the Proxy description: remove "separate
+  implementation" and "#205" references.
+
+- `llms-full.txt` -- update the Proxy description and the relationship
+  section: remove "separate implementation" and "#205" references.
+
+- `CHANGELOG.md` -- add v0.13.1 entry:
+  "internal: Proxy now composes CachingTransport for L2 cache lookup
+  and upstream forwarding, completing ADR-44 Option B. No observable
+  behavior change. Single-flight deduplication is now active in proxy
+  mode. (#205)"
+
+#### Sequence: non-SSE cache miss through composed Proxy
+
+```
+Client -> httputil.ReverseProxy -> Proxy.RoundTrip(req)
+  1. Read req.Body into buffer, restore with fresh reader.
+  2. L1 lookup: l1.List + matcher.Match -> miss.
+  3. Restore req.Body. Call ct.RoundTrip(req).
+     3a. CachingTransport: buffer req body, compute hash.
+     3b. CachingTransport: L2 lookup (store.List + matcher.Match) -> miss.
+     3c. CachingTransport: single-flight check.
+     3d. CachingTransport: call l1RecordingTransport.RoundTrip(req).
+         3d-i.  l1RecordingTransport: call real upstream.RoundTrip(req).
+         3d-ii. l1RecordingTransport: read resp body into buffer.
+         3d-iii.l1RecordingTransport: build raw tape, l1.Save(ctx, rawTape).
+         3d-iv. l1RecordingTransport: restore resp.Body, return resp.
+     3e. CachingTransport: read resp body, check cacheFilter.
+     3f. CachingTransport: build tape, sanitize, l2.Save(ctx, sanitizedTape).
+     3g. CachingTransport: return resp.
+  4. Proxy: isFallback(nil, resp) -> false (200 OK).
+  5. Proxy: health.observe(StateLive).
+  6. Proxy: return resp.
+Client <- *http.Response
+```
+
+#### Sequence: non-SSE L1 cache hit
+
+```
+Client -> Proxy.RoundTrip(req)
+  1. Read req.Body, restore.
+  2. L1 lookup -> hit (tape found).
+  3. Return tapeToResponse(tape, "l1-cache").
+     (CachingTransport never called.)
+Client <- *http.Response (from L1, X-Httptape-Source: l1-cache)
+```
+
+#### Sequence: transport error fallback
+
+```
+Client -> Proxy.RoundTrip(req)
+  1. Read req.Body, restore.
+  2. L1 lookup -> miss.
+  3. ct.RoundTrip(req) -> nil, error (connection refused).
+     (l1RecordingTransport.RoundTrip returned error;
+      CachingTransport propagated it since staleFallback=false.)
+  4. Proxy: isFallback(err, nil) -> true.
+  5. Restore req.Body. Fallback:
+     a. L1 lookup -> check. Hit -> return from L1.
+     b. L2 lookup -> check. Hit -> return from L2.
+     c. No match -> return nil, err.
+Client <- error or fallback response
+```
+
+#### Error cases
+
+| Failure mode | Caller sees | Notes |
+|---|---|---|
+| Request body read fails | `error` (wrapped) | Same as today |
+| L1 lookup store.List fails | Proceeds to CachingTransport (skip L1) | onError called |
+| L2 lookup fails (inside CT) | Upstream call attempted (miss path) | CT's onError called |
+| Upstream transport error | Fallback path (L1 -> L2 -> original error) | Same as today |
+| Upstream 5xx with isFallback | Fallback path (L1 -> L2 -> original 5xx) | Same as today |
+| L1 save fails (in l1RecordingTransport) | Response still returned | onError called |
+| L2 save fails (inside CT) | Response still returned | CT's onError called |
+| SSE stream truncated | Partial tape discarded (CT handles) | L1 does not get SSE tape |
+| Health probe failure | Health state updated | Same as today |
+
+#### Test strategy
+
+**Existing tests (MUST pass unchanged):**
+- `TestProxy_SuccessPath` -- L1/L2 both populated on success.
+- `TestProxy_FallbackToL1` -- L1 pre-populated, upstream down.
+- `TestProxy_FallbackToL2` -- L2 pre-populated, upstream down.
+- `TestProxy_NoCacheError` -- empty stores, upstream down.
+- `TestProxy_SanitizationOnL2Only` -- L1 has raw, L2 has sanitized.
+- `TestProxy_FallbackOn5xx` -- 5xx triggers fallback.
+- `TestProxy_XHttptapeSourceHeader` -- source header correctness.
+- `TestProxy_Close_NoOp` -- RoundTripper interface check.
+- `TestProxy_ConcurrentSafety` -- concurrent round-trips.
+- `TestProxy_RequestBodyPreservedForMatching` -- body hash matching.
+- `TestProxy_PanicsOnNilStores` -- constructor guards.
+- `TestProxy_OnErrorCallback` -- error callback invoked.
+- `TestProxy_FallbackOn5xx_NoCacheMatch` -- 5xx no cache returns 5xx.
+- `TestProxy_WithProxyRoute` -- route label propagation.
+- All health-related tests (`TestProxy_Health*`).
+
+**New tests to add (minimal -- no scope creep):**
+- `TestProxy_SingleFlightViaComposition` -- verify that concurrent
+  identical requests on cache miss result in upstream being called
+  exactly once (single-flight dedup via CachingTransport).
+- `TestProxy_L1NotSavedOnL2Hit` -- verify that when L2 has a tape
+  (CachingTransport returns from cache), L1 is NOT populated with a
+  redundant copy. This confirms the l1RecordingTransport approach works.
+
+**Test patterns:**
+- MemoryStore for both L1 and L2.
+- `roundTripperFunc` adapter for transport injection (already defined
+  in proxy_test.go).
+- Table-driven where practical.
+- `go test -race ./...` must be green.
+
+#### Consequences
+
+**What this achieves:**
+- Single source of truth for cache-miss + upstream + record logic.
+  Bug fixes to this path need only be made in `caching_transport.go`.
+- Proxy gains single-flight deduplication for free (via CachingTransport).
+- Maintenance tax of two parallel implementations is eliminated.
+- Documentation accurately reflects the architecture ("Proxy uses
+  CachingTransport internally" is now true, not aspirational).
+- #205 closes. v0.13.1 ships.
+
+**What changes internally:**
+- `Proxy.RoundTrip` is simpler: L1 pre-check + delegate to CT + fallback.
+- New unexported `l1RecordingTransport` type handles L1 save on the
+  miss path.
+- `Proxy.roundTripSSE` is removed (SSE recording handled by CT for L2;
+  SSE L1 save deferred).
+
+**Known limitation:**
+- SSE tapes are NOT saved to L1 on the miss path (only saved to L2 by
+  CachingTransport). L1 SSE fallback will only work if L1 is
+  pre-populated externally. No existing test relies on SSE L1 fallback.
+  This can be addressed in a follow-up if needed.
+
+**What does NOT change (observable behavior):**
+- All CLI flags, stdout/stderr, exit codes.
+- All `ProxyOption` functions and their effects.
+- `Proxy` public API surface.
+- L1/L2 fallback priority (L1 first, then L2).
+- Sanitization-on-write: L1 gets raw, L2 gets sanitized.
+- Health endpoint behavior.
+- All existing proxy_test.go tests pass.
+
+---
+
 
 ## PM Log
 
