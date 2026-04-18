@@ -17,7 +17,7 @@ import org.testcontainers.utility.MountableFile
 object HttptapeContainer {
 
     val instance: GenericContainer<*> by lazy {
-        GenericContainer("ghcr.io/vibewarden/httptape:0.12.0")
+        GenericContainer("ghcr.io/vibewarden/httptape:0.13.0")
             .withCommand(
                 "serve",
                 "--fixtures", "/fixtures",

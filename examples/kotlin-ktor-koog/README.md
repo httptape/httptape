@@ -37,7 +37,7 @@ This demo exercises the matcher composition stack from #178, #179, and #180:
 
 ## httptape version requirement
 
-This demo requires **httptape v0.12.0** or later. v0.12.0 introduced Content-Type-driven body shape in fixtures (PR [#191](https://github.com/VibeWarden/httptape/pull/191)) and includes `--config` support for declarative matcher composition (first shipped in v0.11.0, PR [#184](https://github.com/VibeWarden/httptape/pull/184)). Earlier releases cannot read the migrated fixture format or the matcher config.
+This demo requires **httptape v0.13.0** or later. v0.13.0 adds `CachingTransport` as a library primitive. v0.12.0 introduced Content-Type-driven body shape in fixtures (PR [#191](https://github.com/VibeWarden/httptape/pull/191)) and includes `--config` support for declarative matcher composition (first shipped in v0.11.0, PR [#184](https://github.com/VibeWarden/httptape/pull/184)). Earlier releases cannot read the migrated fixture format or the matcher config.
 
 ## Prerequisites
 
@@ -114,7 +114,7 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | Kotest | 6.1.11 (FreeSpec) |
 | Testcontainers | 2.0.4 (single shared container) |
 | Gradle | 9.4.1 (wrapper committed) |
-| httptape | v0.12.0 (ghcr.io/vibewarden/httptape:0.12.0) |
+| httptape | v0.13.0 (ghcr.io/vibewarden/httptape:0.13.0) |
 
 ## Why not...?
 

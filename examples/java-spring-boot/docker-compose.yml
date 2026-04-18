@@ -1,6 +1,6 @@
 services:
   httptape:
-    image: ghcr.io/vibewarden/httptape:0.12.0
+    image: ghcr.io/vibewarden/httptape:0.13.0
     command: ["serve", "--fixtures", "/fixtures", "--sse-timing=realtime"]
     volumes:
       # All fixtures must be in a single flat directory for FileStore.

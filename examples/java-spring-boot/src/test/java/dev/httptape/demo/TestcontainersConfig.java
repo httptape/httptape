@@ -44,7 +44,7 @@ class TestcontainersConfig {
      */
     @Bean
     GenericContainer<?> httptapeContainer() throws IOException {
-        GenericContainer<?> container = new GenericContainer<>("ghcr.io/vibewarden/httptape:0.12.0")
+        GenericContainer<?> container = new GenericContainer<>("ghcr.io/vibewarden/httptape:0.13.0")
                 .withCommand("serve", "--fixtures", "/fixtures", "--sse-timing=realtime")
                 .withExposedPorts(8081)
                 .waitingFor(Wait.forHttp("/").forStatusCode(404));
