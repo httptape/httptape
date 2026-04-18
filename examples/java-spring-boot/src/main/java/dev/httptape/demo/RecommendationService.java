@@ -1,5 +1,7 @@
 package dev.httptape.demo;
 
+import java.util.stream.Collectors;
+
 import org.springframework.ai.chat.client.ChatClient;
 
 import reactor.core.publisher.Flux;
@@ -37,10 +39,10 @@ public class RecommendationService {
                 .content();
 
         // Collect all streamed tokens into a single response string.
-        // Using .toStream() keeps the calling code blocking and readable.
-        StringBuilder sb = new StringBuilder();
-        stream.toStream().forEach(sb::append);
-        return sb.toString();
+        // .toStream() keeps the calling code blocking and readable;
+        // Collectors.joining() is the canonical Streams-API form (StringJoiner
+        // uses StringBuilder under the hood — same performance, declarative read).
+        return stream.toStream().collect(Collectors.joining());
     }
 
     /**
