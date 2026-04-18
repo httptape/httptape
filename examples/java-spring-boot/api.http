@@ -1,0 +1,15 @@
+### Get a single user (REST happy path)
+GET http://localhost:8080/users/1
+Accept: application/json
+
+### List all users (REST collection)
+GET http://localhost:8080/users
+Accept: application/json
+
+### Missing user (REST 404)
+GET http://localhost:8080/users/999
+Accept: application/json
+
+### Streaming AI recommendation (SSE)
+GET http://localhost:8080/recommendations?for=headphones
+Accept: text/event-stream

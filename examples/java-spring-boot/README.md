@@ -79,6 +79,8 @@ curl -N http://localhost:8080/recommendations?for=headphones
 docker compose down
 ```
 
+IDE users: open [`api.http`](./api.http) — IntelliJ's HTTP Client (and VS Code with the REST Client extension) lets you click-to-run each request, including the SSE stream.
+
 ## Stack
 
 | | |
