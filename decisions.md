@@ -12149,6 +12149,2022 @@ All tests use stdlib `testing` only. Table-driven where appropriate.
 
 ---
 
+### ADR-42: Template helpers, `PathPatternCriterion`, and `{{pathParam.*}}` accessors
+
+**Date**: 2026-04-18
+**Issue**: #196
+**Status**: Accepted
+
+> **Note**: Issue #199 is being architected in parallel by another architect and may
+> produce ADR-43. If both land with the same number, the orchestrator will renumber
+> during merge reconciliation.
+
+#### Context
+
+httptape has `{{request.*}}` templating in response bodies and headers (shipped
+in v0.11). The existing template system resolves `request.method`, `request.path`,
+`request.url`, `request.headers.<N>`, `request.query.<N>`, and
+`request.body.<path>` -- all accessor-style, no arguments, dispatched via simple
+string prefix matching in `resolveExpr()` in `templating.go`.
+
+Realistic test fixtures need more: timestamps, UUIDs, counters, random strings, and
+deterministic fake data that stays consistent across related requests. Additionally,
+fixtures serving parameterized routes (e.g., `/users/:id`) need to extract path
+parameters and use them in response templates.
+
+Issue #196 bundles three concerns:
+
+1. **Template helpers** -- new `{{...}}` expressions with keyword arguments (`now`,
+   `uuid`, `randomHex`, `randomInt`, `counter`, `faker.*`).
+2. **`PathPatternCriterion`** -- a new `Criterion` that matches Express-style URL
+   patterns (e.g., `/users/:id`) and exposes captured segments.
+3. **`{{pathParam.*}}` accessor** -- resolves captured path segments from
+   `PathPatternCriterion` in template expressions.
+
+Issue #199 (synthetic responses via exemplar tapes) has a hard dependency on #196.
+The design must ensure that `PathPatternCriterion`, `{{pathParam.*}}`, `{{faker.*}}`,
+and the helper argument parsing are stable enough for #199 to build on without
+rework.
+
+#### Decision
+
+##### Open question resolutions
+
+**Q1: Pattern syntax -- Express-style `:id` vs OpenAPI-style `{id}`**
+
+Decision: **Express-style `:id`**.
+
+Rationale:
+- Express `:id` is the dominant idiom in Go HTTP routers (`chi`, `gin`, `gorilla/mux`
+  v1, `httprouter`). Go developers will recognize it immediately.
+- OpenAPI `{id}` uses curly braces, which collide with httptape's `{{...}}` template
+  delimiters. A pattern like `/users/{id}` in a JSON string creates visual noise
+  next to `"body": "{{faker.name}}"`. Express style avoids this.
+- The colon prefix is unambiguous: a path segment starting with `:` is always a
+  named capture; literal colons in URLs are percent-encoded (`%3A`).
+
+**Q2: Match precedence weight for `PathPatternCriterion`**
+
+Decision: **Score 3** (same as `HeadersCriterion`).
+
+Rationale:
+- `PathPatternCriterion` is more specific than `PathRegexCriterion` (score 1) because
+  it carries structural semantics (named segments, fixed literal segments), but less
+  specific than `QueryParamsCriterion` (score 4) which requires field-level equality.
+- It must score *higher* than `PathCriterion` (score 2) when both are present in a
+  `CompositeMatcher`, because a pattern match `/users/:id` matching the request
+  `/users/42` is a positive signal -- but `PathCriterion` would return 0 for this
+  pair (no exact match), eliminating the candidate. In practice, `PathPatternCriterion`
+  and `PathCriterion` should NOT coexist in the same matcher (documented). If they do,
+  `PathCriterion` dominates (returns 0 for non-exact paths, eliminating candidates
+  that `PathPatternCriterion` would accept).
+- Score 3 ties with `HeadersCriterion`. This is acceptable: both represent a
+  "moderately specific" match dimension. Composite scoring still differentiates
+  them when combined with other criteria.
+
+Updated weight table:
+
+| Criterion                     | Score |
+|-------------------------------|-------|
+| MethodCriterion               | 1     |
+| PathCriterion                 | 2     |
+| RouteCriterion                | 1     |
+| PathRegexCriterion            | 1     |
+| **PathPatternCriterion**      | **3** |
+| HeadersCriterion              | 3     |
+| QueryParamsCriterion          | 4     |
+| ContentNegotiationCriterion   | 3-5   |
+| BodyFuzzyCriterion            | 6     |
+| BodyHashCriterion             | 8     |
+
+**Q3: Query-param-in-pattern support**
+
+Decision: **Out of scope.** Query params are accessed via `{{request.query.*}}`.
+`PathPatternCriterion` matches the path component only. This is consistent with
+how Go HTTP routers work (path routing is separate from query parsing).
+
+**Q4: Parser strategy -- extend ad-hoc or write a proper tokenizer**
+
+Decision: **Replace with a small tokenizer/mini-parser in `templating.go`.**
+
+Rationale:
+- The current `resolveExpr()` is prefix-matching on raw strings. Adding keyword
+  arguments (`seed=val`, `format=unix`, `min=0 max=100`) to the same approach would
+  require increasingly fragile string splitting.
+- A proper tokenizer is ~150 lines of Go (scan for function name, then iterate
+  key=value pairs with quoted-string support). The complexity budget is bounded
+  because we explicitly exclude conditionals, loops, and partials (#196 scope).
+- The tokenizer enables clean extension for #199 (pipe operators `| int`).
+- The scan step (`scanTemplateExprs`) is unchanged -- it still finds `{{...}}`
+  boundaries. Only the *evaluation* of the inner expression changes: instead of
+  raw string prefix matching, the inner text is parsed into a `parsedExpr` struct.
+
+**Q5: Faker seed fallback -- `{{faker.email}}` without explicit `seed=`**
+
+Decision: **Hash `tape.ID + request.URL.Path` as automatic seed.**
+
+When `{{faker.email}}` is used without a `seed=` argument:
+1. Concatenate `tape.ID + ":" + r.URL.Path`.
+2. SHA-256 hash the concatenation, hex-encode, take the first 16 chars.
+3. Use the result as the seed argument to the Faker.
+
+This produces a deterministic seed that varies per tape and per request path, so
+`/users/1` and `/users/2` get different fakes, and different tapes for the same
+path also get different fakes. The seed is stable across server restarts because
+it depends only on the tape ID (stored in the fixture) and the request path
+(determined by the client).
+
+Rationale for this approach over alternatives:
+- Using only `request.path` would cause different tapes for the same path to produce
+  identical fakes (collision).
+- Using the full request (body hash, headers) would make fakes vary by request
+  details that shouldn't affect response generation.
+- Using `tape.ID` alone would make all requests to the same tape produce the same
+  fakes (no per-path variation).
+
+**Q6: Counter overflow**
+
+Decision: **Wrap at math.MaxInt64 back to 0.** Silent wrap, no error, no log.
+
+Rationale:
+- A counter that wraps at 2^63 will never wrap in practice (at 1M requests/sec,
+  it would take ~292,000 years).
+- Erroring would be worse than wrapping because it would break tests that happen
+  to be running near the limit.
+- Wrapping is consistent with Go's integer overflow behavior (not a panic).
+- Testing: unit test explicitly sets the counter to `math.MaxInt64 - 1` and verifies
+  the next call returns `math.MaxInt64`, and the one after returns `0`.
+
+**Q7: Type coercion helpers (`| int`, `| float`, `| bool`)**
+
+Decision: **Deferred to #199.** The issue body explicitly says "deferred to #199
+where they are needed for exemplar JSON body rendering." This ADR does not design
+pipe operators. However, the parser design accommodates them: the `parsedExpr`
+struct has room for a `coerce` field, and the tokenizer recognizes `|` as a
+delimiter. #199's architect can extend without reworking the parser.
+
+##### Template parser design
+
+###### `parsedExpr` type (new, in `templating.go`)
+
+```go
+// parsedExpr is a parsed template expression. It represents either an accessor
+// (e.g., "request.path") or a helper call (e.g., "faker.email seed=user-42").
+type parsedExpr struct {
+    // name is the function/accessor name (e.g., "request.path", "now",
+    // "faker.email", "counter", "pathParam.id").
+    name string
+
+    // args holds keyword arguments as key-value pairs.
+    // Nil for accessor-style expressions (request.*, pathParam.*).
+    // Example: {"seed": "user-42", "format": "unix"}.
+    args map[string]string
+}
+```
+
+###### `parseExpr` function (new, in `templating.go`)
+
+```go
+// parseExpr parses the inner text of a {{...}} expression into a parsedExpr.
+// It splits the text into a function name and optional keyword arguments.
+//
+// Syntax:
+//   - Accessors: "request.path", "pathParam.id"
+//   - Helpers without args: "now", "uuid"
+//   - Helpers with args: "now format=unix", "faker.email seed=user-42"
+//   - Quoted arg values: "randomHex length=16"
+//
+// Keyword argument values may contain nested {{...}} expressions which are
+// resolved before the helper is invoked (see resolveArgs).
+//
+// Returns the parsed expression. If the input is empty, returns a parsedExpr
+// with an empty name.
+func parseExpr(raw string) parsedExpr
+```
+
+The parser:
+1. Trims whitespace.
+2. Splits on the first whitespace to get `name` and the rest.
+3. If there is a rest, scans for `key=value` pairs. Values are
+   unquoted strings (no quotes needed because `}}` terminates the expression
+   and `=` is only used as key-value separator). A value runs until the next
+   whitespace or end-of-string.
+4. Returns `parsedExpr{name, args}`.
+
+Note: quoted values are not needed in v1. The only characters that could be
+ambiguous are spaces, but helper argument values (seeds, format strings, numbers)
+do not contain spaces in any planned use case. If a future helper needs spaces in
+values, quoted-string support can be added to `parseExpr` without changing the
+`parsedExpr` type.
+
+###### Nested template evaluation in arguments
+
+When a helper argument contains `{{...}}` (e.g., `seed=user-{{pathParam.id}}`),
+the nested expression must be resolved before the helper runs. This is a
+single-pass approach:
+
+1. `parseExpr` stores the raw argument value (e.g., `"user-{{pathParam.id}}"`).
+2. Before invoking the helper, each argument value is scanned for `{{...}}`.
+   If found, the inner expressions are resolved recursively using the same
+   evaluation context. The resolved value replaces the nested `{{...}}`.
+3. The helper receives the fully-resolved argument value.
+
+Recursion depth is bounded: nested expressions inside argument values are always
+accessors (`pathParam.*`, `request.*`) which do not themselves have arguments.
+A nested helper-in-an-argument (e.g., `seed={{uuid}}`) is technically possible
+but the single-pass resolver handles it correctly because `uuid` is a zero-arg
+helper. Deeper nesting (helper inside helper inside argument) is not supported
+and would be left as literal text -- this is documented as a limitation.
+
+The resolution function:
+
+```go
+// resolveArgs resolves nested {{...}} expressions in helper argument values.
+// It uses the same evaluation context (request, pathParams, tape) as the
+// top-level resolver. Returns the args map with all nested expressions resolved.
+func resolveArgs(args map[string]string, ctx *templateCtx) map[string]string
+```
+
+###### Evaluation context
+
+The `resolveExpr` function currently takes `(expr string, r *http.Request, reqBody []byte)`.
+This must be extended to carry additional context: path parameters, tape metadata
+(for auto-seed), and server-level state (counters). Rather than adding more
+parameters, introduce a context struct:
+
+```go
+// templateCtx holds the evaluation context for template resolution.
+// It is constructed per-request by the Server before template resolution
+// and passed through to all resolvers.
+type templateCtx struct {
+    // req is the incoming HTTP request.
+    req *http.Request
+    // reqBody is the cached request body bytes.
+    reqBody []byte
+    // pathParams holds captured path segments from PathPatternCriterion.
+    // Nil if no path pattern was used for matching.
+    pathParams map[string]string
+    // tapeID is the matched tape's ID (used for auto-seed generation).
+    tapeID string
+    // counters is the server's counter state (shared, mutex-protected).
+    counters *counterState
+    // randSource provides randomness for non-deterministic helpers
+    // (uuid, randomHex, randomInt). Injectable for testing.
+    randSource io.Reader
+}
+```
+
+The existing `resolveExpr` function signature changes to:
+
+```go
+func resolveExpr(expr string, ctx *templateCtx) (string, bool)
+```
+
+And internally dispatches on the `parsedExpr.name` prefix:
+- `request.*` -- existing accessor logic (unchanged behavior)
+- `pathParam.*` -- new accessor, reads from `ctx.pathParams`
+- `now` -- new helper
+- `uuid` -- new helper
+- `randomHex` -- new helper
+- `randomInt` -- new helper
+- `counter` -- new helper
+- `faker.*` -- new helper bridge
+
+`ResolveTemplateBody` and `ResolveTemplateHeaders` gain an additional `ctx *templateCtx`
+parameter. Their public signatures change:
+
+```go
+func ResolveTemplateBody(body []byte, ctx *templateCtx, strict bool) ([]byte, error)
+func ResolveTemplateHeaders(h http.Header, ctx *templateCtx, strict bool) (http.Header, error)
+```
+
+This is a breaking change to two exported functions. Pre-1.0, acceptable. The
+only call sites are in `server.go` `ServeHTTP` and the test file.
+
+##### Helper implementations
+
+Each helper is implemented as a function in `templating.go`. Helpers are not
+an interface or registry -- they are a fixed set dispatched by name in a
+switch statement inside `resolveExpr`. This keeps the code simple and avoids
+over-engineering. If user-defined helpers are ever needed (out of scope per
+#196), a registry pattern can be introduced later.
+
+###### `now`
+
+```go
+// resolveNow returns the current UTC time formatted per the "format" argument.
+// Supported formats: "rfc3339" (default), "iso" (alias for rfc3339),
+// "unix" (seconds since epoch), "unixMillis" (ms since epoch).
+// Custom Go time format strings are also accepted (e.g., "2006-01-02").
+func resolveNow(args map[string]string) string
+```
+
+Arguments:
+- `format` (optional, default `"rfc3339"`): output format.
+
+Implementation: `time.Now().UTC()`, then format based on the `format` arg.
+For `"unix"`: `strconv.FormatInt(t.Unix(), 10)`. For `"unixMillis"`:
+`strconv.FormatInt(t.UnixMilli(), 10)`. For others: `t.Format(formatStr)`.
+
+Testability: the `templateCtx` does NOT carry an injectable clock. `now` is
+inherently non-deterministic (returns the actual current time). Tests that use
+`now` verify the output is a valid RFC3339 string and was produced within the
+last second, rather than comparing exact values. This is the standard Go
+approach for time-dependent functions.
+
+###### `uuid`
+
+```go
+// resolveUUID generates a random UUID v4 string.
+func resolveUUID(ctx *templateCtx) string
+```
+
+Uses `ctx.randSource` (defaults to `crypto/rand.Reader`). Generates 16 random
+bytes, sets version and variant bits per RFC 4122 section 4.4, formats as
+`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+
+This is non-deterministic by default. For deterministic UUIDs, use
+`{{faker.uuid seed=...}}` instead.
+
+###### `randomHex`
+
+```go
+// resolveRandomHex generates a random hex string of the specified length.
+func resolveRandomHex(args map[string]string, ctx *templateCtx) (string, error)
+```
+
+Arguments:
+- `length` (required): number of hex characters to produce.
+
+Implementation: read `length/2` (rounded up) random bytes from `ctx.randSource`,
+hex-encode, truncate to `length`.
+
+Error if `length` is missing, non-numeric, or <= 0.
+
+###### `randomInt`
+
+```go
+// resolveRandomInt generates a random integer in [min, max].
+func resolveRandomInt(args map[string]string, ctx *templateCtx) (string, error)
+```
+
+Arguments:
+- `min` (optional, default `0`): inclusive minimum.
+- `max` (optional, default `100`): inclusive maximum.
+
+Implementation: read bytes from `ctx.randSource`, convert to int, mod into
+range. Error if `min` or `max` is non-numeric or if `min > max`.
+
+###### `counter`
+
+```go
+// resolveCounter increments and returns a named counter.
+func resolveCounter(args map[string]string, ctx *templateCtx) string
+```
+
+Arguments:
+- `name` (optional, default `"default"`): counter name.
+
+Returns the post-increment value as a decimal string.
+
+Counter state is held on the `Server` in a `counterState` struct:
+
+```go
+// counterState manages named counters for the {{counter}} template helper.
+// Thread-safe via a sync.Mutex.
+type counterState struct {
+    mu       sync.Mutex
+    counters map[string]int64
+}
+
+// Next increments the named counter and returns the new value.
+// The counter starts at 1 on first call. Wraps to 0 at math.MaxInt64.
+func (cs *counterState) Next(name string) int64
+```
+
+The `counterState` lives on the `Server` struct as a private field, initialized
+in `NewServer`. It is passed into the `templateCtx` on each request.
+
+Reset API:
+
+```go
+// ResetCounter resets the named counter to 0. If name is empty, all counters
+// are reset.
+func (s *Server) ResetCounter(name string)
+```
+
+This is the Go API for counter reset. An admin HTTP endpoint for reset is out
+of scope for #196 (tied to #194, the admin API feature).
+
+###### `faker.*`
+
+The `faker.*` helpers bridge to the existing `Faker` interface in `faker.go`.
+The suffix after `faker.` maps to a faker type:
+
+| Template expression        | Faker type        |
+|----------------------------|-------------------|
+| `{{faker.email ...}}`      | `EmailFaker{}`    |
+| `{{faker.name ...}}`       | `NameFaker{}`     |
+| `{{faker.phone ...}}`      | `PhoneFaker{}`    |
+| `{{faker.address ...}}`    | `AddressFaker{}`  |
+| `{{faker.creditCard ...}}` | `CreditCardFaker{}` |
+| `{{faker.hmac ...}}`       | `HMACFaker{}`     |
+| `{{faker.redacted ...}}`   | `RedactedFaker{}` |
+| `{{faker.uuid ...}}`       | `PrefixFaker{Prefix: ""}` + UUID formatting |
+
+For `faker.uuid`: since there is no dedicated UUID faker in the existing
+infrastructure, implement as `PrefixFaker{Prefix: ""}` applied to a UUID-format
+seed, then format the hex output as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+with version/variant bits set. Alternatively, a new unexported `uuidFaker`
+function that uses `computeHMAC` directly to produce 16 bytes, sets UUID v4
+bits, and formats. This is an implementation detail.
+
+The `faker.*` helpers do NOT expose `NumericFaker`, `DateFaker`, `PatternFaker`,
+or `PrefixFaker` via template syntax because those require type-specific
+parameters (`length`, `format`, `pattern`, `prefix`) that would complicate the
+argument parsing. They remain accessible via the Go API (`FakeFieldsWith`) and
+JSON config.
+
+Arguments:
+- `seed` (optional): the HMAC seed. If omitted, uses the auto-seed derived from
+  `tape.ID + ":" + request.URL.Path` (per Q5 resolution).
+
+Resolution function:
+
+```go
+// resolveFaker dispatches to the appropriate Faker and returns its output.
+// The fakerType is the suffix after "faker." (e.g., "email", "name").
+// The seed is resolved from args or auto-generated.
+func resolveFaker(fakerType string, args map[string]string, ctx *templateCtx) (string, bool)
+```
+
+The Faker's `Fake(seed, original)` method is called with:
+- `seed` = the resolved seed value.
+- `original` = the seed value (acting as both seed and original input, since
+  there is no "original" value in the template context -- the Faker is generating
+  from scratch, not transforming an existing value).
+
+The output of `Fake()` is converted to string via `fmt.Sprintf("%v", result)`.
+
+##### `PathPatternCriterion` design
+
+###### Type
+
+```go
+// PathPatternCriterion matches the incoming request's URL path against an
+// Express-style pattern with named segments (e.g., "/users/:id").
+//
+// Named segments start with a colon and match any single non-empty path
+// segment (i.e., one or more characters excluding '/'). The captured values
+// are exposed to the template evaluation context via {{pathParam.NAME}}.
+//
+// Examples:
+//   - "/users/:id" matches "/users/42" (id="42"), not "/users/", "/users"
+//   - "/users/:id/orders/:oid" matches "/users/1/orders/7" (id="1", oid="7")
+//   - "/api/v1/items" matches only "/api/v1/items" (no captures, acts like PathCriterion)
+//
+// PathPatternCriterion should NOT be used alongside PathCriterion in the same
+// CompositeMatcher. PathCriterion returns 0 for paths that don't exactly match,
+// which eliminates candidates that PathPatternCriterion would accept.
+//
+// Returns score 3 on match, 0 on mismatch.
+//
+// The pattern is compiled into a regex at construction time (via
+// NewPathPatternCriterion). The compiled regex and capture-name list are stored
+// as private fields for efficient per-request matching.
+type PathPatternCriterion struct {
+    // Pattern is the original Express-style pattern string.
+    Pattern string
+
+    re         *regexp.Regexp
+    paramNames []string
+}
+```
+
+###### Constructor
+
+```go
+// NewPathPatternCriterion compiles an Express-style path pattern into a
+// PathPatternCriterion. Named segments (e.g., ":id") are converted to named
+// regex capture groups. Returns an error if the pattern is malformed.
+//
+// Pattern syntax:
+//   - Literal segments: "/users", "/api/v1"
+//   - Named segments: "/:id", "/:userId" (matches one or more non-'/' chars)
+//   - Mixed: "/users/:id/orders/:orderId"
+//
+// The compiled regex anchors to the full path (^ ... $). Trailing slashes are
+// significant: "/users/:id" does NOT match "/users/42/".
+func NewPathPatternCriterion(pattern string) (*PathPatternCriterion, error)
+```
+
+Pattern compilation:
+1. Split pattern on `/`.
+2. For each segment:
+   - If it starts with `:`, extract the param name (rest of segment), emit
+     `(?P<name>[^/]+)` regex group.
+   - Otherwise, emit the literal segment (regex-escaped via `regexp.QuoteMeta`).
+3. Join with `/`, anchor with `^` and `$`.
+4. Compile with `regexp.Compile`.
+5. Store `paramNames` in order of appearance (for efficient extraction).
+
+Validation:
+- Empty param names (`:` alone) produce an error.
+- Duplicate param names produce an error.
+- Pattern must start with `/`.
+
+###### Score method
+
+```go
+func (c *PathPatternCriterion) Score(req *http.Request, candidate Tape) int
+```
+
+1. Match `req.URL.Path` against `c.re`. If no match, return 0.
+2. Parse `candidate.Request.URL` to get its path. Match against `c.re`. If no
+   match, return 0. (Both request and tape must match the pattern, same logic
+   as `PathRegexCriterion`.)
+3. Return 3.
+
+Note: the captured path params are NOT extracted in `Score`. They are extracted
+separately by the `Server` after matching, when constructing the `templateCtx`.
+This keeps the `Criterion` interface clean (no side effects, no output beyond
+the score).
+
+###### Param extraction method
+
+```go
+// ExtractParams extracts the named path parameters from a URL path that
+// matches this criterion's pattern. Returns nil if the path does not match.
+// This method is called by the Server after matching to populate the
+// template evaluation context.
+func (c *PathPatternCriterion) ExtractParams(path string) map[string]string
+```
+
+###### Name method
+
+```go
+func (c *PathPatternCriterion) Name() string { return "path_pattern" }
+```
+
+##### `{{pathParam.*}}` accessor
+
+In `resolveExpr`, add a case for the `pathParam.` prefix:
+
+```go
+case strings.HasPrefix(pe.name, "pathParam."):
+    paramName := pe.name[len("pathParam."):]
+    if ctx.pathParams == nil {
+        return "", false
+    }
+    val, ok := ctx.pathParams[paramName]
+    if !ok {
+        return "", false
+    }
+    return val, true
+```
+
+This follows the same pattern as `request.headers.<N>` and `request.query.<N>`.
+
+##### Server integration
+
+In `Server.ServeHTTP`, after matching a tape (step 4), before template resolution
+(step 9):
+
+1. Check if the `Server.matcher` is a `*CompositeMatcher`. If so, iterate its
+   criteria to find a `*PathPatternCriterion`. If found, call
+   `ExtractParams(req.URL.Path)` to get path params.
+2. Construct `templateCtx` with the request, request body, path params, tape ID,
+   counters, and rand source.
+3. Pass `templateCtx` to `ResolveTemplateBody` and `ResolveTemplateHeaders`.
+
+If no `PathPatternCriterion` is in the matcher, `pathParams` is nil and
+`{{pathParam.*}}` expressions resolve to unresolvable (empty in lenient mode,
+error in strict mode).
+
+The `Server` struct gains two new private fields:
+
+```go
+type Server struct {
+    // ... existing fields ...
+    counters   *counterState
+    randSource io.Reader
+}
+```
+
+`NewServer` initializes `counters` and `randSource`:
+
+```go
+s.counters = &counterState{counters: make(map[string]int64)}
+if s.randSource == nil {
+    s.randSource = rand.Reader // crypto/rand
+}
+```
+
+A new unexported `ServerOption` for testing:
+
+```go
+func withRandSource(r io.Reader) ServerOption {
+    return func(s *Server) { s.randSource = r }
+}
+```
+
+##### Recursive template resolution in native JSON body objects
+
+ADR-41 introduced Content-Type-driven body shapes where JSON bodies are stored
+as native JSON objects in fixtures. When templating resolves, it must handle
+these native JSON objects:
+
+The current `ResolveTemplateBody` scans `body []byte` for `{{...}}` and performs
+string-level substitution. For native JSON body objects, this still works because
+the body is stored as `[]byte` in the `Tape` struct (the native JSON is
+marshaled back to bytes before template resolution). Template expressions
+embedded in JSON string values (e.g., `"name": "{{faker.name}}"`) are correctly
+found and resolved by the byte-level scanner.
+
+However, there is a subtlety: when the resolved value contains characters that
+would break JSON syntax (e.g., a faker produces `"John "The Rock" Johnson"`),
+the result would be malformed JSON. The solution is:
+
+1. If the body `Content-Type` is JSON-flavored, and the body contains `{{`:
+   a. Unmarshal the body as `any` (JSON tree).
+   b. Walk the tree recursively. For each string leaf that contains `{{`,
+      resolve templates in that string.
+   c. Re-marshal the tree to JSON.
+   This ensures all resolved values are properly JSON-escaped.
+
+2. If the body is not JSON, use the existing byte-level string substitution
+   (unchanged).
+
+New function:
+
+```go
+// resolveTemplateJSON resolves template expressions in a JSON body by
+// walking the deserialized JSON tree. String values containing {{...}} are
+// resolved; non-string values are left unchanged. Returns the re-serialized
+// JSON bytes.
+//
+// This function ensures that resolved values are properly JSON-escaped,
+// which byte-level string substitution cannot guarantee.
+func resolveTemplateJSON(body []byte, ctx *templateCtx, strict bool) ([]byte, error)
+```
+
+The function:
+1. `json.Unmarshal(body, &data)`.
+2. Recursively walk `data`:
+   - `map[string]any`: recurse into each value.
+   - `[]any`: recurse into each element.
+   - `string`: if contains `{{`, resolve via `resolveTemplateString`.
+   - Other types (`float64`, `bool`, `nil`): leave as-is.
+3. `json.Marshal(data)`.
+
+`ResolveTemplateBody` checks the tape's response `Content-Type` (passed via
+`templateCtx` or inferred from the body) to decide which resolution path to take.
+For simplicity, the heuristic is: if the body starts with `{` or `[` (after
+trimming whitespace), use `resolveTemplateJSON`; otherwise, use byte-level
+substitution. This avoids needing the Content-Type in the template context.
+
+##### Config integration
+
+Add `"path_pattern"` to the `criterionBuilders` dispatch table in `config.go`:
+
+```go
+"path_pattern": {validate: validatePathPatternCriterion, build: buildPathPatternCriterion},
+```
+
+The `CriterionConfig` struct gains a new field:
+
+```go
+type CriterionConfig struct {
+    Type    string   `json:"type"`
+    Paths   []string `json:"paths,omitempty"`
+    Pattern string   `json:"pattern,omitempty"` // for path_pattern
+}
+```
+
+Validation:
+- `path_pattern` requires non-empty `Pattern`.
+- `path_pattern` rejects `Paths`.
+- All other criterion types reject `Pattern`.
+
+Builder:
+```go
+func buildPathPatternCriterion(cc CriterionConfig) (Criterion, error) {
+    return NewPathPatternCriterion(cc.Pattern)
+}
+```
+
+##### JSON Schema extension (`config.schema.json`)
+
+Add `"path_pattern"` to the criterion type enum:
+```json
+"enum": ["method", "path", "body_fuzzy", "content_negotiation", "path_pattern"]
+```
+
+Add `pattern` property to the criterion item:
+```json
+"pattern": {
+    "type": "string",
+    "minLength": 1,
+    "description": "Express-style path pattern for path_pattern criterion (e.g., /users/:id)."
+}
+```
+
+Add `if/then` constraints:
+- `path_pattern` requires `pattern`, rejects `paths`.
+- All existing types reject `pattern`.
+
+#### Types
+
+| Type | File | Description |
+|---|---|---|
+| `parsedExpr` | `templating.go` | Parsed template expression with name and keyword arguments |
+| `templateCtx` | `templating.go` | Per-request evaluation context for template resolution |
+| `counterState` | `templating.go` | Thread-safe named counter state, lives on Server |
+| `PathPatternCriterion` | `matcher.go` | Criterion matching Express-style URL patterns with named captures |
+
+Modified types:
+
+| Type | File | Change |
+|---|---|---|
+| `Server` | `server.go` | Add `counters *counterState` and `randSource io.Reader` fields |
+| `CriterionConfig` | `config.go` | Add `Pattern string` field |
+
+#### Functions and methods
+
+New exported:
+
+| Function / Method | Signature | File |
+|---|---|---|
+| `NewPathPatternCriterion` | `func NewPathPatternCriterion(pattern string) (*PathPatternCriterion, error)` | `matcher.go` |
+| `PathPatternCriterion.Score` | `func (c *PathPatternCriterion) Score(req *http.Request, candidate Tape) int` | `matcher.go` |
+| `PathPatternCriterion.Name` | `func (c *PathPatternCriterion) Name() string` | `matcher.go` |
+| `PathPatternCriterion.ExtractParams` | `func (c *PathPatternCriterion) ExtractParams(path string) map[string]string` | `matcher.go` |
+| `Server.ResetCounter` | `func (s *Server) ResetCounter(name string)` | `server.go` |
+| `ResolveTemplateBody` | `func ResolveTemplateBody(body []byte, ctx *templateCtx, strict bool) ([]byte, error)` | `templating.go` (signature change) |
+| `ResolveTemplateHeaders` | `func ResolveTemplateHeaders(h http.Header, ctx *templateCtx, strict bool) (http.Header, error)` | `templating.go` (signature change) |
+
+New unexported:
+
+| Function / Method | Signature | File |
+|---|---|---|
+| `parseExpr` | `func parseExpr(raw string) parsedExpr` | `templating.go` |
+| `resolveArgs` | `func resolveArgs(args map[string]string, ctx *templateCtx) map[string]string` | `templating.go` |
+| `resolveNow` | `func resolveNow(args map[string]string) string` | `templating.go` |
+| `resolveUUID` | `func resolveUUID(ctx *templateCtx) string` | `templating.go` |
+| `resolveRandomHex` | `func resolveRandomHex(args map[string]string, ctx *templateCtx) (string, error)` | `templating.go` |
+| `resolveRandomInt` | `func resolveRandomInt(args map[string]string, ctx *templateCtx) (string, error)` | `templating.go` |
+| `resolveCounter` | `func resolveCounter(args map[string]string, ctx *templateCtx) string` | `templating.go` |
+| `resolveFaker` | `func resolveFaker(fakerType string, args map[string]string, ctx *templateCtx) (string, bool)` | `templating.go` |
+| `resolveTemplateJSON` | `func resolveTemplateJSON(body []byte, ctx *templateCtx, strict bool) ([]byte, error)` | `templating.go` |
+| `counterState.Next` | `func (cs *counterState) Next(name string) int64` | `templating.go` |
+| `counterState.Reset` | `func (cs *counterState) Reset(name string)` | `templating.go` |
+| `validatePathPatternCriterion` | `func validatePathPatternCriterion(cc CriterionConfig) error` | `config.go` |
+| `buildPathPatternCriterion` | `func buildPathPatternCriterion(cc CriterionConfig) (Criterion, error)` | `config.go` |
+| `withRandSource` | `func withRandSource(r io.Reader) ServerOption` | `server.go` |
+| `autoSeed` | `func autoSeed(tapeID, path string) string` | `templating.go` |
+
+Note on `templateCtx` exported/unexported status: `templateCtx` is **unexported**.
+The `ResolveTemplateBody` and `ResolveTemplateHeaders` functions use it as a parameter,
+but since `templateCtx` is unexported, these functions cannot be called by external
+packages with a custom context. This is intentional: the `templateCtx` is an
+internal implementation detail of the `Server`. External callers who used the
+old `ResolveTemplateBody(body, req, strict)` API lose the ability to call it
+directly. If this is a concern, a convenience wrapper can be added:
+
+```go
+// ResolveTemplateBodySimple is a backward-compatible convenience wrapper that
+// resolves templates using only request data (no path params, no counters,
+// no faker). Equivalent to the pre-#196 ResolveTemplateBody behavior.
+func ResolveTemplateBodySimple(body []byte, r *http.Request, strict bool) ([]byte, error)
+```
+
+This wrapper constructs a minimal `templateCtx` internally.
+
+#### File layout
+
+| File | Changes |
+|---|---|
+| `templating.go` | Major rework. Add `parsedExpr`, `templateCtx`, `counterState` types. Add `parseExpr`, `resolveArgs`, `autoSeed` functions. Add helper functions: `resolveNow`, `resolveUUID`, `resolveRandomHex`, `resolveRandomInt`, `resolveCounter`, `resolveFaker`. Add `resolveTemplateJSON` for JSON-aware resolution. Refactor `resolveExpr` to use `parsedExpr` and `templateCtx`. Change `ResolveTemplateBody` and `ResolveTemplateHeaders` signatures to accept `*templateCtx`. Add `ResolveTemplateBodySimple` backward-compat wrapper. |
+| `templating_test.go` | Major expansion. Add tests for `parseExpr`, all helpers, `pathParam.*` accessor, nested template evaluation, counter state, JSON-aware resolution, backward-compat wrapper. |
+| `matcher.go` | Add `PathPatternCriterion` struct, `NewPathPatternCriterion` constructor, `Score`, `Name`, `ExtractParams` methods. Update `CompositeMatcher` godoc score table. |
+| `matcher_test.go` | Add `PathPatternCriterion` tests: pattern matching, param extraction, edge cases, malformed patterns, coexistence warnings. |
+| `server.go` | Add `counters *counterState` and `randSource io.Reader` to `Server`. Initialize in `NewServer`. Add `ResetCounter` method. Add `withRandSource` test option. Update `ServeHTTP` to construct `templateCtx` and pass it to resolve functions. Extract path params from matcher if `PathPatternCriterion` is present. |
+| `server_test.go` | Add tests for counter reset, path-param extraction in ServeHTTP, end-to-end templating with helpers. |
+| `config.go` | Add `Pattern string` field to `CriterionConfig`. Add `"path_pattern"` to `criterionBuilders`. Add `validatePathPatternCriterion` and `buildPathPatternCriterion`. Update validation for existing types to reject `Pattern`. |
+| `config_test.go` | Add tests for `path_pattern` config loading, validation, `BuildMatcher`. |
+| `config.schema.json` | Add `"path_pattern"` to criterion type enum. Add `pattern` property. Add `if/then` constraints. |
+| `docs/template-helpers.md` | New file. Comprehensive documentation of all template helpers, `pathParam.*` accessor, keyword arguments, nested evaluation, faker bridge, counter behavior. |
+| `docs/matching.md` | Add `PathPatternCriterion` section with pattern syntax, score, and usage notes. |
+| `docs/replay.md` | Update templating section with cross-link to `docs/template-helpers.md`. |
+| `docs/api-reference.md` | Add entries for `PathPatternCriterion`, `NewPathPatternCriterion`, `Server.ResetCounter`, `ResolveTemplateBodySimple`, updated `ResolveTemplateBody` signature. |
+| `CLAUDE.md` | Add `template_helpers.md` to docs list. No package structure changes (all code stays in existing files). |
+
+No new Go source files are created. All template logic stays in `templating.go`
+(consistent with the existing layout where template code already lives there,
+not in `server.go`).
+
+#### Sequence
+
+**Request/response flow with path-param templating and helpers:**
+
+1. Request arrives at `Server.ServeHTTP` (e.g., `GET /users/42`).
+2. CORS, error simulation checks (unchanged).
+3. Server loads tapes from store.
+4. `matcher.Match(req, tapes)` runs. If `PathPatternCriterion` is among the
+   criteria, its `Score` method matches `/users/42` against `/users/:id` pattern.
+   Returns score 3. Other criteria score as usual. Best-scoring tape wins.
+5. No-match fallback (unchanged).
+6. Per-fixture error override, delay (unchanged).
+7. SSE check (unchanged -- SSE tapes skip templating).
+8. **Construct `templateCtx`:**
+   a. Read request body (once).
+   b. If matcher is `*CompositeMatcher`, search its criteria for `*PathPatternCriterion`.
+      If found, call `ExtractParams(req.URL.Path)` -> `{"id": "42"}`.
+   c. Build `templateCtx{req, reqBody, pathParams, tape.ID, s.counters, s.randSource}`.
+9. **Resolve templates:**
+   a. `ResolveTemplateBody(tape.Response.Body, ctx, strict)`:
+      - Fast path: no `{{` -> return body as-is.
+      - Detect JSON body (starts with `{` or `[`): use `resolveTemplateJSON`.
+      - Otherwise: use byte-level `scanTemplateExprs` + `resolveExpr` loop.
+   b. `ResolveTemplateHeaders(tape.Response.Headers, ctx, strict)`:
+      - Same per-value resolution as before, using new `resolveExpr` with `templateCtx`.
+10. For each `{{...}}` expression:
+    a. `parseExpr(raw)` -> `parsedExpr{name, args}`.
+    b. `resolveArgs(args, ctx)` -> resolve any nested `{{...}}` in arg values.
+    c. Dispatch on `name`:
+       - `request.*` -> existing accessor logic.
+       - `pathParam.*` -> lookup in `ctx.pathParams`.
+       - `now` -> `resolveNow(args)`.
+       - `uuid` -> `resolveUUID(ctx)`.
+       - `randomHex` -> `resolveRandomHex(args, ctx)`.
+       - `randomInt` -> `resolveRandomInt(args, ctx)`.
+       - `counter` -> `resolveCounter(args, ctx)`.
+       - `faker.*` -> `resolveFaker(suffix, args, ctx)`.
+       - Other -> unresolvable (lenient: empty, strict: error).
+    d. Replace `{{...}}` with resolved value.
+11. Write response (unchanged).
+
+#### Error cases
+
+| Error | Where | Handling |
+|---|---|---|
+| Malformed path pattern (no leading `/`) | `NewPathPatternCriterion` | Return `nil, fmt.Errorf(...)` |
+| Empty param name in pattern (`:` alone) | `NewPathPatternCriterion` | Return `nil, fmt.Errorf(...)` |
+| Duplicate param names in pattern | `NewPathPatternCriterion` | Return `nil, fmt.Errorf(...)` |
+| Invalid regex from pattern compilation | `NewPathPatternCriterion` | Return `nil, fmt.Errorf(...)` |
+| Missing required arg (`randomHex` without `length`) | `resolveRandomHex` | Return `("", error)` -> strict: 500, lenient: empty |
+| Non-numeric arg value (`length=abc`) | `resolveRandomHex`, `resolveRandomInt` | Return `("", error)` -> strict: 500, lenient: empty |
+| `min > max` in `randomInt` | `resolveRandomInt` | Return `("", error)` -> strict: 500, lenient: empty |
+| Unknown faker type (`faker.unknown`) | `resolveFaker` | Return `("", false)` -> strict: 500, lenient: empty |
+| `pathParam.*` without PathPatternCriterion | `resolveExpr` | Return `("", false)` -> strict: 500, lenient: empty |
+| `pathParam.x` where `x` not in captures | `resolveExpr` | Return `("", false)` -> strict: 500, lenient: empty |
+| Config: `path_pattern` without `pattern` | `validatePathPatternCriterion` | Validation error |
+| Config: `path_pattern` with `paths` | `validatePathPatternCriterion` | Validation error |
+| Config: other types with `pattern` | `validateMethodCriterion` etc. | Validation error |
+| Counter wrap at `math.MaxInt64` | `counterState.Next` | Silent wrap to 0 |
+
+#### Test strategy
+
+All tests use stdlib `testing` only. Table-driven where appropriate.
+
+**`templating_test.go` -- new/modified tests:**
+
+1. `TestParseExpr`: table-driven for accessor (`request.path`), zero-arg helper
+   (`now`), single-arg helper (`now format=unix`), multi-arg helper
+   (`randomInt min=1 max=50`), `faker.*` with seed (`faker.email seed=user-42`),
+   pathParam accessor (`pathParam.id`), empty input.
+
+2. `TestResolveNow`: verify RFC3339 output (default), unix format, iso format,
+   custom Go format. Time assertions: verify within 2-second window.
+
+3. `TestResolveUUID`: inject deterministic `randSource` via `bytes.NewReader`.
+   Verify output format matches UUID v4 pattern. Verify version and variant bits.
+
+4. `TestResolveRandomHex`: inject deterministic `randSource`. Verify length,
+   hex validity. Error cases: missing length, non-numeric length, zero length.
+
+5. `TestResolveRandomInt`: inject deterministic `randSource`. Verify within
+   range. Error cases: non-numeric min/max, min > max.
+
+6. `TestResolveCounter`: verify sequential increment (1, 2, 3...), named
+   counters are independent, default name, wrap at `math.MaxInt64`.
+
+7. `TestResolveCounter_Concurrent`: launch N goroutines incrementing the same
+   counter. Verify final value equals N. Run with `-race`.
+
+8. `TestResolveFaker_Email`: verify deterministic output with explicit seed.
+   Same seed -> same output. Different seed -> different output.
+
+9. `TestResolveFaker_Name`: same as email but for NameFaker.
+
+10. `TestResolveFaker_Phone`: same pattern.
+
+11. `TestResolveFaker_Address`: same pattern.
+
+12. `TestResolveFaker_AutoSeed`: no `seed=` arg. Verify deterministic per
+    (tapeID, path) pair. Different paths -> different output.
+
+13. `TestResolveFaker_Unknown`: `faker.doesnotexist` -> unresolvable.
+
+14. `TestResolvePathParam`: verify resolution against `templateCtx` with
+    populated `pathParams`. Missing param -> unresolvable. Nil pathParams map
+    -> unresolvable.
+
+15. `TestResolveArgs_Nested`: `seed=user-{{pathParam.id}}` with pathParams
+    `{"id": "42"}` -> resolved to `seed=user-42`.
+
+16. `TestResolveTemplateBody_Helpers`: end-to-end body resolution with
+    multiple helpers and accessors in the same body.
+
+17. `TestResolveTemplateJSON`: JSON body with template expressions in string
+    values. Verify JSON-escaping of resolved values. Verify non-string values
+    untouched.
+
+18. `TestResolveTemplateJSON_NestedObject`: deeply nested JSON with templates
+    at various depths.
+
+19. `TestResolveTemplateBodySimple`: backward-compat wrapper. Verify existing
+    `request.*` expressions still work.
+
+20. `TestResolveExpr_BackwardCompat`: all existing `request.*` expressions
+    continue to work with the new `templateCtx`-based signature.
+
+**`matcher_test.go` -- new tests:**
+
+21. `TestPathPatternCriterion_BasicMatch`: `/users/:id` matches `/users/42`.
+    Score = 3.
+
+22. `TestPathPatternCriterion_MultiSegment`: `/users/:id/orders/:oid` matches
+    `/users/1/orders/7`. Score = 3.
+
+23. `TestPathPatternCriterion_NoMatch`: `/users/:id` does not match `/posts/1`.
+    Score = 0.
+
+24. `TestPathPatternCriterion_ExactLiteral`: `/api/v1/health` matches only
+    `/api/v1/health`. Score = 3. No captures.
+
+25. `TestPathPatternCriterion_TrailingSlash`: `/users/:id` does not match
+    `/users/42/`. Score = 0.
+
+26. `TestPathPatternCriterion_EmptySegment`: `/users/:id` does not match
+    `/users/`. Score = 0.
+
+27. `TestPathPatternCriterion_ExtractParams`: verify `ExtractParams` returns
+    correct map for matching paths, nil for non-matching paths.
+
+28. `TestNewPathPatternCriterion_Errors`: empty param name, duplicate param
+    names, missing leading `/`, empty pattern.
+
+29. `TestPathPatternCriterion_Name`: verify returns `"path_pattern"`.
+
+30. `TestPathPatternCriterion_TapeMustMatch`: both request path and tape URL
+    path must match the pattern (same as PathRegexCriterion logic).
+
+**`server_test.go` -- new tests:**
+
+31. `TestServer_ResetCounter`: set counter, reset by name, verify 0. Reset
+    all (empty name), verify all 0.
+
+32. `TestServer_PathParamTemplating`: create tape with `PathPatternCriterion`
+    and template body `"id": "{{pathParam.id}}"`. Send request to `/users/42`.
+    Verify response body contains `"id": "42"`.
+
+33. `TestServer_HelperTemplating`: tape with `{{now}}`, `{{counter name=c1}}`,
+    `{{faker.email seed=test}}`. Verify each resolves correctly.
+
+34. `TestServer_CounterAcrossRequests`: send 3 requests, verify counter
+    increments across them.
+
+**`config_test.go` -- new tests:**
+
+35. `TestLoadConfig_PathPatternCriterion`: valid config with `path_pattern`
+    type and `pattern` field.
+
+36. `TestConfig_BuildMatcher_PathPattern`: build matcher, verify it matches
+    patterned paths.
+
+37. `TestLoadConfig_PathPatternValidationErrors`: missing pattern, spurious
+    paths, pattern on wrong type.
+
+**`race_test.go` -- new test:**
+
+38. `TestCounterState_Race`: dedicated race test for concurrent counter
+    increment. Run with `-race`.
+
+**`integration_test.go` -- new test:**
+
+39. `TestIntegration_PathParamFaker`: end-to-end test with `PathPatternCriterion`
+    and `{{faker.name seed=user-{{pathParam.id}}}}` in response body. Send
+    requests for `/users/1` and `/users/2`. Verify different but deterministic
+    names. Re-send `/users/1`, verify same name as first call.
+
+#### Rationale
+
+**Why Express-style `:id` over OpenAPI `{id}`:**
+Express-style is the dominant idiom in the Go HTTP router ecosystem. OpenAPI's
+curly braces conflict with httptape's `{{...}}` template delimiters. Developers
+who know Express, chi, or gin will immediately understand `:id`. OpenAPI-style
+can be supported as a future alternative syntax without breaking the Express default.
+
+**Why tokenizer over regex for expression parsing:**
+The current `resolveExpr` uses string prefix matching (`expr[:8] == "request."`).
+Adding keyword arguments to this approach would require `strings.Fields` splitting
+followed by `strings.SplitN` on `=`, with special cases for quoted values and
+nested `{{...}}`. A structured `parseExpr` function that returns `parsedExpr{name, args}`
+is cleaner, testable in isolation, and extensible for #199 (pipe operators).
+The tokenizer is ~50 lines of code -- not a complex parser.
+
+**Why `templateCtx` struct over more function parameters:**
+`resolveExpr` currently takes 3 parameters. Adding pathParams, tapeID, counters,
+and randSource would bring it to 7+. A context struct bundles related data,
+reduces parameter sprawl, and makes it easy to add future context fields
+(e.g., scenario state from #195) without signature changes.
+
+**Why counters live on Server, not globally:**
+Per-instance counters respect the "no global state" principle. Each `NewServer`
+gets its own counter space. Tests don't interfere with each other. The `counterState`
+is `sync.Mutex`-protected for concurrent access.
+
+#### Alternatives considered
+
+1. **text/template from stdlib:** Go's `text/template` provides a full
+   template engine with custom functions. Rejected because: (a) its syntax
+   (`{{.Request.Path}}`) differs from httptape's existing `{{request.path}}`
+   convention, breaking backward compatibility; (b) it includes conditionals
+   and loops which are explicitly out of scope; (c) error messages from
+   `text/template` expose Go-internal details that are confusing in an HTTP
+   mocking context; (d) the security model of `text/template` (arbitrary method
+   calls via FuncMap) is broader than needed.
+
+2. **Helper registry with `TemplateHelper` interface:** Define a
+   `TemplateHelper` interface and register helpers by name. Rejected because
+   the set of helpers is fixed and curated (no user-defined helpers per #196
+   scope). An interface adds indirection without benefit. A switch statement
+   is simpler and keeps all dispatch in one place. If user-defined helpers
+   are added in the future, the switch can be replaced with a registry.
+
+3. **Separate `template_helpers.go` file:** Move helper implementations to a
+   new file. Rejected because the helpers are tightly coupled to `resolveExpr`
+   and `templateCtx` -- splitting them would create circular dependencies
+   between the files (both would need `templateCtx`). Keeping everything in
+   `templating.go` is consistent with the existing layout and avoids artificial
+   file boundaries.
+
+4. **PathPatternCriterion stores captures in request context (`context.WithValue`):**
+   Instead of `ExtractParams`, the `Score` method could store captures in
+   `req.Context()`. Rejected because: (a) the `Criterion` interface contract says
+   "must not modify the request"; (b) `context.WithValue` requires a context key
+   type, adding ceremony; (c) the captures are only needed for templating, not
+   matching -- separating extraction from scoring is cleaner.
+
+5. **Inlined auto-seed (hash inside resolveExpr):** Instead of the separate
+   `autoSeed` function, compute the seed inline. Rejected for testability:
+   `autoSeed` as a separate function can be unit-tested in isolation.
+
+#### Consequences
+
+**Benefits:**
+
+- **Realistic fixtures without hand-coding:** Template helpers eliminate the need
+  to hard-code timestamps, UUIDs, and fake data in every fixture. Fixtures become
+  templates that produce dynamic, realistic responses.
+- **Deterministic faking via `{{faker.*}}`:** Same seed produces the same fake
+  across runs and across related requests. This is the key differentiator -- most
+  mocking tools offer random-only or hardcoded values.
+- **Path-parameterized fixtures:** A single tape for `/users/:id` can serve
+  infinite user IDs with per-ID deterministic fakes. This directly enables
+  #199 (exemplar tapes).
+- **Nested evaluation (`seed=user-{{pathParam.id}}`):** Enables derived seeds
+  that vary per path segment, creating per-entity consistency without manual
+  fixture wiring.
+- **Backward compatible:** All existing `{{request.*}}` expressions continue
+  to work. `WithTemplating(false)` fast path is preserved. `WithStrictTemplating`
+  semantics are preserved.
+
+**Costs / trade-offs:**
+
+- **Breaking change to `ResolveTemplateBody` and `ResolveTemplateHeaders`
+  signatures:** These were exported functions that external callers might use
+  directly. Mitigated by the `ResolveTemplateBodySimple` backward-compat wrapper
+  and pre-1.0 status.
+- **Increased complexity in `templating.go`:** The file grows from ~310 lines to
+  ~600-700 lines. This is acceptable: the file is cohesive (all template-related
+  logic) and the additional code is straightforward (helper functions, parser,
+  context struct).
+- **Non-deterministic helpers (`now`, `uuid`, `randomHex`, `randomInt`):**
+  These produce different output on every call, which makes fixtures non-reproducible
+  by default. Documented: use `faker.*` with explicit seeds for reproducibility.
+  The `randSource` injection point enables deterministic testing.
+- **`PathPatternCriterion` and `PathCriterion` conflict:** Using both in the same
+  `CompositeMatcher` causes `PathCriterion` to eliminate pattern-matched candidates.
+  Documented with a prominent warning. Config validation does NOT reject this
+  combination (it is not wrong, just unhelpful).
+
+**Future implications:**
+
+- **#199 (exemplar tapes):** This ADR provides the foundation. #199 adds the
+  `exemplar` flag, `url_pattern` field, synthesis mode, and pipe operators (`| int`).
+  The `parsedExpr` struct can be extended with a `coerce` field for pipe operators
+  without reworking the parser.
+- **#195 (scenarios):** Scenario state can be exposed to templates via a new
+  `templateCtx` field (e.g., `ctx.scenarioState`). The `templateCtx` struct is
+  designed for extensibility.
+- **#194 (admin API):** Counter reset can be exposed via the admin HTTP endpoint
+  by calling `s.ResetCounter(name)`.
+- **User-defined helpers (out of scope):** If ever needed, the `resolveExpr`
+  switch statement can be replaced with a registry (`map[string]HelperFunc`)
+  populated by a `WithTemplateHelper(name, fn)` `ServerOption`.
+
+---
+
+
+### ADR-43: Synthetic responses via exemplar tapes
+
+**Date**: 2026-04-18
+**Issue**: #199
+**Status**: Accepted
+
+> **Dependency note**: This ADR assumes #196 (ADR-42) delivers `PathPatternCriterion`
+> (with colon-prefixed named segments, e.g., `/users/:id`), the `{{pathParam.NAME}}`
+> template accessor, nested template evaluation (expressions inside helper arguments
+> are resolved before the helper runs), and the `{{faker.*}}` / `{{now}}` / `{{uuid}}`
+> template helpers. This ADR does NOT redesign those primitives. If #196's design
+> changes, the integration points noted here must be revisited.
+>
+> **Parallel architect note**: ADR-42 (#196) is being designed concurrently in a
+> separate worktree. The orchestrator will reconcile both ADRs on merge.
+
+#### Context
+
+httptape today is strict replay-only. A request that does not match any tape
+falls through to the fallback handler (default 404). This is correct for
+integration tests, where unexpected requests should fail fast. But in
+frontend-first development workflows -- where the backend is partially
+specified and the UI is being built against a mock -- this rigidity is a
+blocker. A developer records one tape for `/users/1` and wants the server to
+synthesize responses for `/users/2`, `/users/3`, etc., with realistic,
+deterministic fake data.
+
+Issue #199 introduces "exemplar tapes" -- hand-authored fixtures with URL
+patterns and templated response bodies. When the server is running in
+synthesis mode and no exact-URL tape matches, exemplars are consulted. The
+first matching exemplar's response body is rendered with captured path params,
+deterministic faker helpers, and other template expressions.
+
+The design is gated by a two-level opt-in:
+1. **Per-tape**: the `exemplar: true` flag marks a tape as a pattern-based
+   template, not a recorded interaction.
+2. **Per-server**: the `WithSynthesis()` option (or `--synthesize` CLI flag)
+   enables the exemplar fallback path. Without this, exemplar tapes are loaded
+   but never consulted -- integration tests are safe.
+
+#### Open question resolutions
+
+**Q1: `url_pattern` as separate field vs overloading `url`?**
+
+Decision: **Separate field.** `URLPattern string` on `RecordedReq` is a new
+optional field (`json:"url_pattern,omitempty"`), distinct from `URL string`.
+This gives unambiguous typing: `URL` is always a concrete URL (recorded or
+hand-authored for exact match); `URLPattern` is always a colon-prefixed
+pattern (e.g., `/users/:id`). Validation enforces mutual exclusivity (see Q2).
+
+Rationale: overloading `url` to sometimes be a pattern and sometimes be a
+literal URL would require content-inspection heuristics. A separate field is
+self-documenting and validatable at load time.
+
+**Q2: Can a single tape be both exact-url and exemplar?**
+
+Decision: **No. Mutually exclusive.** Validation rules:
+- `Exemplar == true` requires `URLPattern != ""` and `URL == ""`.
+- `Exemplar == false` (or unset) requires `URLPattern == ""`.
+- If `URL != ""` and `URLPattern != ""`, validation error.
+- If `Exemplar == true` and `URLPattern == ""`, validation error.
+
+A tape library can have both an exact tape for `/users/1` and an exemplar for
+`/users/:id`. The exact tape takes precedence when synthesis is enabled.
+
+**Q3: Synthesis + SSE?**
+
+Decision: **Out of scope for this issue.** SSE exemplar tapes require template
+resolution on individual `SSEEvent.Data` fields, which is a distinct problem.
+If a tape has `Exemplar: true` and `SSEEvents` is non-empty, validation
+produces an error: "SSE exemplar tapes are not supported."
+
+This is documented as a known limitation. A follow-up issue can add SSE
+exemplar support.
+
+**Q4: Synthesis + request body matching (`body_fuzzy`)?**
+
+Decision: **Allowed but unusual.** An exemplar with POST + `body_fuzzy`
+criterion is permitted. The exemplar fallback only triggers when no exact match
+is found. If the server's `CompositeMatcher` includes `BodyFuzzyCriterion`,
+the exemplar's request body (if any) is scored against the incoming request's
+body using the same criteria. This means an exemplar can narrow its match
+domain beyond just the URL pattern.
+
+This is explicitly supported -- not deferred. The interaction is natural
+because the exemplar fallback reuses the existing matcher infrastructure
+(see Sequence below). No special handling is needed.
+
+**Q5: Persistence -- same directory or subdirectory?**
+
+Decision: **Same directory, flag-based discrimination.** Exemplar tapes live
+alongside normal tapes in the same fixtures directory. The `"exemplar": true`
+field in the JSON distinguishes them. No subdirectory convention.
+
+Rationale: subdirectories would require changes to `FileStore` scanning logic.
+Flag-based discrimination is simpler and consistent with how other tape
+metadata (e.g., `route`) works.
+
+**Q6: Faker seed stability across exemplar redeclarations?**
+
+Decision: **Documented as a feature.** Seeds like `user-{{pathParam.id}}`
+are content-derived (the evaluated template expression), not tape-identity-
+derived (no dependency on tape ID or filename). Renaming the tape file,
+changing the tape ID, or rearranging exemplars has zero effect on generated
+fake data, as long as the seed expression evaluates to the same string.
+This is deterministic by design (HMAC-SHA256 with fixed project key).
+
+**Q7: Type coercion (`| int`, `| float`, `| bool`) -- which issue?**
+
+Decision: **Type coercion ships with #199, not #196.** Coercion is only
+meaningful when template expressions are embedded in native JSON object bodies
+(the exemplar use case). In string bodies, everything is already a string.
+#196's template helpers produce string values, which is correct for the
+string-body use case. #199 adds the recursive JSON walk and needs coercion at
+leaf positions to emit proper JSON types (integer `42` instead of string
+`"42"`).
+
+If #196's architect decides to include coercion as a template-engine
+primitive, #199 reuses it. If #196 defers, #199 implements it. Either way,
+this ADR defines the coercion semantics.
+
+Coercion syntax: `| int`, `| float`, `| bool` appended to the expression
+inside `{{...}}`. Examples:
+- `{{pathParam.id | int}}` -- resolve `pathParam.id`, parse as integer, emit
+  as JSON number.
+- `{{request.query.page | int}}` -- query param coerced to integer.
+- `{{faker.randomInt seed=x min=1 max=100 | int}}` -- faker output coerced.
+
+If coercion fails (e.g., `"abc" | int`), the behavior depends on strict mode:
+- Strict: return HTTP 500 with `X-Httptape-Error: template`.
+- Lenient: emit the uncoerced string value.
+
+**Q8: Interaction with `body_fuzzy` exemplars?**
+
+Decision: **Explicitly supported.** See Q4.
+
+#### Decision
+
+##### Tape struct additions
+
+Two new fields, both optional, backward-compatible (`omitempty`):
+
+```go
+// Tape struct gains:
+type Tape struct {
+    // ... existing fields ...
+
+    // Exemplar marks this tape as a pattern-based template for synthesis mode.
+    // When true, the tape's request uses URLPattern instead of URL, and the
+    // response body may contain template expressions that are resolved at
+    // serve time using captured path parameters and other template helpers.
+    //
+    // Exemplar tapes are only consulted when the server has synthesis enabled
+    // (WithSynthesis option). When synthesis is disabled, exemplar tapes are
+    // loaded but ignored.
+    Exemplar bool `json:"exemplar,omitempty"`
+}
+```
+
+```go
+// RecordedReq struct gains:
+type RecordedReq struct {
+    // ... existing fields ...
+
+    // URLPattern is a colon-prefixed path pattern (e.g., "/users/:id") used
+    // by exemplar tapes for pattern-based matching. Mutually exclusive with
+    // URL: a tape must have either URL (exact match) or URLPattern (pattern
+    // match via PathPatternCriterion), never both.
+    //
+    // Only meaningful when the parent Tape has Exemplar set to true.
+    // Validation enforces: Exemplar==true requires URLPattern!="",
+    // and URLPattern!="" requires Exemplar==true.
+    URLPattern string `json:"url_pattern,omitempty"`
+}
+```
+
+JSON marshal/unmarshal semantics:
+- Both fields use `omitempty`. Existing fixtures without these fields
+  unmarshal with zero values (`false`, `""`), producing no behavioral change.
+- Marshal of existing non-exemplar tapes omits both fields.
+- `Exemplar: true` must be explicitly set in hand-authored fixture JSON.
+- Round-trip: `Marshal(Unmarshal(json))` preserves both fields identically.
+
+##### Server struct additions
+
+```go
+type Server struct {
+    // ... existing fields ...
+
+    // synthesis enables exemplar tape fallback. When true, requests that
+    // don't match any exact tape are checked against exemplar tapes.
+    // When false (default), exemplar tapes are loaded but never consulted.
+    synthesis bool
+}
+```
+
+##### New ServerOption
+
+```go
+// WithSynthesis enables synthesis mode on the Server. When enabled, requests
+// that don't match any exact-URL tape fall back to exemplar tapes -- tapes
+// with Exemplar: true and a URLPattern. The exemplar's response body is
+// rendered using template helpers (path params, fakers, etc.) to produce a
+// unique, deterministic response.
+//
+// Synthesis is disabled by default. When disabled, exemplar tapes are loaded
+// but never consulted, ensuring integration tests are not affected by
+// exemplar tapes in the fixture directory.
+//
+// Requires that tapes are loaded from a store that includes exemplar fixtures.
+// Exemplar tapes must pass validation (see ValidateExemplar).
+func WithSynthesis() ServerOption {
+    return func(s *Server) { s.synthesis = true }
+}
+```
+
+##### Tape validation function
+
+```go
+// ValidateExemplar checks that a tape marked as an exemplar is structurally
+// valid. Returns nil if the tape is valid, or an error describing the issue.
+//
+// Validation rules:
+//   - Exemplar==true requires URLPattern to be non-empty.
+//   - Exemplar==true requires URL to be empty.
+//   - URLPattern is only valid when Exemplar==true.
+//   - SSE exemplars (Exemplar==true with non-empty SSEEvents) are not
+//     supported and produce an error.
+//   - Non-exemplar tapes with URLPattern set produce an error.
+//   - URL and URLPattern set simultaneously produce an error.
+//
+// ValidateExemplar is called by ValidateTape. It does not validate the
+// URLPattern syntax -- that is the responsibility of PathPatternCriterion
+// from #196.
+func ValidateExemplar(t Tape) error
+```
+
+Additionally, add a general `ValidateTape` function that calls
+`ValidateExemplar` plus any other tape-level validation:
+
+```go
+// ValidateTape checks a tape for structural validity. Currently checks
+// exemplar-specific constraints. Returns nil if valid.
+func ValidateTape(t Tape) error
+```
+
+##### Match flow (Server.ServeHTTP)
+
+The `ServeHTTP` method gains a two-phase match flow when synthesis is enabled.
+The change is localized to `Server.ServeHTTP` -- the `Matcher` interface is
+NOT modified. The flow:
+
+1. **Load all tapes** from store (existing: `s.store.List(r.Context(), Filter{})`).
+
+2. **Partition tapes** into two slices:
+   - `exactTapes`: tapes where `Exemplar == false` (normal tapes).
+   - `exemplarTapes`: tapes where `Exemplar == true`.
+   When synthesis is disabled (`s.synthesis == false`), skip the partition --
+   pass all tapes to the matcher as today (exemplar tapes will fail matching
+   because `PathCriterion` compares `URL` path, and exemplar tapes have no
+   `URL` -- they will score 0 and be eliminated).
+
+   **Correction on fail-safe**: Relying on `PathCriterion` returning 0 for
+   exemplar tapes is fragile -- it depends on which criteria the user
+   configured. Instead, when synthesis is disabled, explicitly filter out
+   exemplar tapes before passing candidates to the matcher. This guarantees
+   exemplar tapes are truly inert regardless of matcher configuration.
+
+3. **Phase 1 -- exact match**: call `s.matcher.Match(r, exactTapes)`. If a
+   match is found, proceed to response rendering (existing logic). Done.
+
+4. **Phase 2 -- exemplar fallback** (only if synthesis enabled AND phase 1
+   found no match):
+   a. Build a temporary `PathPatternCriterion` for each exemplar tape using
+      its `URLPattern`. **Correction**: building a criterion per exemplar per
+      request is wasteful. Instead, on tape load (once per `ServeHTTP` call),
+      build a `pathPatternMatcher` -- a small struct that wraps a list of
+      `(pattern, exemplarTape)` pairs, pre-compiled. Since `ServeHTTP` loads
+      tapes on every request (the O(n) scan acknowledged in ADR-4), the
+      per-request compilation cost is bounded by the number of exemplars.
+   b. For each exemplar tape (in declaration order), test the incoming
+      request path against the exemplar's `URLPattern` using
+      `PathPatternCriterion` from #196. If the pattern matches:
+      - Record the match with its specificity score (from
+        `PathPatternCriterion.Score`).
+      - Also run any other criteria in the server's matcher against the
+        exemplar (method, headers, body_fuzzy, etc.) -- the exemplar must
+        pass ALL criteria, not just the path pattern. This ensures a POST
+        exemplar is only consulted for POST requests.
+   c. Among all matching exemplars, select the one with the highest total
+      score. Ties are broken by declaration order (first in slice wins,
+      matching `CompositeMatcher` behavior).
+   d. If a matching exemplar is found, capture the path parameters from the
+      `PathPatternCriterion` match and proceed to template rendering.
+
+5. **No match at all**: invoke `s.onNoMatch` callback (if set) and write
+   fallback response (existing logic).
+
+**Specificity note**: `PathPatternCriterion.Score` from #196 is expected to
+return a higher score for more specific patterns (fewer wildcard segments).
+This ADR assumes the following contract from #196:
+- `/users/:id/orders` (1 param) scores higher than `/users/:id` (1 param,
+  shorter) -- wait, these have the same param count. The specificity is
+  actually about the total number of literal segments vs param segments.
+- This ADR relies on #196 defining a score that encodes specificity. If #196
+  uses a flat score (e.g., always returns 1), the "most specific exemplar
+  wins" requirement is met by extending the criterion or implementing a
+  secondary sort here.
+
+**Dependency note for #196 architect**: This ADR requires that
+`PathPatternCriterion.Score` either encodes specificity in its score value
+OR that `PathPatternCriterion` exposes the captured path parameters
+(e.g., `map[string]string`) so the server can feed them into the template
+context. The exact API is:
+
+```go
+// Required from #196 (assumed contract):
+type PathPatternCriterion struct {
+    Pattern string
+    // ... private fields ...
+}
+
+// MatchAndCapture matches the request path against the pattern and returns
+// captured path parameters. Returns nil, false if the pattern does not match.
+// This is used by the exemplar fallback path in Server.ServeHTTP.
+func (c *PathPatternCriterion) MatchAndCapture(path string) (map[string]string, bool)
+```
+
+If #196 does not expose `MatchAndCapture`, this ADR will need a package-level
+helper or will need to parse the pattern and match manually. The preferred
+approach is for #196 to expose this method, since the pattern parsing logic
+already exists in `PathPatternCriterion.Score`.
+
+##### Template resolution for exemplar responses
+
+Exemplar response rendering extends the existing `ResolveTemplateBody` flow
+with two additions:
+1. **Path parameter context**: captured path params (from
+   `PathPatternCriterion.MatchAndCapture`) are injected into the template
+   resolution context, accessible via `{{pathParam.NAME}}`. This is a #196
+   primitive -- this ADR just plumbs the captured values.
+2. **Recursive JSON body resolution**: when the response body is a native
+   JSON object (per ADR-41's polymorphic body model), template resolution
+   must walk the JSON tree and resolve expressions at leaf string positions.
+
+**Recursive JSON body template resolution algorithm:**
+
+```go
+// ResolveTemplateBodyJSON recursively resolves template expressions in a
+// JSON body. This is used for exemplar tapes whose response bodies are
+// native JSON objects (not string or base64).
+//
+// The algorithm walks the JSON tree depth-first:
+//   - Object: recurse into each value. Keys are not template-resolved.
+//   - Array: recurse into each element.
+//   - String leaf: resolve template expressions (same as ResolveTemplateBody
+//     on string bodies). Apply type coercion if present (| int, | float,
+//     | bool). If the entire string is a single template expression with
+//     coercion, the leaf value type changes (string -> number/bool).
+//   - Number/bool/null leaf: no template resolution. Return as-is.
+//
+// The function operates on the unmarshaled `any` tree (from json.Unmarshal)
+// and returns a new tree with resolved values. The caller marshals the
+// result back to JSON bytes.
+func resolveTemplateJSON(data any, ctx *TemplateContext, strict bool) (any, error)
+```
+
+Walk algorithm in detail:
+
+1. **Input**: `data any` (the unmarshaled JSON body, which is
+   `map[string]any`, `[]any`, `string`, `float64`, `bool`, or `nil`).
+
+2. **Object** (`map[string]any`): create a new map. For each key-value pair,
+   recurse on the value. Keys are NOT resolved (template expressions in JSON
+   keys would produce invalid JSON structure). Assign the resolved value to
+   the same key in the new map.
+
+3. **Array** (`[]any`): create a new slice. For each element, recurse. Append
+   the resolved element.
+
+4. **String** (`string`): this is where template resolution happens.
+   a. If the string contains no `{{`, return as-is (fast path).
+   b. Scan for template expressions using `scanTemplateExprs`.
+   c. Check if the entire string is a single template expression with type
+      coercion (e.g., `"{{pathParam.id | int}}"`). If so:
+      - Resolve the expression (without the coercion pipe).
+      - Parse the coercion: `| int`, `| float`, `| bool`.
+      - Convert the resolved string to the target type.
+      - Return the typed value (`float64` for int/float, `bool` for bool).
+      - On conversion failure: strict mode returns error; lenient mode
+        returns the uncoerced string.
+   d. If the string contains mixed literal text and expressions (e.g.,
+      `"Hello, {{pathParam.name}}!"`), or multiple expressions without
+      coercion, resolve all expressions and concatenate. Return as string.
+      Coercion is only supported when the entire string is a single
+      expression -- mixed coercion is ambiguous and an error.
+
+5. **Number** (`float64`), **bool**, **nil**: return as-is.
+
+The result `any` tree is marshaled back to `[]byte` via `json.Marshal` for
+the response body.
+
+**Interaction with existing `ResolveTemplateBody`**: the existing function
+operates on raw `[]byte`. For exemplar tapes with native JSON bodies, the
+new flow is:
+1. Unmarshal `tape.Response.Body` to `any` (since the body is stored as
+   compact JSON bytes per ADR-41).
+2. Call `resolveTemplateJSON(data, ctx, strict)`.
+3. Marshal the resolved tree back to `[]byte`.
+
+For exemplar tapes with string bodies (text Content-Type), the existing
+`ResolveTemplateBody` is used unchanged.
+
+For exemplar tapes with base64 bodies (binary Content-Type), no template
+resolution occurs.
+
+The dispatch is based on the response `Content-Type` header using the
+existing `ParseMediaType` / `IsJSON` / `IsText` / `IsBinary` classifiers
+from `media_type.go`.
+
+##### TemplateContext type
+
+A new type to carry the template resolution context, replacing the current
+approach of passing `*http.Request` and `reqBody []byte` separately:
+
+```go
+// TemplateContext holds the data available to template expressions during
+// resolution. It carries the incoming request, cached request body, and
+// additional context like captured path parameters.
+type TemplateContext struct {
+    // Request is the incoming HTTP request.
+    Request *http.Request
+    // RequestBody is the cached request body bytes (read once, reusable).
+    RequestBody []byte
+    // PathParams holds captured path parameter values from PathPatternCriterion.
+    // Empty for non-exemplar tapes.
+    PathParams map[string]string
+}
+```
+
+The existing `resolveExpr` function is updated to accept `*TemplateContext`
+instead of `(*http.Request, []byte)`. The `{{pathParam.NAME}}` expression
+resolution looks up `ctx.PathParams[NAME]`.
+
+This change is backward-compatible for non-exemplar tapes: `PathParams` is
+nil/empty, and `{{pathParam.*}}` expressions resolve to empty string (lenient)
+or error (strict).
+
+##### Server.ServeHTTP updated flow
+
+Step-by-step from request arrival to response:
+
+1. CORS handling (unchanged).
+2. Error simulation (unchanged).
+3. Load all tapes: `tapes, err := s.store.List(r.Context(), Filter{})`.
+4. **Partition**: split tapes into `exactTapes` (Exemplar==false) and
+   `exemplarTapes` (Exemplar==true). When synthesis is disabled, set
+   `exemplarTapes = nil` (or skip the partition entirely -- just filter out
+   exemplar tapes from the candidates).
+5. **Phase 1**: `tape, ok := s.matcher.Match(r, exactTapes)`.
+6. If ok: proceed to step 9 (response rendering) with `pathParams = nil`.
+7. **Phase 2** (only if `!ok && s.synthesis && len(exemplarTapes) > 0`):
+   a. For each exemplar tape, compile `PathPatternCriterion` from
+      `tape.Request.URLPattern`.
+   b. Check if the request path matches the pattern. If yes, capture path
+      params.
+   c. Score the exemplar against all other configured criteria (method,
+      headers, etc.). An exemplar must pass all criteria to be eligible.
+   d. Track the highest-scoring match.
+   e. If a match is found: `tape = bestExemplar`, `pathParams = capturedParams`.
+      Proceed to step 9.
+   f. If no match: proceed to step 8.
+8. **No match**: invoke `s.onNoMatch` (if set), write fallback response. Done.
+9. **Per-fixture error override** (unchanged).
+10. **Delay** (unchanged).
+11. **SSE check**: if SSE tape, call `s.serveSSE` (unchanged). Exemplar SSE
+    tapes are rejected at validation time, so this branch is never hit for
+    exemplars.
+12. **Template resolution** (enhanced for exemplars):
+    a. Build `TemplateContext` with request, cached body, and `pathParams`.
+    b. Determine body type from response Content-Type:
+       - JSON: unmarshal body to `any`, call `resolveTemplateJSON`, marshal
+         back.
+       - Text: call `ResolveTemplateBody` (existing, with `TemplateContext`).
+       - Binary: no resolution.
+    c. Resolve template expressions in response headers (existing
+       `ResolveTemplateHeaders`, updated to use `TemplateContext`).
+13. **Write response** (unchanged).
+
+##### CLI flag
+
+Add `--synthesize` flag to `httptape serve` in `cmd/httptape/main.go`:
+
+```go
+synthesize := fs.Bool("synthesize", false, "Enable synthesis mode (exemplar tapes generate responses for unmatched URLs)")
+```
+
+If `*synthesize` is true, append `httptape.WithSynthesis()` to `serverOpts`.
+
+After server creation, log the synthesis state:
+
+```go
+if *synthesize {
+    // Count exemplar tapes.
+    allTapes, _ := store.List(context.Background(), httptape.Filter{})
+    exemplarCount := 0
+    for _, t := range allTapes {
+        if t.Exemplar {
+            exemplarCount++
+        }
+    }
+    logger.Printf("synthesis mode ENABLED -- %d exemplar tape(s) loaded", exemplarCount)
+} else {
+    // Check if exemplar tapes exist but synthesis is off.
+    allTapes, _ := store.List(context.Background(), httptape.Filter{})
+    for _, t := range allTapes {
+        if t.Exemplar {
+            logger.Printf("WARNING: %d exemplar tape(s) found but synthesis is disabled (use --synthesize to enable)", countExemplars(allTapes))
+            break
+        }
+    }
+}
+```
+
+##### Startup validation
+
+At server startup (in `cmd/httptape/main.go`, after store creation, before
+server start), validate all loaded tapes:
+
+```go
+allTapes, err := store.List(context.Background(), httptape.Filter{})
+if err != nil {
+    return fmt.Errorf("load tapes: %w", err)
+}
+for _, t := range allTapes {
+    if err := httptape.ValidateTape(t); err != nil {
+        return fmt.Errorf("invalid tape %s: %w", t.ID, err)
+    }
+}
+```
+
+This catches structural errors (exemplar without URLPattern, URL + URLPattern
+on same tape, SSE exemplar) at startup, not at request time.
+
+##### Admin endpoint integration (#194)
+
+If #194 (admin API) ships, synthesis state should be queryable via
+`GET /__httptape/config` or similar. This is a note for the #194 architect,
+not a design commitment in this ADR. The `Server.synthesis` field is already
+accessible within the package.
+
+##### Type coercion implementation
+
+Type coercion is a template-expression-level feature. It is parsed from the
+raw expression string:
+
+```go
+// parseCoercion splits a template expression into the expression body and
+// an optional type coercion. Returns the expression without the coercion
+// pipe, the coercion type (or ""), and whether a coercion was found.
+//
+// Examples:
+//   "pathParam.id | int"    -> ("pathParam.id", "int", true)
+//   "pathParam.id"          -> ("pathParam.id", "", false)
+//   "faker.name seed=foo"   -> ("faker.name seed=foo", "", false)
+//   "request.query.page | float" -> ("request.query.page", "float", true)
+func parseCoercion(raw string) (expr string, coercion string, ok bool)
+```
+
+Supported coercions:
+- `int`: `strconv.ParseFloat` then truncate to `int64`, emit as JSON number.
+- `float`: `strconv.ParseFloat`, emit as JSON number.
+- `bool`: `strconv.ParseBool`, emit as JSON boolean.
+
+Coercion is only effective in `resolveTemplateJSON` (native JSON body
+context). In `ResolveTemplateBody` (string body), coercion is ignored --
+everything is a string already.
+
+#### Types
+
+| Type | File | Description |
+|---|---|---|
+| `TemplateContext` | `templating.go` | Carries request, cached body, path params for template resolution |
+
+Modified types:
+
+| Type | File | Change |
+|---|---|---|
+| `Tape` | `tape.go` | New field `Exemplar bool` (`json:"exemplar,omitempty"`) |
+| `RecordedReq` | `tape.go` | New field `URLPattern string` (`json:"url_pattern,omitempty"`) |
+| `Server` | `server.go` | New field `synthesis bool` |
+
+#### Functions and methods
+
+New exported:
+
+| Function / Method | Signature | File |
+|---|---|---|
+| `WithSynthesis` | `func WithSynthesis() ServerOption` | `server.go` |
+| `ValidateTape` | `func ValidateTape(t Tape) error` | `tape.go` |
+| `ValidateExemplar` | `func ValidateExemplar(t Tape) error` | `tape.go` |
+
+New unexported:
+
+| Function | Signature | File |
+|---|---|---|
+| `resolveTemplateJSON` | `func resolveTemplateJSON(data any, ctx *TemplateContext, strict bool) (any, error)` | `templating.go` |
+| `parseCoercion` | `func parseCoercion(raw string) (expr string, coercion string, ok bool)` | `templating.go` |
+| `coerceValue` | `func coerceValue(s string, coercion string) (any, error)` | `templating.go` |
+
+Modified:
+
+| Function / Method | File | Change |
+|---|---|---|
+| `resolveExpr` | `templating.go` | Signature changes from `(expr string, r *http.Request, reqBody []byte) (string, bool)` to `(expr string, ctx *TemplateContext) (string, bool)`. Adds `pathParam.*` lookup from `ctx.PathParams`. |
+| `ResolveTemplateBody` | `templating.go` | Signature adds `*TemplateContext` parameter (or internal refactor to build context from existing params). |
+| `ResolveTemplateHeaders` | `templating.go` | Same context refactor. |
+| `Server.ServeHTTP` | `server.go` | Adds two-phase match (exact then exemplar fallback), tape partitioning, exemplar-specific template resolution with JSON walk. |
+
+#### File layout
+
+**Modified files:**
+
+| File | Changes |
+|---|---|
+| `tape.go` | Add `Exemplar bool` to `Tape`. Add `URLPattern string` to `RecordedReq`. Update `RecordedReq.MarshalJSON` and `RecordedReq.UnmarshalJSON` to include `url_pattern`. Add `ValidateTape` and `ValidateExemplar` functions. |
+| `tape_test.go` | Add tests for `ValidateTape`, `ValidateExemplar`, JSON marshal/unmarshal round-trip with exemplar fields. |
+| `server.go` | Add `synthesis bool` to `Server`. Add `WithSynthesis() ServerOption`. Modify `ServeHTTP` with two-phase match flow, tape partitioning, exemplar fallback with path param capture, and JSON body template resolution dispatch. |
+| `server_test.go` | Add tests for synthesis mode: exact wins over exemplar, exemplar fallback, synthesis disabled ignores exemplars, most-specific exemplar wins, method filtering on exemplars, startup validation. |
+| `templating.go` | Add `TemplateContext` type. Add `resolveTemplateJSON`, `parseCoercion`, `coerceValue`. Refactor `resolveExpr` to use `TemplateContext`. Add `pathParam.*` resolution. Update `ResolveTemplateBody` and `ResolveTemplateHeaders` to use `TemplateContext` internally. |
+| `templating_test.go` | Add tests for `resolveTemplateJSON` (recursive walk on objects, arrays, nested objects, mixed types), `parseCoercion`, `coerceValue`, `pathParam.*` resolution. |
+| `cmd/httptape/main.go` | Add `--synthesize` flag to `runServe`. Add startup logging and exemplar tape validation. |
+| `cmd/httptape/main_test.go` | Add test for `--synthesize` flag parsing. |
+| `integration_test.go` | Add end-to-end test: exemplar tape serving `/users/1`, `/users/2`, `/users/7` with deterministic fake data per ID. Add negative test: synthesis disabled, exemplar ignored, fallback 404. |
+| `config.schema.json` | Add `exemplar` and `url_pattern` to the tape schema (if tape schema is defined in config -- architect note: tapes are not validated via `config.schema.json`, they are standalone fixture files. No schema change needed for config. Fixture schema is implicit.) |
+| `CLAUDE.md` | No structural changes needed. The package structure is unchanged. |
+
+**New files:**
+
+| File | Purpose |
+|---|---|
+| `docs/synthesis.md` | User documentation: when to use synthesis, how it differs from replay, opt-in gating, exemplar authoring guide, seed stability. |
+
+**Modified docs:**
+
+| File | Changes |
+|---|---|
+| `docs/fixtures-authoring.md` | Add section on exemplar tape authoring, `url_pattern` field, `exemplar: true` flag, template body examples. |
+| `docs/cli.md` | Add `--synthesize` flag documentation for `serve` command. |
+| `docs/api-reference.md` | Add `WithSynthesis`, `ValidateTape`, `ValidateExemplar`, `TemplateContext` entries. Update `Tape` and `RecordedReq` field tables. |
+
+**CHANGELOG:**
+
+Add entry for new synthesis mode feature.
+
+#### Sequence
+
+**Request arrives at Server with synthesis enabled, no exact match:**
+
+1. Request: `GET /users/42`.
+2. `ServeHTTP` loads all tapes from store.
+3. Partition: `exactTapes` = [tape for `/users/1`], `exemplarTapes` = [exemplar for `/users/:id`].
+4. Phase 1: `matcher.Match(req, exactTapes)` -- `/users/42` does not match `/users/1`. No match.
+5. Phase 2 (synthesis enabled):
+   a. For exemplar tape with pattern `/users/:id`:
+      - `PathPatternCriterion.MatchAndCapture("/users/42")` returns `{"id": "42"}`, true.
+      - Run other criteria: `MethodCriterion.Score(req, exemplar)` = 1 (GET matches GET). Pass.
+   b. Best match: the exemplar with params `{"id": "42"}`.
+6. Build `TemplateContext{Request: req, RequestBody: nil, PathParams: {"id": "42"}}`.
+7. Response body is native JSON: `{"id": "{{pathParam.id | int}}", "name": "{{faker.name seed=user-{{pathParam.id}}}}"}`.
+8. Unmarshal body to `any`.
+9. `resolveTemplateJSON` walks the tree:
+   - Key `"id"`: value `"{{pathParam.id | int}}"` -- single expression with coercion.
+     Resolve `pathParam.id` -> `"42"`. Coerce `| int` -> `float64(42)`.
+   - Key `"name"`: value `"{{faker.name seed=user-{{pathParam.id}}}}"` -- single expression.
+     Nested eval: `user-{{pathParam.id}}` -> `"user-42"`. Then `faker.name seed=user-42`
+     -> `"Alice Johnson"` (deterministic from HMAC). Return as string.
+10. Marshal resolved tree: `{"id":42,"name":"Alice Johnson"}`.
+11. Write response: 200, Content-Type: application/json, body: `{"id":42,"name":"Alice Johnson"}`.
+
+**Request arrives at Server with synthesis disabled, exemplar exists:**
+
+1. Request: `GET /users/42`.
+2. `ServeHTTP` loads all tapes from store.
+3. Synthesis disabled: filter out exemplar tapes. `candidates` = [tape for `/users/1`].
+4. `matcher.Match(req, candidates)` -- no match.
+5. No match: write fallback (404, "httptape: no matching tape found").
+
+**Request arrives at Server with synthesis enabled, exact match exists:**
+
+1. Request: `GET /users/1`.
+2. `ServeHTTP` loads all tapes, partitions.
+3. Phase 1: `matcher.Match(req, exactTapes)` -- `/users/1` matches tape for `/users/1`. Match found.
+4. Proceed to response rendering with existing exact tape. Exemplar NOT consulted.
+5. Write recorded response (exact replay).
+
+#### Error cases
+
+| Error | Where | Handling |
+|---|---|---|
+| Tape with `Exemplar==true` but empty `URLPattern` | `ValidateExemplar` | Returns `fmt.Errorf("httptape: exemplar tape %s: url_pattern is required", t.ID)` |
+| Tape with `Exemplar==true` and non-empty `URL` | `ValidateExemplar` | Returns `fmt.Errorf("httptape: exemplar tape %s: url and url_pattern are mutually exclusive", t.ID)` |
+| Tape with `Exemplar==false` and non-empty `URLPattern` | `ValidateExemplar` | Returns `fmt.Errorf("httptape: tape %s: url_pattern requires exemplar to be true", t.ID)` |
+| SSE exemplar tape | `ValidateExemplar` | Returns `fmt.Errorf("httptape: exemplar tape %s: SSE exemplars are not supported", t.ID)` |
+| Tape with both `URL` and `URLPattern` | `ValidateExemplar` | Returns `fmt.Errorf("httptape: tape %s: url and url_pattern are mutually exclusive", t.ID)` |
+| Invalid `URLPattern` syntax | `PathPatternCriterion` (from #196) | Error at criterion construction time. Server logs and skips the exemplar. |
+| Type coercion failure (e.g., `"abc" \| int`) | `resolveTemplateJSON` | Strict: returns error -> HTTP 500 with `X-Httptape-Error: template`. Lenient: emits uncoerced string. |
+| Unresolvable template expression in exemplar body | `resolveTemplateJSON` / `ResolveTemplateBody` | Strict: error -> HTTP 500. Lenient: empty string. Same as existing behavior. |
+| Store error during tape load | `ServeHTTP` | Returns HTTP 500 "httptape: store error" (existing behavior). |
+| All tapes invalid at startup | CLI startup | `runServe` returns error, process exits. |
+
+#### Test strategy
+
+All tests use stdlib `testing` only. Table-driven where appropriate.
+
+**`tape_test.go` -- validation tests:**
+
+1. `TestValidateExemplar_Valid`: exemplar with `Exemplar: true`, `URLPattern: "/users/:id"`, `URL: ""`. Expect nil error.
+
+2. `TestValidateExemplar_MissingURLPattern`: `Exemplar: true`, `URLPattern: ""`. Expect error containing "url_pattern is required".
+
+3. `TestValidateExemplar_MutuallyExclusive`: `Exemplar: true`, `URL: "/users/1"`, `URLPattern: "/users/:id"`. Expect error.
+
+4. `TestValidateExemplar_URLPatternWithoutExemplar`: `Exemplar: false`, `URLPattern: "/users/:id"`. Expect error.
+
+5. `TestValidateExemplar_SSEExemplar`: `Exemplar: true`, `URLPattern: "/events/:id"`, `SSEEvents: [...]`. Expect error.
+
+6. `TestValidateExemplar_NonExemplarNoURLPattern`: normal tape, `Exemplar: false`, `URL: "/users/1"`, `URLPattern: ""`. Expect nil (valid).
+
+7. `TestTape_MarshalJSON_Exemplar`: marshal exemplar tape, verify JSON contains `"exemplar": true` and `"url_pattern": "/users/:id"`.
+
+8. `TestTape_UnmarshalJSON_Exemplar`: unmarshal JSON with `"exemplar": true` and `"url_pattern"`, verify fields set correctly.
+
+9. `TestTape_UnmarshalJSON_NoExemplar`: unmarshal JSON without `"exemplar"` field. Verify `Exemplar == false`, `URLPattern == ""`.
+
+10. `TestTape_MarshalJSON_RoundTrip_Exemplar`: marshal -> unmarshal -> marshal, verify identical output.
+
+**`server_test.go` -- synthesis mode tests:**
+
+11. `TestServer_SynthesisDisabled_ExemplarIgnored`: store with one exemplar tape. Server without `WithSynthesis`. Request matching exemplar pattern. Expect fallback 404.
+
+12. `TestServer_SynthesisEnabled_ExactWins`: store with exact tape for `/users/1` AND exemplar for `/users/:id`. Server with `WithSynthesis`. Request `/users/1`. Expect exact tape response, NOT synthesized.
+
+13. `TestServer_SynthesisEnabled_ExemplarFallback`: store with exact tape for `/users/1` and exemplar for `/users/:id`. Request `/users/2`. Expect synthesized response from exemplar with path params resolved.
+
+14. `TestServer_SynthesisEnabled_MostSpecificExemplar`: two exemplars: `/users/:id` and `/users/:id/orders`. Request `/users/42/orders`. Expect the more specific exemplar wins.
+
+15. `TestServer_SynthesisEnabled_MethodFilter`: exemplar for GET `/users/:id`. Request POST `/users/42`. Expect fallback 404 (method mismatch eliminates exemplar).
+
+16. `TestServer_SynthesisEnabled_NoExemplars`: store with no exemplar tapes. Synthesis enabled. Request for unmatched URL. Expect fallback 404.
+
+17. `TestServer_SynthesisEnabled_DeterministicResponse`: same request `/users/42` twice. Verify identical response bodies (deterministic faker).
+
+**`templating_test.go` -- JSON template resolution tests:**
+
+18. `TestResolveTemplateJSON_Object`: input `{"name": "{{pathParam.name}}"}` with pathParams `{"name": "alice"}`. Expect `{"name": "alice"}`.
+
+19. `TestResolveTemplateJSON_NestedObject`: input `{"user": {"id": "{{pathParam.id | int}}"}}` with pathParams `{"id": "42"}`. Expect `{"user": {"id": 42}}` (number, not string).
+
+20. `TestResolveTemplateJSON_Array`: input `[{"id": "{{pathParam.id | int}}"}]` with pathParams `{"id": "1"}`. Expect `[{"id": 1}]`.
+
+21. `TestResolveTemplateJSON_NonStringLeaf`: input `{"count": 5, "active": true}`. Expect unchanged (numbers and bools are not template-resolved).
+
+22. `TestResolveTemplateJSON_MixedContent`: input `{"greeting": "Hello, {{pathParam.name}}!"}`. Expect `{"greeting": "Hello, alice!"}` (string, no coercion).
+
+23. `TestResolveTemplateJSON_CoercionInt`: `"{{pathParam.id | int}}"` with `id=42`. Expect `float64(42)`.
+
+24. `TestResolveTemplateJSON_CoercionFloat`: `"{{request.query.price | float}}"` with query `price=19.99`. Expect `float64(19.99)`.
+
+25. `TestResolveTemplateJSON_CoercionBool`: `"{{request.query.active | bool}}"` with query `active=true`. Expect `true` (bool).
+
+26. `TestResolveTemplateJSON_CoercionFailure_Strict`: `"{{pathParam.id | int}}"` with `id=abc`, strict mode. Expect error.
+
+27. `TestResolveTemplateJSON_CoercionFailure_Lenient`: `"{{pathParam.id | int}}"` with `id=abc`, lenient mode. Expect string `"abc"`.
+
+28. `TestResolveTemplateJSON_NoTemplates`: input `{"id": 1, "name": "Alice"}`. Expect unchanged (fast path, no allocations).
+
+29. `TestParseCoercion`: table-driven: `"pathParam.id | int"` -> `("pathParam.id", "int", true)`, `"pathParam.id"` -> `("pathParam.id", "", false)`, `"faker.name seed=foo"` -> no coercion.
+
+**`integration_test.go`:**
+
+30. `TestIntegration_ExemplarSynthesis`: end-to-end test. Create fixture directory with one exact tape (`/users/1`) and one exemplar (`/users/:id`). Start server with `WithSynthesis()`. Request `/users/1` -> exact replay. Request `/users/2` -> synthesized response with `id=2`. Request `/users/7` -> synthesized response with `id=7`. Verify `/users/2` and `/users/7` produce different fake names but each is deterministic across re-requests.
+
+31. `TestIntegration_SynthesisDisabled_ExemplarIgnored`: same fixtures as above but server without `WithSynthesis()`. Request `/users/2` -> fallback 404.
+
+**`cmd/httptape/main_test.go`:**
+
+32. `TestServeWithSynthesize`: invoke with `--synthesize` flag, verify no error.
+
+#### Alternatives considered
+
+1. **All tapes can synthesize (no `exemplar` flag)**: Any tape with template
+   expressions in its body becomes a synthesizer. Rejected because: (a) this
+   conflates recorded tapes with hand-authored templates -- a recorded tape
+   that happens to contain `{{` in its response body would be incorrectly
+   treated as a template; (b) no explicit opt-in makes it impossible to
+   distinguish intentional exemplars from incidental string matches; (c) URL
+   patterns need to be explicitly declared -- they cannot be inferred from
+   exact URLs.
+
+2. **Per-path-pattern config (in `config.json`) instead of per-tape flag**:
+   Define URL patterns and response templates in the config file, separate
+   from fixture JSON. Rejected because: (a) splits the definition of a mock
+   response across two files (config + fixture), making authoring harder;
+   (b) the fixture JSON is already the natural place for response templates
+   (body, headers, status code); (c) the `exemplar: true` flag is
+   self-documenting and requires no config changes.
+
+3. **Separate `exemplars/` subdirectory**: Exemplar tapes live in a dedicated
+   subdirectory, eliminating the need for the `exemplar` flag. Rejected
+   because: (a) requires `FileStore` changes to scan subdirectories; (b)
+   breaks the single-directory convention; (c) less portable (directory
+   structure is environment-specific, flag-based discrimination is not).
+
+4. **Server-level flag per-path-pattern (not per-tape)**: `WithSynthesis()`
+   accepts a list of path patterns. Only those patterns are synthesized.
+   Rejected because: (a) duplicates information already in the exemplar tapes'
+   `URLPattern` field; (b) requires keeping the server config and fixture
+   files in sync; (c) the per-tape flag is simpler and self-contained.
+
+5. **No server-level flag (always synthesize if exemplar tapes exist)**:
+   Rejected because: (a) silently changes behavior for integration test users
+   who happen to have exemplar tapes in their fixture directory; (b) violates
+   fail-safe principle -- exemplars should be inert unless explicitly
+   activated; (c) the PM spec explicitly requires a two-level opt-in.
+
+#### Consequences
+
+**Benefits:**
+
+- **Frontend-first workflow unlocked**: developers record one tape and get
+  realistic, deterministic responses for any parameter value. The mock server
+  becomes a lightweight, contract-driven stub -- no separate stub framework
+  needed.
+- **Fail-safe defaults**: integration test users are completely unaffected.
+  Exemplar tapes are inert unless `WithSynthesis()` is explicitly set. Even
+  if exemplar fixtures are accidentally included in a test fixture directory,
+  they are ignored.
+- **Deterministic reproducibility**: faker seeds are content-derived
+  (`user-{{pathParam.id}}`), not tape-identity-derived. The same request
+  always produces the same fake data, regardless of tape file name or
+  declaration order. This makes UI snapshots and visual regression tests
+  reliable.
+- **Composable with existing matcher**: exemplars pass through the same
+  `CompositeMatcher` criteria as exact tapes (method, headers, body_fuzzy,
+  etc.). No special-case matcher logic.
+- **Backward compatible**: new fields are `omitempty` and default to zero
+  values. Existing fixtures load unchanged. Existing server configurations
+  behave identically.
+
+**Costs / trade-offs:**
+
+- **Two-phase match adds complexity to `ServeHTTP`**: the method gains a
+  second matching pass. This is acceptable because (a) the second pass is
+  conditional (synthesis enabled + no exact match), (b) exemplar count is
+  typically small (single digits), and (c) the O(n) scan is already the
+  bottleneck, not the match logic.
+- **Type coercion is limited**: only `| int`, `| float`, `| bool`. No
+  `| string` (identity), no `| array`, no custom coercions. This covers
+  the common cases (ID fields, boolean flags, numeric values). Extensions
+  can be added later.
+- **SSE exemplars deferred**: a user who wants to synthesize SSE streams
+  (e.g., LLM streaming responses with varying content) cannot do so with
+  this feature. A follow-up issue is needed.
+- **`TemplateContext` refactor touches existing signatures**: `resolveExpr`
+  and related functions change their parameter lists. All existing callers
+  (internal to the package) must be updated. No public API break since these
+  functions are unexported.
+- **Dependency on #196**: this feature cannot ship until #196 delivers
+  `PathPatternCriterion` and `{{pathParam.*}}`. If #196 is delayed, #199
+  is blocked.
+
+**Future implications:**
+
+- **SSE exemplars** can be added as a follow-up by extending
+  `resolveTemplateJSON` to walk `SSEEvent.Data` strings.
+- **Stateful exemplars** (#195 scenarios) could combine with synthesis to
+  produce request-sequence-dependent responses from exemplar templates.
+- **Schema-based synthesis** (generating responses from OpenAPI schemas)
+  could layer on top of the exemplar infrastructure by auto-generating
+  exemplar tapes from schema definitions.
+- **Admin API** (#194) can expose synthesis state (enabled/disabled, exemplar
+  count) via a query endpoint.
+
+---
+
+
 ## PM Log
 
 ### 2026-04-16
@@ -12320,3 +14336,37 @@ Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179
 **Priority rationale:** #194 and #195 are high priority because they directly unlock the multi-turn agent testing narrative (verify what the agent sent; serve stateful response sequences). #196 and #197 are medium priority — useful but not blocking the core value proposition.
 
 **All four issues:** `READY_FOR_ARCH` status comments posted. Architects not dispatched — returned to user for triage.
+
+### 2026-04-18 — Path-parameter templating (#196 scope expansion) + exemplar tapes (#199)
+
+**Context:** Frontend-first development workflows need the mock server to synthesize responses for parameterized routes (e.g., `/users/1`, `/users/2`, `/users/42`) from a single exemplar tape, using deterministic fake data derived from captured path parameters. This requires two coordinated changes: (1) path-parameter matching and template accessors in the templating engine, and (2) a new "exemplar" tape mode with server-level opt-in synthesis.
+
+**Actions taken:**
+
+1. **Revised #196** — `feat(templating): response template helpers with deterministic faker integration`
+   - Scope expanded to include path-parameter templating (matcher + template accessor).
+   - **New matcher:** `PathPatternCriterion` with colon-prefixed named segments (`:id` syntax), config dispatch as `"type": "path_pattern"`, JSON Schema enum update.
+   - **New template accessor:** `{{pathParam.NAME}}` resolves captured URL segments. `{{request.query.NAME}}` verified and documented as first-class.
+   - **Nested template evaluation:** `seed=user-{{pathParam.id}}` evaluated before the helper runs — key mechanism for per-ID deterministic faking.
+   - 3 new open questions added for the architect: pattern syntax choice (Express `:id` vs OpenAPI `{id}`), match precedence weight, query-param-in-pattern exclusion.
+   - Type coercion helpers (`| int`, `| float`, `| bool`) deferred to #199 where they are needed for exemplar JSON body rendering.
+   - Body rewritten cleanly (not appended) to integrate both scopes into a coherent spec.
+   - Status reconfirmed: `READY_FOR_ARCH`. Scope expansion comment posted.
+
+2. **Created #199** — `feat: synthetic responses via exemplar tapes (opt-in, frontend-first workflows)`
+   - Labels: `type:feature`, `priority:medium`, `milestone:future`. Milestone: Future.
+   - New optional `exemplar: bool` field on `Tape` and `url_pattern: string` on `RecordedReq` (mutually exclusive with exact `url`). Purely additive fields — not a breaking change.
+   - **Critical opt-in gate:** synthesis is disabled by default. `WithSynthesis()` ServerOption / `--synthesize` CLI flag is the master switch. Per-tape `exemplar: true` is necessary but not sufficient. This protects integration tests from silently masking missing fixtures.
+   - Matching precedence: exact URL wins over exemplar; among exemplars, most-specific pattern wins (fewest wildcard segments).
+   - Template resolution recurses into native JSON objects, resolves strings, skips base64.
+   - Type coercion helpers (`| int`, `| float`, `| bool`) for JSON type correctness in rendered bodies.
+   - 16 acceptance criteria. 6 open questions for the architect (separate field vs overload, SSE scope, POST exemplar + body_fuzzy interaction, persistence layout, seed stability).
+   - **Hard dependency on #196** — cannot ship before #196 (needs `PathPatternCriterion`, `{{pathParam.*}}`, `{{faker.*}}`).
+   - Independent of #194 (journal), #195 (scenarios), #197 (inbound TLS).
+   - Status: `READY_FOR_ARCH`.
+
+**Rationale for the two-issue split:** #196 delivers the template engine and matcher primitives (reusable infrastructure). #199 builds the exemplar-tape mode on top of those primitives (product feature). This keeps #196 shippable and testable independently, and lets the architect design the template engine without being coupled to the exemplar concept.
+
+**Dependency chain:** #196 (template helpers + path params) -> #199 (exemplar tapes + synthesis mode).
+
+**Both issues:** `READY_FOR_ARCH` status comments posted. Architects not dispatched — returned to user.
