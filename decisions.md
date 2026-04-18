@@ -14370,3 +14370,32 @@ Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179
 **Dependency chain:** #196 (template helpers + path params) -> #199 (exemplar tapes + synthesis mode).
 
 **Both issues:** `READY_FOR_ARCH` status comments posted. Architects not dispatched — returned to user.
+
+### 2026-04-18 — CachingTransport library API (#202) + v0.13 milestone + #164 milestone bump
+
+**Driver:** VibeWarden integration. httptape will be embedded as a Go library inside VibeWarden's Caddy-based egress proxy. Single-binary deployment is VibeWarden's core positioning — a sidecar httptape container is not acceptable. Two concrete use cases: (A) zero-cost demo hosting for LinkGuard (record ~50 LLM responses, replay infinitely, EUR 0 API cost), (B) egress proxy integration for dev/staging traffic recording and replay in tests.
+
+**Actions taken:**
+
+1. **Created milestone "v0.13 — Embedded Library API"** (milestone #14, state: open). Description: "Library surface additions that unblock VibeWarden egress integration — CachingTransport and related primitives." Created matching `milestone:v0.13` label.
+
+2. **Created #202** — `feat: CachingTransport library API — http.RoundTripper that replays from store on hit, records + forwards on miss`
+   - URL: https://github.com/VibeWarden/httptape/issues/202
+   - Labels: `type:feature`, `priority:high`, `milestone:v0.13`. Milestone: v0.13 — Embedded Library API.
+   - Core API: `NewCachingTransport(upstream, store, ...CachingOption)` returning `*CachingTransport` implementing `http.RoundTripper`. Options: `WithCacheMatcher`, `WithCacheSanitizer`, `WithCacheFilter`, `WithSingleFlight`.
+   - RoundTrip flow: buffer body, match against store, return on hit, forward + record + return on miss. SSE uses tee semantics (stream to client while accumulating for store).
+   - 14 acceptance criteria covering implementation, thread safety, SSE, sanitization, tests, docs, and changelog.
+   - 7 open questions for the architect: naming, store-failure error handling, relationship to proxy CLI, Cache-Control header respect (PM recommends: ignore it — this is a tape-match layer, not RFC 7234), body size limits, TTL/eviction (PM recommends: not in v1), Recorder deprecation (PM recommends: keep Recorder as record-only primitive).
+   - Soft dependency on #164 for stale-fallback policy on cache miss + upstream down.
+   - Out of scope: admin endpoints, custom serialization, stale-while-revalidate, TTL, Recorder deprecation.
+   - Status: `READY_FOR_ARCH`.
+
+3. **Updated #164** — `proxy: cache miss + upstream down — response behavior for BOTH non-SSE and SSE endpoints`
+   - Milestone bumped from Future to v0.13 — Embedded Library API.
+   - Label changed from `milestone:future` to `milestone:v0.13`.
+   - Appended "Related: CachingTransport (#202)" section linking the two issues as siblings (not duplicates): #164 defines the stale-fallback policy, #202 implements it in the CachingTransport RoundTrip.
+   - Status: `READY_FOR_ARCH`.
+
+**Priority rationale:** This is the highest-priority post-launch feature. VibeWarden integration blocks on CachingTransport existing as a library primitive. The LinkGuard demo use case alone justifies the work — it turns a recurring LLM API cost into a one-time recording.
+
+**Both issues:** `READY_FOR_ARCH` status comments posted. Architect not dispatched — returned to user.
