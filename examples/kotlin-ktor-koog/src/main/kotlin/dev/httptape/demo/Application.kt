@@ -1,12 +1,16 @@
 package dev.httptape.demo
 
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.routing.*
-import io.ktor.serialization.kotlinx.json.*
-import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.contentnegotiation.ContentNegotiation as ServerContentNegotiation
 import io.ktor.server.sse.*
+import kotlinx.serialization.json.Json
 
 /**
  * Entry point for the Ktor demo application.
@@ -25,20 +29,32 @@ fun main() {
 /**
  * Configures the Ktor application with all required plugins and routes.
  *
- * Extracted as an extension function so tests can call it with
- * overridden base URLs via [testApplication].
+ * Creates an application-scoped [HttpClient] that is shared across all
+ * requests and closed when the application stops. Extracted as an
+ * extension function so tests can call it with overridden base URLs
+ * via [testApplication].
  */
 fun Application.configureApp(
     openAiBaseUrl: String = System.getenv("OPENAI_BASE_URL") ?: "https://api.openai.com",
     openAiApiKey: String = System.getenv("OPENAI_API_KEY") ?: "sk-placeholder",
     weatherBaseUrl: String = System.getenv("WEATHER_BASE_URL") ?: "https://wttr.in"
 ) {
-    install(ContentNegotiation) {
+    install(ServerContentNegotiation) {
         json()
     }
     install(SSE)
 
+    val weatherHttpClient = HttpClient(CIO) {
+        install(ContentNegotiation) {
+            json(Json { ignoreUnknownKeys = true })
+        }
+    }
+
+    monitor.subscribe(ApplicationStopped) {
+        weatherHttpClient.close()
+    }
+
     routing {
-        weatherAdviceRoute(openAiBaseUrl, openAiApiKey, weatherBaseUrl)
+        weatherAdviceRoute(openAiBaseUrl, openAiApiKey, weatherBaseUrl, weatherHttpClient)
     }
 }

@@ -35,6 +35,30 @@ This demo exercises the matcher composition stack from #178, #179, and #180:
 - **#179 (Criterion interface)**: `MethodCriterion`, `PathCriterion`, and `BodyFuzzyCriterion` implement the `Criterion` interface.
 - **#180 (declarative config)**: The `httptape.config.json` file declares the `CompositeMatcher` with all three criteria. No Go code changes needed -- the config drives the matching.
 
+## Note on httptape version
+
+This demo requires httptape's `--config` flag for `serve` mode, which enables declarative
+matcher composition (PR [#184](https://github.com/VibeWarden/httptape/pull/184)). That
+feature is **not included in any published release** -- the latest release (v0.10.1)
+predates it.
+
+**What this means today:** Both the Testcontainers setup (`HttptapeContainer.kt`) and
+`docker-compose.yml` build httptape from the repository root Dockerfile at test time.
+No pre-built image is pulled. The first run will spend ~30 seconds building the httptape
+Docker image; subsequent runs reuse the cached image (Testcontainers' image build is
+content-hashed).
+
+- `HttptapeContainer.kt` uses `ImageFromDockerfile` pointed at the repo root.
+- `docker-compose.yml` uses `build: context: ../..`.
+
+**After v0.11.0 ships:** Once the next httptape release lands (which will include PR #184),
+the demo can switch to a pre-built image. This is a one-line change in each file:
+
+- In `HttptapeContainer.kt`: replace the `ImageFromDockerfile(...)` block with
+  `GenericContainer("ghcr.io/vibewarden/httptape:0.11.0")`.
+- In `docker-compose.yml`: replace the `build:` block with
+  `image: ghcr.io/vibewarden/httptape:0.11.0`.
+
 ## Prerequisites
 
 - **Docker** (for Testcontainers and the optional `docker compose` flow)
@@ -47,7 +71,7 @@ cd examples/kotlin-ktor-koog
 ./gradlew test
 ```
 
-Tests spin up an httptape container via Testcontainers, run the Koog agent against it, and assert the response. No API keys. No real LLM calls. Deterministic on every run.
+Tests spin up an httptape container via Testcontainers, run the Koog agent against it, and assert the response. No API keys. No real LLM calls. Deterministic on every run. The first run builds the httptape Docker image from source (~30s); subsequent runs reuse the cached image.
 
 ## Adding a new fixture
 
@@ -78,7 +102,7 @@ Subsequent test runs reuse the same httptape container, dropping startup overhea
 
 ## Try it standalone
 
-For non-JVM users who want to `curl` the demo (builds httptape from source):
+For non-JVM users who want to `curl` the demo (builds httptape from source -- see [Note on httptape version](#note-on-httptape-version)):
 
 ```bash
 docker compose up -d --build
@@ -99,6 +123,7 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | Kotest | 6.1.11 (BehaviorSpec) |
 | Testcontainers | 2.0.4 (single shared container) |
 | Gradle | 9.4.1 (wrapper committed) |
+| httptape | built from source (see [Note on httptape version](#note-on-httptape-version)) |
 
 ## Why not...?
 

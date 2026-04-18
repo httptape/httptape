@@ -7,6 +7,7 @@ import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIModels
 import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import io.ktor.client.*
 import io.ktor.server.routing.*
 import io.ktor.server.sse.*
 
@@ -16,11 +17,15 @@ import io.ktor.server.sse.*
  * The route accepts a `city` query parameter, creates a Koog agent
  * with the [WeatherTools] tool set, runs the agent against the OpenAI
  * chat completions API, and returns the final answer as a single SSE event.
+ *
+ * The [weatherHttpClient] is an application-scoped Ktor [HttpClient]
+ * whose lifecycle is managed by the caller (closed on application stop).
  */
 fun Route.weatherAdviceRoute(
     openAiBaseUrl: String,
     openAiApiKey: String,
-    weatherBaseUrl: String
+    weatherBaseUrl: String,
+    weatherHttpClient: HttpClient
 ) {
     sse("/weather-advice") {
         val city = call.parameters["city"]
@@ -29,7 +34,7 @@ fun Route.weatherAdviceRoute(
             return@sse
         }
 
-        val weatherTools = WeatherTools(weatherBaseUrl)
+        val weatherTools = WeatherTools(weatherHttpClient, weatherBaseUrl)
         val toolRegistry = ToolRegistry { tools(weatherTools) }
 
         val llmClient = OpenAILLMClient(
