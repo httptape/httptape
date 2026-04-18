@@ -35,22 +35,9 @@ This demo exercises the matcher composition stack from #178, #179, and #180:
 - **#179 (Criterion interface)**: `MethodCriterion`, `PathCriterion`, and `BodyFuzzyCriterion` implement the `Criterion` interface.
 - **#180 (declarative config)**: The `httptape.config.json` file declares the `CompositeMatcher` with all three criteria. No Go code changes needed -- the config drives the matching.
 
-## Note on httptape version
+## httptape version requirement
 
-This demo currently **builds httptape from source** (the repo root `Dockerfile`)
-instead of pulling a pre-built image from GHCR. This is because PR
-[#191](https://github.com/VibeWarden/httptape/pull/191) migrated the fixture
-format to the v0.12 content-type-aware body shape, which is not readable by
-older published images (v0.11.0 and below).
-
-Once v0.12.0 is tagged and pushed to GHCR, a follow-up PR will swap both
-`HttptapeContainer.kt` and `docker-compose.yml` back to
-`ghcr.io/vibewarden/httptape:0.12.0`.
-
-The demo also requires the `--config` flag for `serve` mode (declarative matcher
-composition, introduced in [PR #184](https://github.com/VibeWarden/httptape/pull/184)),
-first shipped in **httptape v0.11.0**. Earlier releases (v0.10.1 and below) do not
-have `--config` support and will fail with the agent looping.
+This demo requires **httptape v0.12.0** or later. v0.12.0 introduced Content-Type-driven body shape in fixtures (PR [#191](https://github.com/VibeWarden/httptape/pull/191)) and includes `--config` support for declarative matcher composition (first shipped in v0.11.0, PR [#184](https://github.com/VibeWarden/httptape/pull/184)). Earlier releases cannot read the migrated fixture format or the matcher config.
 
 ## Prerequisites
 
@@ -127,7 +114,7 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | Kotest | 6.1.11 (FreeSpec) |
 | Testcontainers | 2.0.4 (single shared container) |
 | Gradle | 9.4.1 (wrapper committed) |
-| httptape | built from source (v0.12.0-dev, see [version note](#note-on-httptape-version)) |
+| httptape | v0.12.0 (ghcr.io/vibewarden/httptape:0.12.0) |
 
 ## Why not...?
 

@@ -16,18 +16,6 @@ The service calls an LLM via OpenAI's chat completions API. Tests serve a hand-c
 
 The service also calls a regular REST endpoint via Spring's modern `RestClient`. Same Testcontainers + httptape pattern, recorded JSON fixtures.
 
-## Note on httptape version
-
-This demo currently **builds httptape from source** (the repo root `Dockerfile`)
-instead of pulling a pre-built image from GHCR. This is because PR
-[#191](https://github.com/VibeWarden/httptape/pull/191) migrated the fixture
-format to the v0.12 content-type-aware body shape, which is not readable by
-older published images (v0.10.1 and below).
-
-Once v0.12.0 is tagged and pushed to GHCR, a follow-up PR will swap both
-`TestcontainersConfig.java` and `docker-compose.yml` back to
-`ghcr.io/vibewarden/httptape:0.12.0`.
-
 ## Prerequisites
 
 - **Docker** (for Testcontainers and the optional `docker compose` flow)
