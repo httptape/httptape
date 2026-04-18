@@ -2,9 +2,7 @@ package dev.httptape.demo
 
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.containers.wait.strategy.Wait
-import org.testcontainers.images.builder.ImageFromDockerfile
 import org.testcontainers.utility.MountableFile
-import java.nio.file.Path
 
 /**
  * JVM-singleton httptape container shared across all test classes.
@@ -14,20 +12,11 @@ import java.nio.file.Path
  * serves three fixture files and uses a declarative matcher config that
  * distinguishes the two POST /v1/chat/completions requests via
  * `body_fuzzy` on `$.messages[*].role`.
- *
- * The httptape image is built from the repository root Dockerfile so that
- * the test always uses the latest matcher features (including `--config`
- * support in `serve` mode, which is not yet in a published release).
  */
 object HttptapeContainer {
 
     val instance: GenericContainer<*> by lazy {
-        val repoRoot = Path.of("../..").toAbsolutePath().normalize()
-        val image = ImageFromDockerfile("httptape-test", false)
-            .withFileFromPath(".", repoRoot)
-            .withFileFromPath("Dockerfile", repoRoot.resolve("Dockerfile"))
-
-        GenericContainer(image)
+        GenericContainer("ghcr.io/vibewarden/httptape:0.11.0")
             .withCommand(
                 "serve",
                 "--fixtures", "/fixtures",

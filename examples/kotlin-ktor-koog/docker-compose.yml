@@ -1,8 +1,6 @@
 services:
   httptape:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: ghcr.io/vibewarden/httptape:0.11.0
     command: ["serve", "--fixtures", "/fixtures", "--config", "/config/httptape.config.json"]
     volumes:
       - ./src/test/resources/fixtures/openai/chat-1.json:/fixtures/chat-1.json:ro
