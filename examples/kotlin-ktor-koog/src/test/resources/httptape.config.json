@@ -1,0 +1,11 @@
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "body_fuzzy", "paths": ["$.messages[*].role"] }
+    ]
+  },
+  "rules": []
+}

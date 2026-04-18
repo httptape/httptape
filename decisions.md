@@ -10181,6 +10181,999 @@ All tests use stdlib `testing` only. Table-driven where appropriate.
 
 ---
 
+### ADR-40: Kotlin + Ktor + Koog + Kotest demo (examples/kotlin-ktor-koog)
+
+**Date**: 2026-04-18
+**Issue**: #185
+**Status**: Accepted
+
+#### Context
+
+The three matcher improvements -- #178 (vacuous-true fix), #179 (Criterion interface), and
+#180 (declarative matcher composition via config) -- need an end-to-end proof artifact that
+exercises all three together in a realistic multi-step agent scenario. Issue #185 specifies a
+Kotlin + Ktor + Koog + Kotest demo where a single-tool AI agent makes two POST requests to the
+same OpenAI URL (distinguished by JSON body content via `BodyFuzzyCriterion`) plus one body-less
+GET request (coexisting via the vacuous-true fix), all served by one httptape container with a
+declarative matcher config file.
+
+This ADR resolves the 5 open questions from the PM spec and specifies the complete file layout,
+dependency versions, build configuration, fixture format, test strategy, CI extension, and
+dependabot coverage for `examples/kotlin-ktor-koog/`.
+
+#### Open question resolutions
+
+**Q1: Kotest BehaviorSpec vs FunSpec**
+
+Decision: **BehaviorSpec**.
+
+Rationale: The agent scenario has a natural Given/When/Then narrative ("Given a Koog agent
+backed by httptape / When the user asks the weather-advice question / Then the response
+streams the expected text"). BehaviorSpec's nested `Given`/`When`/`Then` blocks map directly
+to this structure and produce readable test output. FunSpec is flatter and better for
+independent test cases; the agent flow here is inherently sequential and narrative-driven.
+The PM recommendation aligns with the use case.
+
+**Q2: Koog tool HTTP client idiom**
+
+Decision: **Ktor HttpClient (CIO engine)**.
+
+Rationale: Koog's `ToolSet` tools return a `String` (or `TextObject`) -- the tool
+implementation is ordinary Kotlin code. The tool's HTTP call to the weather API should use
+Ktor's HttpClient (CIO engine) because: (1) the demo already depends on Ktor for the server,
+so no new transitive dependency; (2) Ktor HttpClient is coroutine-native, matching Koog's
+suspend-based tool execution; (3) the base URL can be injected via constructor parameter,
+making test redirection straightforward. OkHttp would add an unnecessary dependency. Koog
+does not provide its own HTTP client for tool implementations -- tools are user code.
+
+**Q3: Multi-module vs single-module Gradle layout**
+
+Decision: **Single module**.
+
+Rationale: The demo has one application and one test class. Multi-module Gradle adds
+`settings.gradle.kts` complexity (`include(":app")`, inter-module deps) for zero benefit.
+The Java demo is also single-module. All source code lives under the standard
+`src/main/kotlin/` and `src/test/kotlin/` trees within a single `build.gradle.kts`.
+
+**Q4: Matcher config file location and container mount path**
+
+Decision: `src/test/resources/httptape.config.json` in the source tree.
+Mounted to `/config/httptape.config.json` inside the container via `withCopyFileToContainer`.
+The `--config` CLI flag value is `/config/httptape.config.json`.
+
+Rationale: Placing it under `src/test/resources/` makes it a classpath resource, accessible
+via `Thread.currentThread().contextClassLoader.getResource("httptape.config.json")` for the
+Testcontainers file-copy call. The `/config/` container path is distinct from `/fixtures/`
+to avoid confusion. For the standalone `docker-compose.yml` path, the file is bind-mounted
+from the project root-relative path `src/test/resources/httptape.config.json`.
+
+**Q5: SSE fixture authoring strategy**
+
+Decision: **Hand-craft following OpenAI's wire format, using the Java demo's
+`chat-completion-headphones.json` as the structural template**.
+
+Rationale: (a) Capturing from real OpenAI requires an API key, costs money, and produces
+non-deterministic content that would need manual editing anyway. (b) Hand-crafting ensures
+every field is intentional and documented. (c) The Java demo's existing SSE fixture already
+demonstrates the correct `chat.completion.chunk` JSON structure with `offset_ms` timing and
+the `[DONE]` sentinel. The two new fixtures (`chat-1.json` and `chat-2.json`) adapt this
+template for tool-call deltas: `chat-1.json` uses `delta.tool_calls` (with function name and
+arguments streamed across chunks), `chat-2.json` uses `delta.content` (same as the Java demo).
+The OpenAI API reference for streaming tool calls documents the exact `tool_calls` delta
+shape: `[{"index":0,"id":"call_xxx","type":"function","function":{"name":"getWeather","arguments":""}}]`
+in the first chunk, then `[{"index":0,"function":{"arguments":"..."}}]` in subsequent chunks
+streaming the JSON arguments.
+
+#### Decision
+
+##### Verified dependency versions
+
+All versions verified against Maven Central / GitHub Releases / Gradle releases as of
+2026-04-18. No assumptions.
+
+| Dependency | Version | Source |
+|---|---|---|
+| Kotlin | 2.3.20 | GitHub Releases (v2.3.20, 2026-03-16, stable) |
+| JDK | 25 | Matches Java demo |
+| Ktor | 3.4.2 | GitHub Releases (2026-03-30, stable) |
+| Koog | 0.8.0 | Maven Central + GitHub Releases (2026-04-11, stable). License: Apache 2.0. |
+| Kotest | 6.1.11 | GitHub Releases + Maven Central (2026-04-04, stable) |
+| Kotest Testcontainers Extension | 2.0.2 | Maven Central |
+| Testcontainers | 2.0.4 | GitHub Releases + Maven Central (2026-03-19, stable) |
+| Gradle | 9.4.1 | gradle.org/releases (current) |
+| Logback | 1.5.13 | Maven Central (SLF4J runtime for Ktor) |
+| kotlinx-serialization | 1.10.0 | Matches Koog 0.8.0 transitive |
+| kotlinx-coroutines | 1.10.2 | Matches Koog 0.8.0 transitive |
+
+**Ktor version note**: Koog 0.8.0 was built against Ktor 3.2.2. Using Ktor 3.4.2 is safe
+because Ktor 3.x maintains binary compatibility across minor versions, and Gradle dependency
+resolution will unify all Ktor artifacts to the highest requested version (3.4.2).
+
+**Kotlin version note**: Koog 0.8.0 was built with Kotlin 2.3.10. Kotlin 2.3.20 is
+backward-compatible within the same minor. No issues expected.
+
+##### Directory layout
+
+```
+examples/kotlin-ktor-koog/
+  .gitignore
+  api.http
+  build.gradle.kts
+  docker-compose.yml
+  Dockerfile
+  gradle/
+    wrapper/
+      gradle-wrapper.jar
+      gradle-wrapper.properties
+  gradlew
+  gradlew.bat
+  README.md
+  settings.gradle.kts
+  src/
+    main/
+      kotlin/
+        dev/
+          httptape/
+            demo/
+              Application.kt
+              WeatherAdviceRoute.kt
+              WeatherAgent.kt
+              WeatherTools.kt
+              AppConfig.kt
+      resources/
+        application.yaml
+        logback.xml
+    test/
+      kotlin/
+        dev/
+          httptape/
+            demo/
+              HttptapeContainer.kt
+              WeatherAdviceTest.kt
+      resources/
+        fixtures/
+          openai/
+            chat-1.json
+            chat-2.json
+          weather/
+            weather-berlin.json
+        httptape.config.json
+```
+
+##### File descriptions
+
+**`settings.gradle.kts`**
+
+```kotlin
+rootProject.name = "kotlin-ktor-koog-demo"
+```
+
+Single module. No `include()` statements.
+
+**`build.gradle.kts`** — sketch of every dependency:
+
+```kotlin
+plugins {
+    kotlin("jvm") version "2.3.20"
+    kotlin("plugin.serialization") version "2.3.20"
+    application
+}
+
+group = "dev.httptape"
+version = "0.0.1-SNAPSHOT"
+
+application {
+    mainClass.set("dev.httptape.demo.ApplicationKt")
+}
+
+kotlin {
+    jvmToolchain(25)
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Ktor server
+    implementation("io.ktor:ktor-server-netty:3.4.2")
+    implementation("io.ktor:ktor-server-sse:3.4.2")
+    implementation("io.ktor:ktor-server-content-negotiation:3.4.2")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.4.2")
+
+    // Ktor client (for the weather tool's REST call)
+    implementation("io.ktor:ktor-client-cio:3.4.2")
+    implementation("io.ktor:ktor-client-content-negotiation:3.4.2")
+
+    // Koog — AI agent framework (Ktor plugin + agents)
+    implementation("ai.koog:koog-ktor:0.8.0")
+
+    // kotlinx-serialization (Koog transitive, but explicit for clarity)
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
+
+    // Logging
+    implementation("ch.qos.logback:logback-classic:1.5.13")
+
+    // Test — Kotest
+    testImplementation("io.kotest:kotest-runner-junit5:6.1.11")
+    testImplementation("io.kotest:kotest-assertions-core:6.1.11")
+
+    // Test — Testcontainers
+    testImplementation("org.testcontainers:testcontainers:2.0.4")
+    testImplementation("io.kotest.extensions:kotest-extensions-testcontainers:2.0.2")
+
+    // Test — Ktor client for issuing requests to the app under test
+    testImplementation("io.ktor:ktor-client-cio:3.4.2")
+    testImplementation("io.ktor:ktor-client-content-negotiation:3.4.2")
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+}
+```
+
+**`Application.kt`** — Ktor entry point:
+
+- Starts an embedded Netty server on port 8080 (configurable via env var `PORT`).
+- Installs `ContentNegotiation` with `kotlinx.serialization.json`.
+- Installs `SSE` plugin.
+- Installs the `Koog` plugin with OpenAI configuration. The OpenAI `baseUrl` and `apiKey`
+  are read from `application.yaml` (with env-var overrides):
+  ```kotlin
+  install(Koog) {
+      llm {
+          openAI(apiKey = environment.config.property("koog.openai.api-key").getString()) {
+              baseUrl = environment.config.property("koog.openai.base-url").getString()
+          }
+      }
+  }
+  ```
+- Registers the `/weather-advice` route.
+
+**`application.yaml`**:
+
+```yaml
+ktor:
+  deployment:
+    port: 8080
+
+koog:
+  openai:
+    base-url: ${OPENAI_BASE_URL:-https://api.openai.com}
+    api-key: ${OPENAI_API_KEY:-sk-placeholder}
+
+weather:
+  base-url: ${WEATHER_BASE_URL:-https://wttr.in}
+```
+
+**`logback.xml`** — standard Logback configuration with INFO level for the demo, DEBUG
+for `dev.httptape.demo`.
+
+**`WeatherAdviceRoute.kt`** — defines the `GET /weather-advice` Ktor route:
+
+```kotlin
+fun Route.weatherAdviceRoute() {
+    get("/weather-advice") {
+        val city = call.parameters["city"] ?: return@get call.respondText(
+            "Missing 'city' query parameter", status = HttpStatusCode.BadRequest
+        )
+        // Create agent with the streaming strategy and run it
+        val weatherBaseUrl = application.environment.config.property("weather.base-url").getString()
+        val weatherTools = WeatherTools(weatherBaseUrl)
+        val toolRegistry = ToolRegistry {
+            tools(weatherTools.asTools())
+        }
+
+        call.respondSse {
+            val result = aiAgent(
+                ToolCalls.SINGLE_RUN_SEQUENTIAL,
+                model = OpenAIModels.CostOptimized.GPT4oMini,
+                tools = toolRegistry
+            ) { agent -> agent.run("What's the weather in $city? Should I bring an umbrella?") }
+
+            send(ServerSentEvent(data = result))
+        }
+    }
+}
+```
+
+Note: The exact SSE streaming approach depends on whether the dev uses Koog's streaming
+strategy or the simpler `singleRunStrategy`. For the demo, `singleRunStrategy` with
+`SINGLE_RUN_SEQUENTIAL` tool calls is sufficient -- the agent runs the full
+request-tool-response loop internally and returns the final string. The route then sends
+that string as an SSE event. This is simpler than wiring up Koog's graph-based streaming
+strategy for a demo. The dev may adjust the streaming granularity (per-token vs. final
+result) based on what works cleanly with Koog's API.
+
+**`WeatherAgent.kt`** — this file may be merged into `WeatherAdviceRoute.kt` if the agent
+construction is simple enough (as shown above using `aiAgent()` from the Koog Ktor plugin).
+The architect leaves the dev discretion to split or merge. The key constraint is that the
+agent must use `OpenAIModels.CostOptimized.GPT4oMini` (or similar) as the model and the
+`WeatherTools` tool set.
+
+**`WeatherTools.kt`** — defines the Koog tool set:
+
+```kotlin
+class WeatherTools(private val baseUrl: String) : ToolSet {
+
+    private val client = HttpClient(CIO) {
+        install(ContentNegotiation) {
+            json(Json { ignoreUnknownKeys = true })
+        }
+    }
+
+    @Tool
+    @LLMDescription("Get the current weather forecast for a city")
+    suspend fun getWeather(
+        @LLMDescription("The city name to get weather for")
+        city: String
+    ): String {
+        val response: JsonObject = client.get("$baseUrl/v1/forecast") {
+            parameter("city", city)
+        }.body()
+        return response.toString()
+    }
+}
+```
+
+Key design points:
+- The `baseUrl` is injected via constructor, allowing tests to redirect to httptape.
+- The Ktor HttpClient with CIO engine is coroutine-native.
+- The weather API path is `/v1/forecast?city=Berlin` (a fictional simplified endpoint rather
+  than wttr.in's actual `/{city}?format=j1` path). This makes the matcher config cleaner:
+  the path `/v1/forecast` is distinct from `/v1/chat/completions`, and query parameters
+  are not part of path matching. Using wttr.in's actual path (`/Berlin?format=j1`) would
+  require path-regex matching since the city is embedded in the path, which adds unnecessary
+  complexity. The fixture response shape mimics wttr.in's JSON structure.
+
+**`AppConfig.kt`** — optional. If configuration wiring beyond `application.yaml` is needed,
+this file holds it. The dev may fold everything into `Application.kt` if it stays simple.
+
+**`HttptapeContainer.kt`** — Testcontainers setup (Kotlin equivalent of the Java demo's
+`TestcontainersConfig.java`):
+
+```kotlin
+object HttptapeContainer {
+    val instance: GenericContainer<*> by lazy {
+        GenericContainer("ghcr.io/vibewarden/httptape:0.10.1")
+            .withCommand(
+                "serve",
+                "--fixtures", "/fixtures",
+                "--config", "/config/httptape.config.json",
+                "--sse-timing=realtime"
+            )
+            .withExposedPorts(8081)
+            .waitingFor(Wait.forHttp("/").forStatusCode(404))
+            .apply {
+                // Mount fixtures — flatten subdirectories into /fixtures/
+                copyFixture("fixtures/openai/chat-1.json")
+                copyFixture("fixtures/openai/chat-2.json")
+                copyFixture("fixtures/weather/weather-berlin.json")
+                // Mount matcher config
+                withCopyFileToContainer(
+                    MountableFile.forClasspathResource("httptape.config.json"),
+                    "/config/httptape.config.json"
+                )
+            }
+            .also { it.start() }
+    }
+
+    val baseUrl: String
+        get() = "http://${instance.host}:${instance.getMappedPort(8081)}"
+
+    private fun GenericContainer<*>.copyFixture(classpathPath: String) {
+        val filename = classpathPath.substringAfterLast("/")
+        withCopyFileToContainer(
+            MountableFile.forClasspathResource(classpathPath),
+            "/fixtures/$filename"
+        )
+    }
+}
+```
+
+Design rationale:
+- Uses a Kotlin `object` with `lazy` initialization for JVM-singleton lifecycle (same
+  container shared across all test classes, same pattern as the Java demo's
+  `@TestConfiguration` with `@Bean` scope).
+- Fixtures are enumerated explicitly rather than using classpath scanning (unlike the Java
+  demo's `PathMatchingResourcePatternResolver`). Kotlin has no stdlib equivalent of Spring's
+  classpath-glob scanner. For 3 fixtures, explicit enumeration is clearer than rolling a
+  custom scanner. If the fixture count grows, the dev can add a simple utility that reads
+  a manifest file or walks a resource directory.
+- The `--config` flag points to `/config/httptape.config.json` inside the container.
+
+**`WeatherAdviceTest.kt`** — Kotest BehaviorSpec:
+
+```kotlin
+class WeatherAdviceTest : BehaviorSpec({
+    // Boot httptape once per JVM, then start a Ktor test server
+    // with base URLs pointing at the httptape container.
+
+    given("a Koog agent backed by httptape") {
+        `when`("the user asks for weather advice for Berlin") {
+            then("the response contains weather-based advice") {
+                // 1. Start embedded Ktor server with:
+                //    - koog.openai.base-url = HttptapeContainer.baseUrl
+                //    - weather.base-url = HttptapeContainer.baseUrl
+                //    - koog.openai.api-key = "sk-test-key"
+                // 2. Issue GET /weather-advice?city=Berlin via Ktor test client
+                // 3. Read SSE response
+                // 4. Assert response contains "umbrella" (from chat-2.json fixture)
+            }
+        }
+    }
+})
+```
+
+The test uses Ktor's `testApplication { }` block (from `io.ktor.server.testing`) to start an
+in-process server with overridden config properties. The Koog plugin inside the test server
+connects to httptape (acting as both OpenAI and the weather API) via the dynamic base URL.
+
+Alternative: instead of `testApplication`, the test could start a real Netty server on a
+random port and hit it with an HTTP client. The dev should pick whichever approach integrates
+more cleanly with Koog's Ktor plugin lifecycle. The `testApplication` approach is preferred
+because it avoids port binding and is faster.
+
+**Fixture structure:**
+
+**`chat-1.json`** — POST /v1/chat/completions, response with tool_call:
+
+```json
+{
+  "id": "chat-1-tool-call",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "<JSON with messages=[{role:system,...},{role:user,...}]>",
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/event-stream"],
+      "Cache-Control": ["no-cache"]
+    },
+    "body": null,
+    "sse_events": [
+      {
+        "offset_ms": 50,
+        "data": "{\"id\":\"chatcmpl-tc1\",\"object\":\"chat.completion.chunk\",\"created\":1713264000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_weather_1\",\"type\":\"function\",\"function\":{\"name\":\"getWeather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}"
+      },
+      {
+        "offset_ms": 120,
+        "data": "{\"id\":\"chatcmpl-tc1\",\"object\":\"chat.completion.chunk\",\"created\":1713264000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}]},\"finish_reason\":null}]}"
+      },
+      {
+        "offset_ms": 200,
+        "data": "{\"id\":\"chatcmpl-tc1\",\"object\":\"chat.completion.chunk\",\"created\":1713264000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}"
+      },
+      {
+        "offset_ms": 250,
+        "data": "[DONE]"
+      }
+    ]
+  }
+}
+```
+
+Key points:
+- The request body contains `messages` with roles `["system", "user"]` only. This is what
+  the matcher uses to distinguish this from `chat-2.json`.
+- The SSE response streams tool_call deltas in OpenAI's exact wire format: first chunk has
+  the full `tool_calls` array entry with `id`, `type`, `function.name`, and empty
+  `arguments`; second chunk appends to `arguments`; third chunk has `finish_reason: "tool_calls"`.
+- `finish_reason` is `"tool_calls"` (not `"stop"`) -- this signals Koog to execute the tool.
+- The request body field is populated with a minimal but valid JSON that includes the
+  `messages` array with `system` and `user` roles. The exact content does not matter for
+  matching (only `$.messages[*].role` is checked), but it must be valid JSON.
+
+**`weather-berlin.json`** — GET /v1/forecast?city=Berlin:
+
+```json
+{
+  "id": "weather-berlin",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:01Z",
+  "request": {
+    "method": "GET",
+    "url": "/v1/forecast?city=Berlin",
+    "headers": {},
+    "body": null,
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "eyJjaXR5IjoiQmVybGluIiwidGVtcCI6MTIsImNvbmRpdGlvbiI6InJhaW4iLCJodW1pZGl0eSI6ODIsIndpbmRfa3BoIjoxNSwiZmVlbHNfbGlrZSI6OX0=",
+    "body_hash": ""
+  }
+}
+```
+
+Notes:
+- `body` is base64-encoded JSON: `{"city":"Berlin","temp":12,"condition":"rain","humidity":82,"wind_kph":15,"feels_like":9}`.
+  The dev should check whether httptape expects base64 or raw JSON in the `body` field and
+  use the correct encoding. The Java demo's `get-user-1.json` fixture shows the convention.
+- This is a body-less GET request. The `BodyFuzzyCriterion` returns vacuous-true (score 1)
+  for this tape thanks to #178, keeping it alive in the composite matcher.
+
+**`chat-2.json`** — POST /v1/chat/completions, follow-up with tool result:
+
+```json
+{
+  "id": "chat-2-final-answer",
+  "route": "",
+  "recorded_at": "2026-04-18T10:00:02Z",
+  "request": {
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "body": "<JSON with messages=[{role:system},{role:user},{role:assistant,tool_calls:[...]},{role:tool,content:weather_json}]>",
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["text/event-stream"],
+      "Cache-Control": ["no-cache"]
+    },
+    "body": null,
+    "sse_events": [
+      { "offset_ms": 50, "data": "...chunk with delta.role=assistant..." },
+      { "offset_ms": 120, "data": "...chunk with delta.content='Based'..." },
+      { "offset_ms": 200, "data": "...chunk with delta.content=' on'..." },
+      { "offset_ms": 280, "data": "...chunk with delta.content=' the'..." },
+      { "offset_ms": 360, "data": "...chunk with delta.content=' weather'..." },
+      { "offset_ms": 440, "data": "...chunk with delta.content=' in'..." },
+      { "offset_ms": 520, "data": "...chunk with delta.content=' Berlin'..." },
+      { "offset_ms": 600, "data": "...chunk with delta.content=','..." },
+      { "offset_ms": 680, "data": "...chunk with delta.content=' yes'..." },
+      { "offset_ms": 760, "data": "...chunk with delta.content=','..." },
+      { "offset_ms": 840, "data": "...chunk with delta.content=' bring'..." },
+      { "offset_ms": 920, "data": "...chunk with delta.content=' an'..." },
+      { "offset_ms": 1000, "data": "...chunk with delta.content=' umbrella'..." },
+      { "offset_ms": 1080, "data": "...chunk with delta.content='.'..." },
+      { "offset_ms": 1160, "data": "...chunk with finish_reason=stop..." },
+      { "offset_ms": 1200, "data": "[DONE]" }
+    ]
+  }
+}
+```
+
+Key points:
+- The request body contains `messages` with roles `["system", "user", "assistant", "tool"]`.
+  The `BodyFuzzyCriterion` on `$.messages[*].role` distinguishes this from `chat-1.json`
+  (which has only `["system", "user"]`).
+- The SSE response streams the final natural-language answer.
+- The assembled content includes the word "umbrella" for test assertion.
+- Each `data` field must be a full `chat.completion.chunk` JSON object following the Java
+  demo's template. The `...` placeholders above are for illustration -- the dev must write
+  out the full JSON for each event.
+
+**`httptape.config.json`** — matcher configuration:
+
+```json
+{
+  "version": "1",
+  "matcher": {
+    "criteria": [
+      { "type": "method" },
+      { "type": "path" },
+      { "type": "body_fuzzy", "paths": ["$.messages[*].role"] }
+    ]
+  },
+  "rules": []
+}
+```
+
+This is the linchpin of the demo. It declares a `CompositeMatcher` with three criteria:
+1. `method` — distinguishes GET (weather) from POST (OpenAI).
+2. `path` — distinguishes `/v1/forecast` from `/v1/chat/completions`.
+3. `body_fuzzy` on `$.messages[*].role` — distinguishes the two POST requests to
+   `/v1/chat/completions` by their message roles.
+
+For the GET `/v1/forecast` request, `body_fuzzy` returns vacuous-true (score 1) because
+both the incoming request and the weather tape have no body. This is the #178 fix in action.
+
+**`Dockerfile`** — multi-stage build:
+
+```dockerfile
+# Multi-stage build: Gradle build -> JRE 25 runtime
+FROM eclipse-temurin:25-jdk AS build
+WORKDIR /app
+COPY gradle/ gradle/
+COPY gradlew build.gradle.kts settings.gradle.kts ./
+# Download dependencies first (layer caching)
+RUN ./gradlew dependencies --no-daemon
+COPY src/ src/
+RUN ./gradlew build -x test --no-daemon
+
+FROM eclipse-temurin:25-jre
+WORKDIR /app
+COPY --from=build /app/build/libs/*-all.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+Note: the `application` plugin with `mainClass` set produces a runnable JAR. The dev may
+need to configure the `shadowJar` or `jar` task depending on whether Ktor's fat-JAR or
+distribution packaging is used. Alternatively, the dev can use the Ktor Gradle plugin for
+packaging. The key requirement is that the Dockerfile produces a runnable image.
+
+**`docker-compose.yml`**:
+
+```yaml
+services:
+  httptape:
+    image: ghcr.io/vibewarden/httptape:0.10.1
+    command: ["serve", "--fixtures", "/fixtures", "--config", "/config/httptape.config.json", "--sse-timing=realtime"]
+    volumes:
+      - ./src/test/resources/fixtures/openai/chat-1.json:/fixtures/chat-1.json:ro
+      - ./src/test/resources/fixtures/openai/chat-2.json:/fixtures/chat-2.json:ro
+      - ./src/test/resources/fixtures/weather/weather-berlin.json:/fixtures/weather-berlin.json:ro
+      - ./src/test/resources/httptape.config.json:/config/httptape.config.json:ro
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_BASE_URL=http://httptape:8081
+      - WEATHER_BASE_URL=http://httptape:8081
+      - OPENAI_API_KEY=sk-placeholder
+    depends_on:
+      - httptape
+```
+
+Key difference from the Java demo: the `--config` flag is passed to httptape, mounting the
+matcher config file into the container. The Java demo does not use `--config` because its
+fixtures are method+path-unique (no two fixtures share method+path). This demo requires it.
+
+**`api.http`**:
+
+```
+### Streaming weather advice (SSE)
+GET http://localhost:8080/weather-advice?city=Berlin
+Accept: text/event-stream
+```
+
+One request, mirroring the Java demo's pattern.
+
+**`.gitignore`**:
+
+```
+# === Gradle ===
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# === httptape ===
+.httptape-cache/
+
+# === IntelliJ IDEA ===
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# === Editor swap files ===
+*.swp
+*.swo
+*~
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+```
+
+**`README.md`** — section headings (content to be written by dev):
+
+1. **Title**: "Test your Koog AI agents deterministically"
+2. **What this demo shows**: Single-tool Koog agent + mocked weather REST, tested E2E with httptape.
+3. **Headline scenario**: The wire-level trace from the PM spec.
+4. **Matcher composition callout**: Explicit callout that the demo exercises the matcher
+   composition from #178/#179/#180 -- distinguishing two same-URL POST requests via
+   `body_fuzzy` on `$.messages[*].role` plus a body-less GET via vacuous-true.
+5. **Prerequisites**: Docker + JDK 25.
+6. **Quick start**: `./gradlew test`
+7. **Adding a new fixture**: Drop JSON in fixtures dir, update `HttptapeContainer.kt`.
+8. **Dev workflow**: `./gradlew run` with httptape started via docker-compose or Testcontainers.
+9. **Testcontainers reuse opt-in**: Same as Java demo.
+10. **Try it standalone**: `docker compose up -d` + `curl`.
+11. **Stack table**: Kotlin 2.3.20, JDK 25, Ktor 3.4.2, Koog 0.8.0, Kotest 6.1.11,
+    Testcontainers 2.0.4, Gradle 9.4.1.
+12. **Why not...?** table:
+
+| Alternative | Limitation |
+|---|---|
+| **WireMock** | No native SSE record/replay. No sanitize-on-write. |
+| **Koog's built-in mocks (`getMockExecutor`, `mockTool`)** | Mocks the LLM at executor level, skipping the HTTP layer entirely. You are not testing that your agent works with a real OpenAI-compatible endpoint. httptape tests the full HTTP integration -- serialization, headers, SSE parsing -- same as production. |
+| **Real OpenAI calls in tests** | Slow, flaky, costs money, leaks PII into CI logs. |
+| **Manual Ktor test stubs** | Skips the HTTP layer. Breaks when the API contract changes. |
+
+##### Dependabot configuration
+
+Append two blocks to `.github/dependabot.yml`:
+
+```yaml
+  # ----- Example: kotlin-ktor-koog (Gradle) -----
+  - package-ecosystem: "gradle"
+    directory: "/examples/kotlin-ktor-koog"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "java"
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ----- Example: kotlin-ktor-koog (Dockerfile, eclipse-temurin) -----
+  - package-ecosystem: "docker"
+    directory: "/examples/kotlin-ktor-koog"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+```
+
+Uses `"java"` label (not `"kotlin"`) to match the existing Java demo pattern -- dependabot
+labels are per-ecosystem, and `"java"` covers all JVM languages using Gradle/Maven.
+
+##### CI workflow extension
+
+Add one matrix entry to `.github/workflows/examples.yml`:
+
+```yaml
+          - name: kotlin-ktor-koog
+            path: examples/kotlin-ktor-koog
+            java-version: "25"
+            build-command: ./gradlew test --no-daemon
+```
+
+The existing workflow already has `setup-java` conditional logic (`if: matrix.example.java-version`)
+and uses `cache: maven` for Maven. For Gradle, the cache key needs to be different. The CI
+step should be extended to support Gradle caching:
+
+```yaml
+      # --- Java toolchain (JVM examples) ---
+      - name: Set up JDK
+        if: matrix.example.java-version
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.example.java-version }}
+          cache: ${{ matrix.example.build-tool || 'maven' }}
+```
+
+The Kotlin matrix entry adds `build-tool: gradle` to enable Gradle caching via `setup-java`.
+Existing Java entry gets `build-tool: maven` (or omits it, defaulting to `maven`). The dev
+should verify that `actions/setup-java@v4`'s `cache: gradle` option works with the Gradle
+wrapper committed in the example directory.
+
+Alternative (simpler): use `actions/setup-java@v4` with `cache: gradle` and add
+`cache-dependency-path: examples/kotlin-ktor-koog/build.gradle.kts` to scope the cache.
+
+#### Types
+
+No new Go types. This ADR specifies a Kotlin demo application -- all types are Kotlin
+classes and objects within the `examples/kotlin-ktor-koog/` directory.
+
+#### Functions and methods
+
+No new Go functions. The demo exercises existing httptape functionality through the Docker
+container and `--config` flag.
+
+#### File layout
+
+**New files (all under `examples/kotlin-ktor-koog/`):**
+
+| File | Purpose |
+|---|---|
+| `.gitignore` | Gradle, IntelliJ, OS patterns |
+| `api.http` | One SSE request for IDE HTTP client |
+| `build.gradle.kts` | Gradle build with all dependencies |
+| `docker-compose.yml` | Standalone demo path |
+| `Dockerfile` | Multi-stage JDK 25 build |
+| `README.md` | Demo documentation |
+| `settings.gradle.kts` | Project name |
+| `gradle/wrapper/*` | Gradle wrapper (committed) |
+| `gradlew`, `gradlew.bat` | Gradle wrapper scripts |
+| `src/main/kotlin/.../Application.kt` | Ktor entry point with Koog plugin |
+| `src/main/kotlin/.../WeatherAdviceRoute.kt` | GET /weather-advice route |
+| `src/main/kotlin/.../WeatherTools.kt` | Koog ToolSet with getWeather |
+| `src/main/kotlin/.../AppConfig.kt` | Optional config wiring |
+| `src/main/resources/application.yaml` | Ktor + Koog config |
+| `src/main/resources/logback.xml` | Logging config |
+| `src/test/kotlin/.../HttptapeContainer.kt` | Testcontainers singleton |
+| `src/test/kotlin/.../WeatherAdviceTest.kt` | BehaviorSpec test |
+| `src/test/resources/fixtures/openai/chat-1.json` | OpenAI tool-call SSE fixture |
+| `src/test/resources/fixtures/openai/chat-2.json` | OpenAI final-answer SSE fixture |
+| `src/test/resources/fixtures/weather/weather-berlin.json` | Weather REST JSON fixture |
+| `src/test/resources/httptape.config.json` | Matcher composition config |
+
+**Modified files (existing repo files):**
+
+| File | Change |
+|---|---|
+| `.github/dependabot.yml` | Add `gradle` + `docker` blocks for `kotlin-ktor-koog` |
+| `.github/workflows/examples.yml` | Add matrix entry + Gradle cache support |
+
+#### Sequence
+
+The end-to-end flow during `./gradlew test`:
+
+1. Kotest discovers `WeatherAdviceTest` and starts executing the BehaviorSpec.
+2. The test accesses `HttptapeContainer.instance`, triggering lazy initialization.
+3. `HttptapeContainer` creates a `GenericContainer` with `ghcr.io/vibewarden/httptape:0.10.1`,
+   copies the 3 fixture files into `/fixtures/` and the config into `/config/`, then starts
+   the container with `serve --fixtures /fixtures --config /config/httptape.config.json --sse-timing=realtime`.
+4. httptape loads the config, calls `BuildMatcher()` which constructs a `CompositeMatcher`
+   with `MethodCriterion{}`, `PathCriterion{}`, and `NewBodyFuzzyCriterion("$.messages[*].role")`.
+5. httptape loads the 3 fixtures from `/fixtures/` into the `FileStore`.
+6. The test starts a Ktor `testApplication` with the Koog plugin configured to point at
+   `HttptapeContainer.baseUrl` for both OpenAI and weather base URLs.
+7. The test issues `GET /weather-advice?city=Berlin` to the test server.
+8. The route handler creates a Koog agent with the `WeatherTools` tool set and runs it.
+9. **HTTP #1**: Koog's OpenAI client sends `POST /v1/chat/completions` with
+   `messages=[system, user]` to httptape.
+   - httptape's `CompositeMatcher` scores all 3 tapes:
+     - `chat-1.json`: method=POST(1) + path=/v1/chat/completions(2) + body_fuzzy roles=[system,user] match(6) = 9
+     - `chat-2.json`: method=POST(1) + path=/v1/chat/completions(2) + body_fuzzy roles=[system,user,assistant,tool] NO match(0) = eliminated
+     - `weather-berlin.json`: method=GET(0) = eliminated
+   - Winner: `chat-1.json`. Returns SSE stream with tool_call delta for `getWeather("Berlin")`.
+10. Koog parses the tool_call, invokes `WeatherTools.getWeather("Berlin")`.
+11. **HTTP A**: `WeatherTools` sends `GET /v1/forecast?city=Berlin` to httptape.
+    - `CompositeMatcher` scores:
+      - `chat-1.json`: method=POST(0) = eliminated
+      - `chat-2.json`: method=POST(0) = eliminated
+      - `weather-berlin.json`: method=GET(1) + path=/v1/forecast(2) + body_fuzzy vacuous-true(1) = 4
+    - Winner: `weather-berlin.json`. Returns weather JSON.
+12. Koog receives the weather data and prepares the follow-up message.
+13. **HTTP #2**: Koog sends `POST /v1/chat/completions` with
+    `messages=[system, user, assistant(tool_call), tool(weather_json)]` to httptape.
+    - `CompositeMatcher` scores:
+      - `chat-1.json`: method=POST(1) + path=/v1/chat/completions(2) + body_fuzzy roles=[system,user] vs [system,user,assistant,tool] NO match(0) = eliminated
+      - `chat-2.json`: method=POST(1) + path=/v1/chat/completions(2) + body_fuzzy roles=[system,user,assistant,tool] match(6) = 9
+      - `weather-berlin.json`: method=GET(0) = eliminated
+    - Winner: `chat-2.json`. Returns SSE stream with final answer containing "umbrella".
+14. Koog assembles the final response string.
+15. The route handler sends the result as an SSE event.
+16. The test asserts the response contains "umbrella".
+
+#### Error cases
+
+| Error | Cause | Handling |
+|---|---|---|
+| httptape container fails to start | Docker not running, port conflict | Testcontainers throws `ContainerLaunchException`; test fails with clear error |
+| Fixture file not found on classpath | Missing or misnamed file | `MountableFile.forClasspathResource` throws `IllegalArgumentException` at container setup |
+| Invalid `httptape.config.json` | Malformed JSON, unknown criterion type | httptape exits with error; container health check fails; `ContainerLaunchException` |
+| Koog fails to parse SSE tool_call delta | Incorrect `chat.completion.chunk` JSON format | Koog throws deserialization error; test fails with stack trace pointing to fixture |
+| Matcher selects wrong fixture | Config mismatch, fixture body roles incorrect | Wrong response returned; assertion fails ("umbrella" not found) |
+| Weather tool HTTP call fails | httptape not matching GET request | Ktor client throws; Koog reports tool failure; test fails |
+
+#### Test strategy
+
+One Kotest `BehaviorSpec` class (`WeatherAdviceTest`) with the following test cases:
+
+1. **Happy path**: Given a Koog agent backed by httptape / When the user asks for weather
+   advice for Berlin / Then the response contains "umbrella" (or similar weather-based
+   advice from the `chat-2.json` fixture).
+
+2. **SSE streaming verification** (optional, if the dev implements per-token streaming):
+   Verify that multiple SSE events are received over time (not all at once), proving
+   httptape's `--sse-timing=realtime` works. Mirrors the Java demo's `streamingPreservesCadence`
+   test.
+
+The test does NOT test:
+- httptape's matcher logic (that is tested in `matcher_test.go` in the Go codebase).
+- Koog's agent logic in isolation (that is Koog's own test suite).
+- Real OpenAI calls (explicitly out of scope).
+
+The test DOES prove:
+- The three matcher improvements (#178, #179, #180) work end-to-end from a container
+  consumer's perspective.
+- Koog's OpenAI client correctly deserializes httptape's SSE fixtures (including tool_call
+  deltas).
+- A single httptape container can serve both SSE (OpenAI) and JSON (weather) responses,
+  routing correctly via the declarative matcher config.
+
+#### Alternatives considered
+
+1. **Use Koog's Ktor plugin (`koog-ktor`) vs. standalone `AIAgent` with `simpleOpenAIExecutor`**:
+   The Ktor plugin is chosen because: (a) it demonstrates the idiomatic Ktor integration
+   path, which is Koog's primary JVM server framework; (b) it provides `aiAgent()` extension
+   functions on route handlers, reducing boilerplate; (c) the `install(Koog) { llm { openAI { baseUrl = ... } } }`
+   DSL makes base-URL override clean and visible. Using `simpleOpenAIExecutor` directly would
+   require manual `OpenAILLMClient` construction with `OpenAIClientSettings(baseUrl = ...)`,
+   which is more verbose and less representative of real Ktor+Koog usage.
+
+2. **Use wttr.in's actual URL shape (`/{city}?format=j1`) vs. fictional `/v1/forecast?city={city}`**:
+   The fictional path is chosen because wttr.in embeds the city name in the URL path, which
+   would require `PathRegexCriterion` (not yet exposed via config per ADR-39's scope). The
+   fictional `/v1/forecast?city=Berlin` keeps the city in query params (ignored by
+   `PathCriterion`) and the path constant, making the matcher config simpler and focusing
+   the demo on `body_fuzzy` -- the novel criterion being proven out.
+
+3. **Kotest Testcontainers extension vs. manual `object` singleton**:
+   The `kotest-extensions-testcontainers` library provides a `ContainerExtension` that can
+   manage container lifecycle. However, the manual `object` with `lazy` is simpler,
+   transparent, and mirrors the Java demo's pattern. The extension adds a dependency for
+   syntactic sugar. The architect leaves this to the dev's discretion -- either approach is
+   acceptable. The dependency is already listed in `build.gradle.kts` in case the dev
+   prefers the extension approach.
+
+4. **Gradle Shadow plugin for fat JAR vs. Ktor Gradle plugin**:
+   Either approach produces a runnable JAR for the Dockerfile. The dev should pick whichever
+   is simpler. The Ktor Gradle plugin (`id("io.ktor.plugin")`) has built-in fat-JAR support
+   via `ktor { fatJar { ... } }`. Alternative: the `application` plugin's `installDist` task
+   produces a distribution with launch scripts. The key requirement is that the Dockerfile
+   can `COPY` and `java -jar` the result.
+
+5. **Multiple Kotest test files vs. one BehaviorSpec**:
+   One file is sufficient for the demo's single scenario. The Java demo has two test files
+   (one per scenario: SSE and REST), but this demo has only one scenario (the agent flow
+   exercises both SSE and REST internally). A single `WeatherAdviceTest.kt` keeps it simple.
+
+#### Consequences
+
+**Benefits:**
+- Proves the #178/#179/#180 matcher stack works end-to-end from a container consumer's
+  perspective, using a realistic multi-step AI agent scenario.
+- Demonstrates httptape's value proposition for Kotlin/Ktor developers -- the second JVM
+  demo after the Java/Spring Boot one, showing framework-agnostic compatibility.
+- The matcher config file (`httptape.config.json`) serves as a reusable reference for users
+  who need body-aware matching in their own projects.
+- CI coverage for the Kotlin ecosystem via the `examples.yml` workflow.
+- Dependabot coverage for Gradle dependencies and Docker base images.
+
+**Costs / trade-offs:**
+- **Maintenance burden**: three demos (Java, TypeScript, Kotlin) in three stacks. Each
+  requires dependency updates (mitigated by dependabot), CI runner time (~3 min per run for
+  Gradle + Testcontainers), and periodic version bumps when upstream frameworks release
+  breaking changes.
+- **Koog version churn**: Koog is pre-1.0 (currently 0.8.0) and its API may change. The
+  demo will need updates when Koog releases breaking versions. The `kotest-extensions-testcontainers`
+  library is also relatively new (2.0.2). Dependabot will flag these, but manual review is
+  needed for breaking changes.
+- **JDK 25 availability**: JDK 25 is cutting-edge. CI runners may not have it pre-installed,
+  requiring `actions/setup-java` to download it. This adds ~30s to CI time.
+- **Single httptape container**: serving both SSE and JSON responses from one container
+  simplifies the demo but means all fixtures share one flat namespace. Filename collisions
+  across fixture subdirectories would be caught at container setup time (explicit enumeration).
+
+---
+
 ## PM Log
 
 ### 2026-04-16
@@ -10279,3 +11272,17 @@ Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179
   - 11 acceptance criteria covering: Config struct changes, BuildMatcher factory, LoadConfig validation, schema update, CLI wiring, help text, config_test.go, main_test.go, integration test, backward compatibility.
   - Body and labels updated. Design-pivot rationale comment posted. Status re-set to `READY_FOR_ARCH`.
   - #178 and #179 were NOT modified.
+
+### 2026-04-18 — Kotlin + Ktor + Koog + Kotest demo
+
+- **Created #185** — `feat(examples): Kotlin + Ktor + Koog + Kotest demo with mocked OpenAI agent and weather REST`.
+  - Labels: `type:feature`, `priority:high`, `examples` (created the `examples` label — did not exist; color `#6f42c1`, description "Example applications and demos").
+  - This is the proof artifact that #178 (vacuous-true fix), #179 (Criterion interface), and #180 (declarative matcher composition) all work correctly together end-to-end.
+  - Headline scenario: single-tool Koog agent that makes two `POST /v1/chat/completions` calls (distinguished by `$.messages[*].role` via `BodyFuzzyCriterion`) plus one body-less `GET` for weather data (coexists via #178 vacuous-true fix), all served by a single httptape Testcontainers instance with a declarative matcher config file (#180).
+  - Stack: Kotlin 2.x, JDK 25, Ktor 3.x (Netty), Koog (latest), Kotest (BehaviorSpec recommended), Testcontainers, Gradle Kotlin DSL (latest wrapper). All versions to be verified against Maven Central / Gradle Plugin Portal at implementation time (hard constraint after the Spring Boot version incident).
+  - Weather API: wttr.in (`https://wttr.in/Berlin?format=j1`) — free, no API key.
+  - 18 acceptance criteria covering: directory structure, Gradle build, Ktor endpoint, Koog agent + tool, configurable base URLs, 3 fixtures, matcher config, Kotest test, single shared container, api.http, Dockerfile + docker-compose.yml, README (parallel to Java demo), matcher-callout in README, dependabot config, CI matrix entry, SSE fixture accuracy, `./gradlew test` green, PR held for user review.
+  - PR explicitly NOT to be merged — held for user's personal review.
+  - 5 open questions flagged for the architect: (1) Kotest BehaviorSpec vs FunSpec, (2) Koog tool HTTP client idiom, (3) multi-module vs single-module Gradle, (4) matcher config file location and container mount path, (5) SSE fixture authoring strategy for tool-call deltas.
+  - Parallel structure to #167 (Java demo). References #178, #179, #180 for the matcher stack.
+  - Status comment posted: `READY_FOR_ARCH`.

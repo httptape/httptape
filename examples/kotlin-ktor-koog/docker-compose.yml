@@ -1,0 +1,20 @@
+services:
+  httptape:
+    image: ghcr.io/vibewarden/httptape:0.11.0
+    command: ["serve", "--fixtures", "/fixtures", "--config", "/config/httptape.config.json"]
+    volumes:
+      - ./src/test/resources/fixtures/openai/chat-1.json:/fixtures/chat-1.json:ro
+      - ./src/test/resources/fixtures/openai/chat-2.json:/fixtures/chat-2.json:ro
+      - ./src/test/resources/fixtures/weather/weather-berlin.json:/fixtures/weather-berlin.json:ro
+      - ./src/test/resources/httptape.config.json:/config/httptape.config.json:ro
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_BASE_URL=http://httptape:8081
+      - WEATHER_BASE_URL=http://httptape:8081
+      - OPENAI_API_KEY=sk-placeholder
+    depends_on:
+      - httptape

@@ -1,0 +1,3 @@
+### Streaming weather advice (SSE)
+GET http://localhost:8080/weather-advice?city=Berlin
+Accept: text/event-stream
