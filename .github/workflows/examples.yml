@@ -90,13 +90,40 @@ jobs:
         run: npm ci
 
       # --- Java toolchain (java-spring-boot and future JVM examples) ---
-      - name: Set up JDK
+      # Install JDK 21 (for the httptape-jvm SDK build) and JDK 25 (for
+      # the demo projects). setup-java's last invocation sets JAVA_HOME,
+      # so JDK 25 goes last.
+      - name: Set up JDK 21 (SDK toolchain)
+        if: matrix.example.java-version
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up JDK ${{ matrix.example.java-version }}
         if: matrix.example.java-version
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ matrix.example.java-version }}
           cache: ${{ matrix.example.gradle-cache && 'gradle' || 'maven' }}
+
+      # --- httptape-jvm SDK (for JVM examples consuming the SDK) ---
+      # Checkout as sibling so composite build (../../../httptape-jvm from
+      # examples/kotlin-ktor-koog) resolves, and publishToMavenLocal works
+      # for the Maven-based Java demo.
+      - name: Checkout httptape-jvm SDK
+        if: matrix.example.java-version
+        uses: actions/checkout@v6
+        with:
+          repository: VibeWarden/httptape-jvm
+          path: ../httptape-jvm
+          ref: main
+
+      - name: Publish SDK to Maven local
+        if: matrix.example.java-version
+        working-directory: ${{ github.workspace }}/../httptape-jvm
+        run: ./gradlew publishToMavenLocal --no-daemon
 
       # --- Build / test (all examples) ---
       - name: Build
