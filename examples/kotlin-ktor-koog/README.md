@@ -43,6 +43,25 @@ This demo requires **httptape v0.13.0** or later. v0.13.0 adds `CachingTransport
 
 - **Docker** (for Testcontainers and the optional `docker compose` flow)
 - **JDK 25**
+- **httptape-jvm SDK** checked out as a sibling (see below)
+
+## SDK setup (local development)
+
+This demo uses the `httptape-testcontainers-kotest` SDK (`dev.httptape:httptape-testcontainers-kotest`) which is not yet published to Maven Central. The `settings.gradle.kts` is configured with a Gradle composite build that resolves the SDK from a sibling `httptape-jvm` checkout:
+
+```bash
+# From the parent directory of this httptape checkout
+git clone https://github.com/VibeWarden/httptape-jvm.git
+```
+
+With the sibling repo present, `./gradlew test` resolves the SDK modules directly from source via composite build -- no publishing step needed.
+
+If the sibling repo is not checked out, Gradle falls back to `mavenLocal()`. In that case, publish the SDK first:
+
+```bash
+cd httptape-jvm
+./gradlew publishToMavenLocal
+```
 
 ## Quick start
 
@@ -55,7 +74,7 @@ Tests spin up an httptape container via Testcontainers, run the Koog agent again
 
 ## Adding a new fixture
 
-Drop a JSON file under `src/test/resources/fixtures/` and add a `copyFixture(...)` line in `HttptapeContainer.kt`. Fixtures are enumerated explicitly (Kotlin has no stdlib equivalent of Spring's classpath-glob scanner).
+Drop a JSON file anywhere under `src/test/resources/fixtures/` -- the SDK's classpath scanner auto-discovers it. No code changes needed.
 
 The httptape Tape JSON schema (and how to record real upstream traffic into one) is documented at [vibewarden.dev/docs/httptape](https://vibewarden.dev/docs/httptape/).
 
@@ -112,9 +131,10 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | Ktor | 3.4.2 (Netty server + CIO client) |
 | Koog | 0.8.0 (AI agent framework, Apache 2.0) |
 | Kotest | 6.1.11 (FreeSpec) |
-| Testcontainers | 2.0.4 (single shared container) |
+| httptape-jvm SDK | 0.1.0-SNAPSHOT (Testcontainers + Kotest extension) |
+| Testcontainers | 2.0.4 (via SDK transitive dependency) |
 | Gradle | 9.4.1 (wrapper committed) |
-| httptape | v0.13.0 (ghcr.io/vibewarden/httptape:0.13.0) |
+| httptape | v0.13.1 (ghcr.io/vibewarden/httptape:0.13.1, SDK default) |
 
 ## Why not...?
 

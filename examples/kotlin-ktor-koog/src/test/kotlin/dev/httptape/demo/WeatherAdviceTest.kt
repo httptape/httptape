@@ -1,18 +1,18 @@
 package dev.httptape.demo
 
+import dev.httptape.testcontainers.kotest.httptapeExtension
+import io.kotest.core.extensions.install
 import io.kotest.core.spec.style.FreeSpec
 import io.kotest.matchers.string.shouldContain
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.sse.*
-import io.ktor.client.request.*
 import io.ktor.server.testing.*
 
 /**
  * End-to-end integration test for the weather advice agent.
  *
  * Exercises the full Koog agent flow against a single httptape
- * Testcontainers instance:
+ * Testcontainers instance managed by the httptape-jvm SDK's Kotest
+ * extension:
  *
  * 1. POST /v1/chat/completions (system + user messages) -> tool_call
  * 2. GET /v1/forecast?city=Berlin -> weather JSON
@@ -25,15 +25,18 @@ import io.ktor.server.testing.*
  */
 class WeatherAdviceTest : FreeSpec({
 
-    "advises bringing an umbrella when it is rainy in the requested city" {
-        val httptapeBaseUrl = HttptapeContainer.baseUrl
+    val httptape = install(httptapeExtension {
+        fixtures("fixtures/")
+        matcherConfig("httptape.config.json")
+    })
 
+    "advises bringing an umbrella when it is rainy in the requested city" {
         testApplication {
             application {
                 configureApp(
-                    openAiBaseUrl = httptapeBaseUrl,
+                    openAiBaseUrl = httptape.baseUrl,
                     openAiApiKey = "sk-test-key",
-                    weatherBaseUrl = httptapeBaseUrl
+                    weatherBaseUrl = httptape.baseUrl
                 )
             }
 

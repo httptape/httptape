@@ -17,6 +17,7 @@ kotlin {
 
 repositories {
     mavenCentral()
+    mavenLocal()
 }
 
 dependencies {
@@ -43,9 +44,8 @@ dependencies {
     testImplementation("io.kotest:kotest-runner-junit5:6.1.11")
     testImplementation("io.kotest:kotest-assertions-core:6.1.11")
 
-    // Test — Testcontainers
-    testImplementation("org.testcontainers:testcontainers:2.0.4")
-    testImplementation("io.kotest.extensions:kotest-extensions-testcontainers:2.0.2")
+    // Test — httptape SDK (brings Testcontainers transitively)
+    testImplementation("dev.httptape:httptape-testcontainers-kotest:0.1.0-SNAPSHOT")
 
     // Test — Ktor server test host and client
     testImplementation("io.ktor:ktor-server-test-host:3.4.2")
