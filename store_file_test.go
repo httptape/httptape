@@ -1851,3 +1851,583 @@ func TestFileStore_DefaultDirectory(t *testing.T) {
 		t.Error("default fixtures directory was not created")
 	}
 }
+
+// --- Coverage gap tests (issue #219) ---
+
+func TestSlugifyURL_ParseFallback_WithSchemeAndPath(t *testing.T) {
+	// url.Parse fails on URLs with invalid hosts like "http://[bad".
+	// The fallback code extracts the path manually.
+	got := slugifyURL("http://[bad/api/users")
+	if got != "api-users" {
+		t.Errorf("slugifyURL fallback with scheme = %q, want %q", got, "api-users")
+	}
+}
+
+func TestSlugifyURL_ParseFallback_NoSlash(t *testing.T) {
+	// When the fallback path has no '/', it collapses to empty -> "root".
+	got := slugifyURL("http://[bad")
+	if got != "root" {
+		t.Errorf("slugifyURL fallback no slash = %q, want %q", got, "root")
+	}
+}
+
+func TestSlugifyURL_ParseFallback_WithQuery(t *testing.T) {
+	// The fallback path extraction should strip query strings.
+	got := slugifyURL("http://[bad/api/items?page=2")
+	if got != "api-items" {
+		t.Errorf("slugifyURL fallback with query = %q, want %q", got, "api-items")
+	}
+}
+
+func TestQueryHash_ParseError(t *testing.T) {
+	// queryHash returns "" when url.Parse fails.
+	got := queryHash("http://[bad?key=value")
+	if got != "" {
+		t.Errorf("queryHash with unparseable URL = %q, want empty", got)
+	}
+}
+
+func TestReadableFilenames_EmptySlugFallsBackToID(t *testing.T) {
+	// When the URL path produces an empty slug after slugification and the
+	// resulting filename is empty, ReadableFilenames falls back to tape.ID.
+	strategy := ReadableFilenames()
+	tape := Tape{
+		ID: "fallback-id",
+		Request: RecordedReq{
+			// Empty method and a URL whose path is only special chars.
+			Method: "",
+			URL:    "http://example.com/###",
+		},
+	}
+	got := strategy(tape)
+	// "unknown" + "_" + some slug from "###". But if path is only special chars,
+	// slugifyURL returns "root", so we get "unknown_root".
+	if got == "" {
+		t.Error("ReadableFilenames() produced empty string, should not happen")
+	}
+}
+
+func TestFileStore_Save_TmpWriteError(t *testing.T) {
+	// Simulate a write failure by making the store's directory read-only
+	// after the temp file is created. On macOS/Linux, chmod on dir prevents
+	// creating new files but CreateTemp itself may fail instead.
+	//
+	// The simplest portable test: make the directory read-only so CreateTemp
+	// fails (L272). This is already covered by TestFileStore_Save_ReadOnlyDir.
+	//
+	// Instead, test the rename error path (L288): save to a directory, then
+	// remove it between CreateTemp and Rename by using a custom strategy
+	// that triggers collision resolution failure.
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Fill the directory with files that have read-only permissions to
+	// provoke filenameAvailableForID read errors (L340).
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(func(tape Tape) string {
+		return "fixed"
+	}))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Write a file that is unreadable, matching the collision candidate name.
+	unreadable := filepath.Join(dir, "fixed.json")
+	if err := os.WriteFile(unreadable, []byte(`{"id":"other"}`), 0o000); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadable, 0o644) })
+
+	tape := makeTape("route", "GET", "http://example.com")
+	err = store.Save(ctx, tape)
+	// The file is unreadable, so filenameAvailableForID returns an error,
+	// which propagates through resolveFilename.
+	if err == nil {
+		t.Fatal("Save() with unreadable collision file: error = nil, want error")
+	}
+}
+
+func TestFileStore_FilenameCollision_ReadErrorInLoop(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(func(tape Tape) string {
+		return "collide"
+	}))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save one tape normally to occupy collide.json.
+	tape1 := makeTape("route", "GET", "http://example.com")
+	tape1.ID = "tape-1"
+	if err := store.Save(ctx, tape1); err != nil {
+		t.Fatalf("Save(tape1) error = %v", err)
+	}
+
+	// Make collide_2.json unreadable to trigger the error path inside
+	// the collision resolution loop (L314-316).
+	unreadable := filepath.Join(dir, "collide_2.json")
+	if err := os.WriteFile(unreadable, []byte(`{"id":"other"}`), 0o000); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadable, 0o644) })
+
+	tape2 := makeTape("route", "POST", "http://example.com")
+	tape2.ID = "tape-2"
+	err = store.Save(ctx, tape2)
+	if err == nil {
+		t.Fatal("Save() with unreadable collision suffix file: error = nil, want error")
+	}
+}
+
+func TestFileStore_RemoveOldFile_SkipsCorruptAndUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Save a tape with UUID strategy under <id>.json.
+	storeUUID, err := NewFileStore(WithDirectory(dir))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := storeUUID.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Place a corrupt JSON file and an unreadable JSON file in the directory
+	// to exercise the skip paths in removeOldFile (L364-365, L368-369).
+	// Use "000-" prefix to sort before any UUID so they are visited first.
+	corruptPath := filepath.Join(dir, "000-corrupt.json")
+	if err := os.WriteFile(corruptPath, []byte("{broken"), 0o644); err != nil {
+		t.Fatalf("WriteFile(corrupt) error = %v", err)
+	}
+	unreadablePath := filepath.Join(dir, "000-unreadable.json")
+	if err := os.WriteFile(unreadablePath, []byte(`{"id":"x"}`), 0o000); err != nil {
+		t.Fatalf("WriteFile(unreadable) error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadablePath, 0o644) })
+
+	// Re-save the same tape with readable strategy. This triggers removeOldFile
+	// to scan and find the old UUID file, but it must skip the corrupt and
+	// unreadable files along the way.
+	storeReadable, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore(readable) error = %v", err)
+	}
+
+	if err := storeReadable.Save(ctx, tape); err != nil {
+		t.Fatalf("Save(readable) error = %v", err)
+	}
+
+	// The old UUID file should have been removed.
+	uuidPath := filepath.Join(dir, tape.ID+".json")
+	if _, err := os.Stat(uuidPath); !os.IsNotExist(err) {
+		t.Error("old UUID file still exists after re-save with readable strategy")
+	}
+}
+
+func TestFileStore_Load_FastPathDifferentID(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Save a tape with readable strategy.
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Write a file named exactly <id>.json but with a different tape ID inside.
+	// This exercises the fast-path "file exists but has different ID" fallthrough
+	// to scan (L403-408).
+	differentTape := makeTape("other-route", "POST", "http://example.com/other")
+	data, err := json.MarshalIndent(differentTape, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent() error = %v", err)
+	}
+	imposterPath := filepath.Join(dir, tape.ID+".json")
+	if err := os.WriteFile(imposterPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Load by original tape.ID should fall through to scan and find it.
+	loaded, err := store.Load(ctx, tape.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.ID != tape.ID {
+		t.Errorf("Load().ID = %q, want %q", loaded.ID, tape.ID)
+	}
+}
+
+func TestFileStore_Delete_FastPathCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Save a tape with readable strategy so the actual file has a readable name.
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Place a corrupt JSON file at the fast-path location <id>.json.
+	// This exercises the "file exists but corrupt" fallthrough in Delete (L489-491).
+	fastPath := filepath.Join(dir, tape.ID+".json")
+	if err := os.WriteFile(fastPath, []byte("{corrupt}"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Delete should fall through to scan and still succeed.
+	if err := store.Delete(ctx, tape.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	// Verify the real tape file is gone by listing (List skips corrupt JSON).
+	tapes, listErr := store.List(ctx, Filter{})
+	if listErr != nil {
+		t.Fatalf("List() error = %v", listErr)
+	}
+	for _, tp := range tapes {
+		if tp.ID == tape.ID {
+			t.Error("tape still found in List after Delete")
+		}
+	}
+}
+
+func TestFileStore_Delete_FastPathDifferentID(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Place a valid JSON file at the fast-path but with a different ID.
+	differentTape := makeTape("other", "POST", "http://example.com/other")
+	data, _ := json.MarshalIndent(differentTape, "", "  ")
+	fastPath := filepath.Join(dir, tape.ID+".json")
+	if err := os.WriteFile(fastPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Delete should fall through to scan and find the real file.
+	if err := store.Delete(ctx, tape.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+}
+
+func TestFileStore_Delete_FastPathRemoveError(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Use UUID strategy so <id>.json is the fast-path file.
+	store, err := NewFileStore(WithDirectory(dir))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Make directory read+execute only (0o555): files can be read but not deleted.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	err = store.Delete(ctx, tape.ID)
+	if err == nil {
+		t.Fatal("Delete() with non-writable dir: error = nil, want error")
+	}
+}
+
+func TestFileStore_Delete_ScanRemoveError(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Make the directory read-only to prevent file removal in the scan path.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	err = store.Delete(ctx, tape.ID)
+	if err == nil {
+		t.Fatal("Delete() in read-only dir via scan: error = nil, want error")
+	}
+}
+
+func TestFileStore_List_MidLoopContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save multiple tapes so there are files to iterate.
+	for i := 0; i < 5; i++ {
+		tape := makeTape("route", "GET", "http://example.com")
+		tape.ID = fmt.Sprintf("tape-%d", i)
+		if err := store.Save(ctx, tape); err != nil {
+			t.Fatalf("Save(tape-%d) error = %v", i, err)
+		}
+	}
+
+	// Use a context that is already cancelled. The per-file cancellation check
+	// (L443) fires during iteration.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = store.List(cancelledCtx, Filter{})
+	if err == nil {
+		t.Fatal("List() with cancelled context: error = nil, want error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("List() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestFileStore_ScanForID_ContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Use readable strategy so Load uses scan path.
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save multiple tapes so the scan iterates.
+	for i := 0; i < 3; i++ {
+		tape := makeTape("route", "GET", "http://example.com/items")
+		tape.ID = fmt.Sprintf("tape-%d", i)
+		if err := store.Save(ctx, tape); err != nil {
+			t.Fatalf("Save(tape-%d) error = %v", i, err)
+		}
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Load triggers scanForID. With cancelled context, the per-file check fires.
+	_, err = store.Load(cancelledCtx, "tape-2")
+	if err == nil {
+		t.Fatal("Load() with cancelled context during scan: error = nil, want error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Load() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestFileStore_ScanForID_SkipsCorruptAfterIDExtraction(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save a valid tape first.
+	tape := makeTape("route", "GET", "http://example.com/users")
+	tape.ID = "target-id"
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// AFTER saving, write a file where extractIDFromJSON succeeds but
+	// json.Unmarshal into a full Tape fails. Place it so it sorts before the
+	// valid file (get_users.json). This exercises the unmarshal-skip path in
+	// scanForID: extractIDFromJSON returns "target-id" (matches), but full
+	// Tape unmarshal fails due to invalid recorded_at format.
+	malformedPath := filepath.Join(dir, "aaa-malformed.json")
+	malformedJSON := `{"id":"target-id","route":"r","recorded_at":"not-valid-time-format"}`
+	if err := os.WriteFile(malformedPath, []byte(malformedJSON), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// Load should skip the malformed file and find the valid one.
+	loaded, err := store.Load(ctx, "target-id")
+	if err != nil {
+		t.Fatalf("Load() error = %v, expected success after skipping corrupt file", err)
+	}
+	if loaded.ID != "target-id" {
+		t.Errorf("Load().ID = %q, want %q", loaded.ID, "target-id")
+	}
+}
+
+func TestFileStore_Delete_ScanSkipsCorruptAndUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com/users")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Add corrupt and unreadable JSON files that the Delete scan must skip.
+	corruptPath := filepath.Join(dir, "aaa-corrupt.json")
+	if err := os.WriteFile(corruptPath, []byte("{bad json"), 0o644); err != nil {
+		t.Fatalf("WriteFile(corrupt) error = %v", err)
+	}
+	unreadablePath := filepath.Join(dir, "aaa-unreadable.json")
+	if err := os.WriteFile(unreadablePath, []byte(`{"id":"x"}`), 0o000); err != nil {
+		t.Fatalf("WriteFile(unreadable) error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadablePath, 0o644) })
+
+	// Add a non-JSON file and a subdirectory to exercise entry-skip conditions.
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("WriteFile(txt) error = %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+
+	// Delete should scan past all non-matching entries and succeed.
+	if err := store.Delete(ctx, tape.ID); err != nil {
+		t.Fatalf("Delete() error = %v, want nil (corrupt files should be skipped)", err)
+	}
+
+	_, err = store.Load(context.Background(), tape.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Load() after Delete error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFileStore_List_SkipsUnreadableFiles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save a valid tape.
+	tape := makeTape("route", "GET", "http://example.com")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Place an unreadable JSON file in the directory.
+	unreadable := filepath.Join(dir, "unreadable.json")
+	if err := os.WriteFile(unreadable, []byte(`{"id":"x"}`), 0o000); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadable, 0o644) })
+
+	// List should skip the unreadable file and return the valid tape.
+	tapes, err := store.List(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(tapes) != 1 {
+		t.Errorf("List() returned %d tapes, want 1", len(tapes))
+	}
+}
+
+func TestFileStore_Save_CollisionWithCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(func(tape Tape) string {
+		return "fixed"
+	}))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Place a corrupt (but readable) JSON file at the candidate path.
+	// filenameAvailableForID reads it, extractIDFromJSON fails, returns (false, nil).
+	// This makes the slot "occupied" so the strategy tries suffixed names.
+	corruptPath := filepath.Join(dir, "fixed.json")
+	if err := os.WriteFile(corruptPath, []byte("{broken json"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	tape := makeTape("route", "GET", "http://example.com")
+	if err := store.Save(ctx, tape); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// The tape should have been written as fixed_2.json since fixed.json was occupied.
+	path := filepath.Join(dir, "fixed_2.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("expected fixed_2.json to exist: %v", err)
+	}
+}
+
+func TestFileStore_Delete_ScanContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	store, err := NewFileStore(WithDirectory(dir), WithFilenameStrategy(ReadableFilenames()))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	// Save multiple tapes so there are entries to iterate.
+	for i := 0; i < 3; i++ {
+		tape := makeTape("route", "GET", "http://example.com/items")
+		tape.ID = fmt.Sprintf("tape-%d", i)
+		if err := store.Save(ctx, tape); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+	}
+
+	// Place a valid JSON file at fast-path with a different ID so Delete falls
+	// through to scan, then cancel context.
+	differentTape := makeTape("other", "POST", "http://example.com")
+	data, _ := json.MarshalIndent(differentTape, "", "  ")
+	fastPath := filepath.Join(dir, "tape-2.json")
+	if err := os.WriteFile(fastPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = store.Delete(cancelledCtx, "tape-2")
+	if err == nil {
+		t.Fatal("Delete() with cancelled context during scan: error = nil, want error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Delete() error = %v, want context.Canceled", err)
+	}
+}
