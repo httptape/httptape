@@ -1137,6 +1137,215 @@ func TestCachingTransport_SingleFlightSSEWaiters(t *testing.T) {
 	}
 }
 
+func TestWithCacheSanitizer_NilDefaultsToNoopPipeline(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store, WithCacheSanitizer(nil))
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("got %d tapes, want 1", len(tapes))
+	}
+}
+
+func TestWithCacheMaxBodySize_NegativeClampedToZero(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	// Negative value should be clamped to 0 (no limit).
+	ct := NewCachingTransport(upstream, store, WithCacheMaxBodySize(-5))
+
+	bigBody := strings.Repeat("x", 20*1024*1024) // 20 MiB
+	req, _ := http.NewRequest("POST", "http://example.com/api", strings.NewReader(bigBody))
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	// Should be cached (no limit means everything passes).
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Errorf("got %d tapes, want 1 (negative clamped to no limit)", len(tapes))
+	}
+}
+
+func TestCachingTransport_ReQueryStoreForSSE_StoreListError(t *testing.T) {
+	t.Parallel()
+
+	// Pre-populate a store with an SSE tape, then make the store fail on List.
+	ms := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/stream",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+		SSEEvents: []SSEEvent{
+			{OffsetMS: 0, Data: "event1"},
+		},
+	})
+	ms.Save(context.Background(), tape)
+
+	// Flakey store fails on first List (the reQueryStoreForSSE call), then
+	// succeeds for the fallback roundTripUpstream -> store.List.
+	flakey := &flakeyListStore{MemoryStore: ms}
+	flakey.failCount.Store(1)
+
+	var capturedErrors []string
+	var mu sync.Mutex
+
+	// The upstream for the fallback roundTripUpstream path.
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: fallback-event\n\n")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, flakey,
+		WithCacheSingleFlight(false),
+		WithCacheOnError(func(err error) {
+			mu.Lock()
+			capturedErrors = append(capturedErrors, err.Error())
+			mu.Unlock()
+		}),
+	)
+
+	// Call reQueryStoreForSSE directly by simulating the waiter path.
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := ct.reQueryStoreForSSE(req, nil)
+	if err != nil {
+		t.Fatalf("reQueryStoreForSSE: unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "fallback-event") {
+		t.Errorf("expected fallback-event in body, got %q", string(body))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(capturedErrors) == 0 {
+		t.Error("expected onError to be called for store list failure")
+	}
+}
+
+func TestCachingTransport_ReQueryStoreForSSE_NoMatchingTape(t *testing.T) {
+	t.Parallel()
+
+	// Empty store: no matching tape found after leader completed.
+	store := NewMemoryStore()
+
+	var capturedErrors []string
+	var mu sync.Mutex
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheSingleFlight(false),
+		WithCacheOnError(func(err error) {
+			mu.Lock()
+			capturedErrors = append(capturedErrors, err.Error())
+			mu.Unlock()
+		}),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := ct.reQueryStoreForSSE(req, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"ok":true}` {
+		t.Errorf("body = %q, want upstream response", string(body))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, msg := range capturedErrors {
+		if strings.Contains(msg, "no matching tape found") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'no matching tape found' in errors, got %v", capturedErrors)
+	}
+}
+
+func TestCachingTransport_ReQueryStoreForSSE_NonSSETapeMatch(t *testing.T) {
+	t.Parallel()
+
+	// Store has a non-SSE tape that matches the request.
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/data",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"application/json"}},
+		Body:       []byte(`{"cached":"value"}`),
+	})
+	store.Save(context.Background(), tape)
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		t.Error("upstream should not be called when store has a matching tape")
+		return nil, errors.New("should not reach")
+	})
+
+	ct := NewCachingTransport(upstream, store, WithCacheSingleFlight(false))
+
+	req, _ := http.NewRequest("GET", "http://example.com/data", nil)
+	resp, err := ct.reQueryStoreForSSE(req, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"cached":"value"}` {
+		t.Errorf("body = %q, want cached value", string(body))
+	}
+}
+
 func TestCachingTransport_SingleFlightStaleFallbackForWaiters(t *testing.T) {
 	t.Parallel()
 
