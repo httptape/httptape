@@ -728,3 +728,216 @@ func TestNameFaker(t *testing.T) {
 		t.Error("non-string should pass through")
 	}
 }
+
+// --- Coverage gap tests (issue #219) ---
+
+func TestPhoneFaker_HMACRechain(t *testing.T) {
+	// HMAC-SHA256 produces 32 bytes. A phone number with 33+ digits forces
+	// the re-chain path (hi >= len(h)).
+	f := PhoneFaker{}
+	longPhone := strings.Repeat("1", 40) // 40 digits
+	got := f.Fake("seed", longPhone)
+	s, ok := got.(string)
+	if !ok {
+		t.Fatalf("expected string, got %T", got)
+	}
+	if len(s) != 40 {
+		t.Errorf("length = %d, want 40", len(s))
+	}
+	for i, c := range s {
+		if c < '0' || c > '9' {
+			t.Errorf("non-digit at %d: %c", i, c)
+		}
+	}
+	// Verify deterministic.
+	got2 := f.Fake("seed", longPhone)
+	if got != got2 {
+		t.Errorf("non-deterministic: %v != %v", got, got2)
+	}
+}
+
+func TestPatternFaker_HMACRechain_Digits(t *testing.T) {
+	// Pattern with 40 '#' placeholders forces re-chain for digit generation.
+	pattern := strings.Repeat("#", 40)
+	f := PatternFaker{Pattern: pattern}
+	got := f.Fake("seed", "input")
+	s, ok := got.(string)
+	if !ok {
+		t.Fatalf("expected string, got %T", got)
+	}
+	if len(s) != 40 {
+		t.Errorf("length = %d, want 40", len(s))
+	}
+	for i, c := range s {
+		if c < '0' || c > '9' {
+			t.Errorf("non-digit at %d: %c", i, c)
+		}
+	}
+}
+
+func TestPatternFaker_HMACRechain_Letters(t *testing.T) {
+	// Pattern with 40 '?' placeholders forces re-chain for letter generation.
+	pattern := strings.Repeat("?", 40)
+	f := PatternFaker{Pattern: pattern}
+	got := f.Fake("seed", "input")
+	s, ok := got.(string)
+	if !ok {
+		t.Fatalf("expected string, got %T", got)
+	}
+	if len(s) != 40 {
+		t.Errorf("length = %d, want 40", len(s))
+	}
+	for i, c := range s {
+		if c < 'a' || c > 'z' {
+			t.Errorf("non-letter at %d: %c", i, c)
+		}
+	}
+}
+
+func TestFakeAtPathWith_NonObjectData(t *testing.T) {
+	// When the JSON body is an array at the top level, fakeAtPathWith should
+	// return without error (data is not map[string]any).
+	body := []byte(`[{"email":"a@b.com"},{"email":"c@d.com"}]`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"$.email": EmailFaker{},
+	})
+
+	result := fn(tape)
+	// Body should be unchanged since the top-level is an array, not an object.
+	var arr []any
+	if err := json.Unmarshal(result.Request.Body, &arr); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The emails should be untouched (path does not match top-level array).
+	first := arr[0].(map[string]any)
+	if first["email"] != "a@b.com" {
+		t.Errorf("email should be unchanged, got %v", first["email"])
+	}
+}
+
+func TestFakeAtPathWith_MissingKey(t *testing.T) {
+	// When the path targets a key that does not exist in the object,
+	// fakeAtPathWith should silently skip.
+	body := []byte(`{"name":"Alice"}`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"$.nonexistent": EmailFaker{},
+	})
+
+	result := fn(tape)
+	var data map[string]any
+	if err := json.Unmarshal(result.Request.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// name should be unchanged.
+	if data["name"] != "Alice" {
+		t.Errorf("name = %v, want Alice", data["name"])
+	}
+}
+
+func TestFakeAtPathWith_WildcardOnNonArray(t *testing.T) {
+	// When a wildcard path targets a field that is not an array,
+	// fakeAtPathWith should silently skip.
+	body := []byte(`{"users":"not-an-array"}`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"$.users[*].email": EmailFaker{},
+	})
+
+	result := fn(tape)
+	var data map[string]any
+	if err := json.Unmarshal(result.Request.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data["users"] != "not-an-array" {
+		t.Errorf("users = %v, want 'not-an-array'", data["users"])
+	}
+}
+
+func TestFakeAtPathWith_WildcardAtLeaf(t *testing.T) {
+	// When a wildcard is the last segment (no deeper path), the array
+	// elements are containers and should be left unchanged.
+	body := []byte(`{"items":[1,2,3]}`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"$.items[*]": RedactedFaker{},
+	})
+
+	result := fn(tape)
+	var data map[string]any
+	if err := json.Unmarshal(result.Request.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// items should be unchanged since wildcard at leaf skips containers.
+	items := data["items"].([]any)
+	if len(items) != 3 {
+		t.Errorf("items length = %d, want 3", len(items))
+	}
+	if items[0] != float64(1) {
+		t.Errorf("items[0] = %v, want 1", items[0])
+	}
+}
+
+func TestFakeFieldsWith_InvalidPath(t *testing.T) {
+	// Invalid path (no $. prefix) should be silently ignored.
+	body := []byte(`{"email":"test@test.com"}`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"email":    EmailFaker{}, // missing $. prefix
+		"$.email":  EmailFaker{}, // valid
+	})
+
+	result := fn(tape)
+	var data map[string]any
+	if err := json.Unmarshal(result.Request.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	email := data["email"].(string)
+	if !strings.HasSuffix(email, "@example.com") {
+		t.Errorf("valid path $.email should have been faked, got %q", email)
+	}
+}
+
+func TestFakeAtPathWith_IntermediateNonObject(t *testing.T) {
+	// Path traversal through a non-object intermediate value should silently skip.
+	body := []byte(`{"user":"just-a-string"}`)
+	tape := Tape{
+		Request:  RecordedReq{Body: body, Headers: make(map[string][]string)},
+		Response: RecordedResp{Body: body, Headers: make(map[string][]string)},
+	}
+
+	fn := FakeFieldsWith("seed", map[string]Faker{
+		"$.user.email": EmailFaker{},
+	})
+
+	result := fn(tape)
+	var data map[string]any
+	if err := json.Unmarshal(result.Request.Body, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// user is a string, not an object - path traversal fails silently.
+	if data["user"] != "just-a-string" {
+		t.Errorf("user = %v, want 'just-a-string'", data["user"])
+	}
+}
