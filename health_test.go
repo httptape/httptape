@@ -960,3 +960,371 @@ func (c *fakeClock) advance(d time.Duration) {
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 }
+
+// --- Coverage gap tests (issue #219) ---
+
+func TestHealthMonitor_ReportError_NilError(t *testing.T) {
+	var called bool
+	h := NewHealthMonitor("http://x", healthNoopTransport{},
+		WithHealthErrorHandler(func(err error) {
+			called = true
+		}))
+	defer h.Close() //nolint:errcheck
+
+	// Calling reportError with nil should be a no-op.
+	h.reportError(nil)
+	if called {
+		t.Error("reportError(nil) should not invoke the error handler")
+	}
+}
+
+func TestHealthMonitor_ReportError_NoHandler(t *testing.T) {
+	// HealthMonitor without error handler: reportError should not panic.
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+	defer h.Close() //nolint:errcheck
+
+	h.reportError(errors.New("test error"))
+	// No panic means success.
+}
+
+func TestHealthMonitor_RunProbeOnce_PanicRecovery(t *testing.T) {
+	// Transport that panics on RoundTrip. The panic-recovery in runProbeOnce
+	// should catch it and report it via the error handler.
+	var capturedErr atomic.Value
+	rt := &recordingTransport{
+		respFn: func(*http.Request) (*http.Response, error) {
+			panic("probe-panic")
+		},
+	}
+
+	h := NewHealthMonitor("http://x", rt,
+		WithHealthInterval(15*time.Millisecond),
+		WithHealthErrorHandler(func(err error) {
+			capturedErr.Store(err)
+		}))
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if v := capturedErr.Load(); v != nil {
+			errStr := v.(error).Error()
+			if !strings.Contains(errStr, "panic in probe loop") {
+				t.Errorf("error = %q, want 'panic in probe loop'", errStr)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("panic was not caught by runProbeOnce")
+		default:
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+}
+
+func TestHealthMonitor_RunProbeOnce_TransportNilResponse(t *testing.T) {
+	// Transport that returns (nil, nil) — an unusual but valid edge case.
+	// runProbeOnce should handle this gracefully (the nil response guard at L440).
+	rt := &recordingTransport{
+		respFn: func(*http.Request) (*http.Response, error) {
+			return nil, nil
+		},
+	}
+
+	h := NewHealthMonitor("http://x", rt,
+		WithHealthInterval(15*time.Millisecond))
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+
+	// Let a few probe cycles run without crashing.
+	time.Sleep(60 * time.Millisecond)
+	if rt.callCount() == 0 {
+		t.Fatal("probe never fired")
+	}
+}
+
+func TestHealthMonitor_RunProbeOnce_ResponseWithBodyOnError(t *testing.T) {
+	// Transport returns (resp with body, error) — the rare partial-read scenario.
+	// runProbeOnce should close the body to avoid leaking connections.
+	var bodyClosed atomic.Int32
+	rt := &recordingTransport{
+		respFn: func(*http.Request) (*http.Response, error) {
+			body := &trackingCloser{closed: &bodyClosed}
+			resp := &http.Response{
+				StatusCode: 200,
+				Body:       body,
+				Header:     http.Header{},
+			}
+			return resp, errors.New("partial read error")
+		},
+	}
+
+	h := NewHealthMonitor("http://x", rt,
+		WithHealthInterval(15*time.Millisecond))
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+
+	deadline := time.After(2 * time.Second)
+	for bodyClosed.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("body was never closed on transport error with response")
+		default:
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+}
+
+// trackingCloser is an io.ReadCloser that tracks Close calls.
+type trackingCloser struct {
+	closed *atomic.Int32
+}
+
+func (tc *trackingCloser) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (tc *trackingCloser) Close() error {
+	tc.closed.Add(1)
+	return nil
+}
+
+func TestHealthMonitor_RunProbeOnce_5xxNoTransition(t *testing.T) {
+	// Transport returns 500 without X-Httptape-Source header.
+	// classifyProbeResponse returns (_, false), so state stays unchanged.
+	rt := &recordingTransport{
+		respFn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 500, Body: http.NoBody, Header: http.Header{}}, nil
+		},
+	}
+
+	h := NewHealthMonitor("http://x", rt,
+		WithHealthInterval(15*time.Millisecond))
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+
+	time.Sleep(60 * time.Millisecond)
+
+	// State should remain live (no transition from 5xx without header).
+	if got := h.snapshot().State; got != StateLive {
+		t.Errorf("State=%q, want %q (5xx should not cause transition)", got, StateLive)
+	}
+}
+
+func TestHealthMonitor_RunProbeOnce_501PromotesToGET(t *testing.T) {
+	// Test that 501 (Not Implemented) also triggers HEAD-to-GET promotion,
+	// in addition to 405 (tested elsewhere).
+	var seenGet atomic.Int32
+	rt := &recordingTransport{
+		respFn: func(req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodHead {
+				return &http.Response{StatusCode: 501, Body: http.NoBody, Header: http.Header{}}, nil
+			}
+			seenGet.Add(1)
+			return &http.Response{StatusCode: 200, Body: http.NoBody, Header: http.Header{}}, nil
+		},
+	}
+
+	h := NewHealthMonitor("http://x", rt,
+		WithHealthInterval(15*time.Millisecond))
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+
+	deadline := time.After(2 * time.Second)
+	for seenGet.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("never promoted to GET on 501")
+		default:
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+}
+
+func TestHealthMonitor_ServeStream_MonitorCloseMidStream(t *testing.T) {
+	// Test that closing the monitor while a client is connected to the SSE
+	// stream causes the handler to return cleanly (the h.done branch in
+	// serveStream's select).
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+healthStreamPath, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	br := bufio.NewReader(resp.Body)
+	if _, err := readSSEEvent(br, 2*time.Second); err != nil {
+		t.Fatalf("read initial event: %v", err)
+	}
+
+	// Close the monitor while the stream is active. This should trigger the
+	// <-h.done branch in serveStream's select loop.
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read should terminate (EOF or connection closed).
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		done <- err
+	}()
+	select {
+	case <-done:
+		// clean termination
+	case <-time.After(2 * time.Second):
+		t.Error("stream did not close after monitor shutdown")
+	}
+}
+
+func TestHealthMonitor_ServeStream_SubscriberDroppedByOverflow(t *testing.T) {
+	// When a subscriber's buffer overflows, broadcastLocked drops it by
+	// closing the channel. The serveStream handler should see ok=false on
+	// the next receive and return cleanly.
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+	defer h.Close() //nolint:errcheck
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+healthStreamPath, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	br := bufio.NewReader(resp.Body)
+	// Read initial event to drain it.
+	if _, err := readSSEEvent(br, 2*time.Second); err != nil {
+		t.Fatalf("read initial: %v", err)
+	}
+
+	// Now flood transitions to overflow the subscriber's buffer (size 8).
+	// The subscriber is NOT being drained, so it will overflow.
+	for i := 0; i < 20; i++ {
+		if i%2 == 0 {
+			h.observe(StateL1Cache)
+		} else {
+			h.observe(StateLive)
+		}
+	}
+
+	// The stream should terminate (channel closed by overflow drop).
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		done <- err
+	}()
+	select {
+	case <-done:
+		// clean termination
+	case <-time.After(2 * time.Second):
+		t.Error("stream did not close after subscriber overflow")
+	}
+}
+
+func TestHealthMonitor_StartWithZeroInterval(t *testing.T) {
+	// When interval is 0, start() enters startOnce.Do but returns early
+	// because interval <= 0. No goroutine should be spawned.
+	baseline := runtime.NumGoroutine()
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+	defer h.Close() //nolint:errcheck
+
+	h.start()
+	h.start() // idempotent
+
+	// Goroutine count should not increase.
+	time.Sleep(50 * time.Millisecond)
+	waitForGoroutineCount(t, baseline+2, time.Second) // +2 for test overhead
+}
+
+func TestHealthMonitor_RunProbeOnce_InvalidUpstreamURL(t *testing.T) {
+	// Use an upstream URL that causes http.NewRequestWithContext to fail.
+	// This exercises the request-build error path (L422-425).
+	var capturedErr atomic.Value
+	h := NewHealthMonitor("http://x", healthNoopTransport{},
+		WithHealthInterval(15*time.Millisecond),
+		WithHealthErrorHandler(func(err error) {
+			capturedErr.Store(err)
+		}))
+	defer h.Close() //nolint:errcheck
+
+	// Override the upstreamURL to something that makes NewRequest fail.
+	// The method needs to be invalid. Promote probeMethod to something invalid.
+	h.promoteProbeMethod("BAD\nMETHOD")
+
+	h.start()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if v := capturedErr.Load(); v != nil {
+			errStr := v.(error).Error()
+			if !strings.Contains(errStr, "probe build request") {
+				t.Errorf("error = %q, want 'probe build request'", errStr)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("NewRequest error was not reported")
+		default:
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+}
+
+func TestHealthMonitor_ServeStream_NonFlusher(t *testing.T) {
+	// Test that serveStream returns 500 when the ResponseWriter does not
+	// implement http.Flusher.
+	h := NewHealthMonitor("http://x", healthNoopTransport{})
+	defer h.Close() //nolint:errcheck
+
+	w := &nonFlusherResponseWriter{
+		header: http.Header{},
+	}
+	r := httptest.NewRequest("GET", healthStreamPath, nil)
+
+	h.ServeHTTP(w, r)
+
+	if w.statusCode != http.StatusInternalServerError {
+		t.Errorf("status=%d, want 500", w.statusCode)
+	}
+}
+
+// nonFlusherResponseWriter implements http.ResponseWriter but NOT http.Flusher.
+type nonFlusherResponseWriter struct {
+	header     http.Header
+	statusCode int
+	body       []byte
+}
+
+func (w *nonFlusherResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *nonFlusherResponseWriter) Write(b []byte) (int, error) {
+	w.body = append(w.body, b...)
+	return len(b), nil
+}
+
+func (w *nonFlusherResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
