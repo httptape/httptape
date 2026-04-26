@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"strings"
 )
 
 // Matcher selects a Tape from a list of candidates that best matches
@@ -560,6 +561,132 @@ func (ContentNegotiationCriterion) Score(req *http.Request, candidate Tape) int 
 // Name returns "content_negotiation".
 func (ContentNegotiationCriterion) Name() string { return "content_negotiation" }
 
+// PathPatternCriterion matches the incoming request's URL path against an
+// Express-style pattern with named segments (e.g., "/users/:id").
+//
+// Named segments start with a colon and match any single non-empty path
+// segment (i.e., one or more characters excluding '/'). The captured values
+// are exposed to the template evaluation context via {{pathParam.NAME}}.
+//
+// Examples:
+//   - "/users/:id" matches "/users/42" (id="42"), not "/users/", "/users"
+//   - "/users/:id/orders/:oid" matches "/users/1/orders/7" (id="1", oid="7")
+//   - "/api/v1/items" matches only "/api/v1/items" (no captures, acts like PathCriterion)
+//
+// PathPatternCriterion should NOT be used alongside PathCriterion in the same
+// CompositeMatcher. PathCriterion returns 0 for paths that don't exactly match,
+// which eliminates candidates that PathPatternCriterion would accept.
+//
+// Returns score 3 on match, 0 on mismatch.
+//
+// The pattern is compiled into a regex at construction time (via
+// NewPathPatternCriterion). The compiled regex and capture-name list are stored
+// as private fields for efficient per-request matching.
+type PathPatternCriterion struct {
+	// Pattern is the original Express-style pattern string.
+	Pattern string
+
+	re         *regexp.Regexp
+	paramNames []string
+}
+
+// NewPathPatternCriterion compiles an Express-style path pattern into a
+// PathPatternCriterion. Named segments (e.g., ":id") are converted to named
+// regex capture groups. Returns an error if the pattern is malformed.
+//
+// Pattern syntax:
+//   - Literal segments: "/users", "/api/v1"
+//   - Named segments: "/:id", "/:userId" (matches one or more non-'/' chars)
+//   - Mixed: "/users/:id/orders/:orderId"
+//
+// The compiled regex anchors to the full path (^ ... $). Trailing slashes are
+// significant: "/users/:id" does NOT match "/users/42/".
+func NewPathPatternCriterion(pattern string) (*PathPatternCriterion, error) {
+	if pattern == "" {
+		return nil, fmt.Errorf("httptape: empty path pattern")
+	}
+	if pattern[0] != '/' {
+		return nil, fmt.Errorf("httptape: path pattern must start with '/', got %q", pattern)
+	}
+
+	parts := strings.Split(pattern, "/")
+	var regexParts []string
+	var paramNames []string
+	seen := make(map[string]bool)
+
+	for i, part := range parts {
+		if i == 0 {
+			// The first part is always empty (before leading /).
+			regexParts = append(regexParts, "")
+			continue
+		}
+		if strings.HasPrefix(part, ":") {
+			name := part[1:]
+			if name == "" {
+				return nil, fmt.Errorf("httptape: empty parameter name in pattern %q at segment %d", pattern, i)
+			}
+			if seen[name] {
+				return nil, fmt.Errorf("httptape: duplicate parameter name %q in pattern %q", name, pattern)
+			}
+			seen[name] = true
+			paramNames = append(paramNames, name)
+			regexParts = append(regexParts, fmt.Sprintf("(?P<%s>[^/]+)", name))
+		} else {
+			regexParts = append(regexParts, regexp.QuoteMeta(part))
+		}
+	}
+
+	reStr := "^" + strings.Join(regexParts, "/") + "$"
+	re, err := regexp.Compile(reStr)
+	if err != nil {
+		return nil, fmt.Errorf("httptape: invalid path pattern %q: %w", pattern, err)
+	}
+
+	return &PathPatternCriterion{
+		Pattern:    pattern,
+		re:         re,
+		paramNames: paramNames,
+	}, nil
+}
+
+// Score returns 3 if both the request path and the candidate tape's URL path
+// match the compiled pattern, 0 otherwise.
+func (c *PathPatternCriterion) Score(req *http.Request, candidate Tape) int {
+	if !c.re.MatchString(req.URL.Path) {
+		return 0
+	}
+	parsed, err := url.Parse(candidate.Request.URL)
+	if err != nil {
+		return 0
+	}
+	if !c.re.MatchString(parsed.Path) {
+		return 0
+	}
+	return 3
+}
+
+// Name returns "path_pattern".
+func (c *PathPatternCriterion) Name() string { return "path_pattern" }
+
+// ExtractParams extracts the named path parameters from a URL path that
+// matches this criterion's pattern. Returns nil if the path does not match.
+// This method is called by the Server after matching to populate the
+// template evaluation context.
+func (c *PathPatternCriterion) ExtractParams(path string) map[string]string {
+	matches := c.re.FindStringSubmatch(path)
+	if matches == nil {
+		return nil
+	}
+	params := make(map[string]string, len(c.paramNames))
+	for _, name := range c.paramNames {
+		idx := c.re.SubexpIndex(name)
+		if idx >= 0 && idx < len(matches) {
+			params[name] = matches[idx]
+		}
+	}
+	return params
+}
+
 // CompositeMatcher evaluates a list of Criterion implementations against
 // candidate tapes and returns the highest-scoring match. If all criteria
 // return a positive score for a candidate, the candidate's total score is
@@ -572,6 +699,7 @@ func (ContentNegotiationCriterion) Name() string { return "content_negotiation" 
 //	PathCriterion:                 2
 //	RouteCriterion:                1
 //	PathRegexCriterion:            1
+//	PathPatternCriterion:          3
 //	HeadersCriterion:              3
 //	QueryParamsCriterion:          4
 //	ContentNegotiationCriterion:   3-5

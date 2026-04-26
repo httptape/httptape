@@ -550,3 +550,24 @@ func TestCachingTransport_SingleFlightPropagatesLeaderError(t *testing.T) {
 // waiter path does not share mutable response state -- it performs an
 // independent store read -- so the race surface is identical to
 // TestServer_ConcurrentSSEReplay above.
+
+// TestCounterState_Race stresses the counterState under heavy concurrent
+// access to verify mutex correctness with the race detector.
+func TestCounterState_Race(t *testing.T) {
+	cs := &counterState{counters: make(map[string]int64)}
+	n := 1000
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			cs.Next("shared")
+		}()
+	}
+	wg.Wait()
+
+	got := cs.counters["shared"]
+	if got != int64(n) {
+		t.Errorf("after %d concurrent increments, counter = %d", n, got)
+	}
+}

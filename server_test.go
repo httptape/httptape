@@ -1443,7 +1443,8 @@ func TestServer_Templating_QueryParam(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	want := `{"q":"hello","page":"3"}`
+	// JSON-aware resolution re-marshals, which sorts keys alphabetically.
+	want := `{"page":"3","q":"hello"}`
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %q, want %q", got, want)
 	}
@@ -1549,7 +1550,7 @@ func TestServer_Templating_EnabledByDefault(t *testing.T) {
 	}
 }
 
-func TestServer_Templating_NonRequestNamespace_Literal(t *testing.T) {
+func TestServer_Templating_UnknownNamespace_Lenient(t *testing.T) {
 	store := NewMemoryStore()
 	storeTape(t, store, "GET", "/state", 200,
 		`count={{state.counter}}`, nil)
@@ -1566,9 +1567,9 @@ func TestServer_Templating_NonRequestNamespace_Literal(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	// Non-request namespace expressions should be left as-is.
-	if got := rec.Body.String(); got != "count={{state.counter}}" {
-		t.Errorf("body = %q, want %q", got, "count={{state.counter}}")
+	// Unknown namespace expressions are replaced with empty string in lenient mode.
+	if got := rec.Body.String(); got != "count=" {
+		t.Errorf("body = %q, want %q", got, "count=")
 	}
 }
 
@@ -1591,5 +1592,123 @@ func TestServer_Templating_URL(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != "url=/url-echo?key=val" {
 		t.Errorf("body = %q, want %q", got, "url=/url-echo?key=val")
+	}
+}
+
+func TestServer_ResetCounter(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/count", 200, `{{counter}}`, nil)
+
+	srv, err := NewServer(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Increment counter.
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/count", nil))
+	if got := rec.Body.String(); got != "1" {
+		t.Errorf("first call = %q, want %q", got, "1")
+	}
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/count", nil))
+	if got := rec.Body.String(); got != "2" {
+		t.Errorf("second call = %q, want %q", got, "2")
+	}
+
+	// Reset all counters.
+	srv.ResetCounter("")
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/count", nil))
+	if got := rec.Body.String(); got != "1" {
+		t.Errorf("after reset = %q, want %q", got, "1")
+	}
+}
+
+func TestServer_PathParamTemplating(t *testing.T) {
+	store := NewMemoryStore()
+
+	// Store a tape with a path that matches the pattern.
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/users/42",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte(`id={{pathParam.id}}`),
+	})
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatal(err)
+	}
+
+	criterion, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(store, WithMatcher(NewCompositeMatcher(
+		MethodCriterion{},
+		criterion,
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/users/42", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != "id=42" {
+		t.Errorf("body = %q, want %q", got, "id=42")
+	}
+}
+
+func TestServer_HelperTemplating(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/helpers", 200,
+		`counter={{counter name=c1}} faker={{faker.email seed=test}}`, nil)
+
+	srv, err := NewServer(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/helpers", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "counter=1") {
+		t.Errorf("expected counter=1 in body, got %q", body)
+	}
+	if !strings.Contains(body, "faker=") {
+		t.Errorf("expected faker= in body, got %q", body)
+	}
+	if !strings.Contains(body, "@example.com") {
+		t.Errorf("expected email format in body, got %q", body)
+	}
+}
+
+func TestServer_CounterAcrossRequests(t *testing.T) {
+	store := NewMemoryStore()
+	storeTape(t, store, "GET", "/inc", 200, `{{counter}}`, nil)
+
+	srv, err := NewServer(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest("GET", "/inc", nil))
+		want := fmt.Sprintf("%d", i)
+		if got := rec.Body.String(); got != want {
+			t.Errorf("request %d: body = %q, want %q", i, got, want)
+		}
 	}
 }

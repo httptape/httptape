@@ -6,7 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Template helpers**: `{{now}}`, `{{uuid}}`, `{{randomHex}}`, `{{randomInt}}`,
+  `{{counter}}`, and `{{faker.*}}` template expressions in response bodies and
+  headers. Helpers support keyword arguments (e.g., `{{now format=unix}}`). (#196)
+
+- **`PathPatternCriterion`**: Express-style path pattern matching with named
+  segments (e.g., `/users/:id`). Captured path parameters are available in
+  templates via `{{pathParam.NAME}}`. Score 3. (#196)
+
+- **`{{pathParam.*}}` accessor**: resolves captured path segments from
+  `PathPatternCriterion` in template expressions. (#196)
+
+- **Nested template evaluation**: helper arguments can contain `{{...}}`
+  expressions that are resolved before the helper runs (e.g.,
+  `{{faker.name seed=user-{{pathParam.id}}}}`). (#196)
+
+- **JSON-aware template resolution**: JSON response bodies are parsed,
+  templates in string values are resolved, and the result is properly
+  JSON-escaped and re-serialized. (#196)
+
+- **`Server.ResetCounter`**: resets named or all template counters. (#196)
+
+- **`ResolveTemplateBodySimple`**: backward-compatible wrapper for template
+  resolution using only request data. (#196)
+
+- **Config support for `path_pattern`**: declarative `"type": "path_pattern"`
+  criterion with `"pattern"` field. (#196)
+
 ### Breaking Changes
+
+- **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
+  These now accept `*templateCtx` (unexported) instead of `*http.Request`.
+  External callers should use `ResolveTemplateBodySimple` instead. Pre-1.0,
+  acceptable. (#196)
+
+- **Unknown template namespaces**: expressions like `{{state.counter}}` that
+  were previously left as literal text are now replaced with empty string in
+  lenient mode (error in strict mode). All supported expressions are now
+  explicitly dispatched. (#196)
+
+### Breaking Changes (prior)
 
 - **`NewServer` signature change**: `NewServer(store Store, opts ...ServerOption)`
   now returns `(*Server, error)` instead of `*Server`. The constructor validates

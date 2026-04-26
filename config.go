@@ -57,9 +57,11 @@ type MatcherConfig struct {
 //   - "path":                matches on URL path (no type-specific fields)
 //   - "body_fuzzy":          matches on specific JSON body fields (requires Paths)
 //   - "content_negotiation": matches request Accept against response Content-Type (no type-specific fields)
+//   - "path_pattern":        matches Express-style path patterns (requires Pattern)
 type CriterionConfig struct {
-	Type  string   `json:"type"`
-	Paths []string `json:"paths,omitempty"`
+	Type    string   `json:"type"`
+	Paths   []string `json:"paths,omitempty"`
+	Pattern string   `json:"pattern,omitempty"`
 }
 
 // Rule represents a single sanitization rule within a Config.
@@ -241,15 +243,19 @@ type criterionBuilder struct {
 // criterionBuilders maps criterion type names to their builder definitions.
 // Each entry corresponds to a supported Criterion.Name() value.
 var criterionBuilders = map[string]criterionBuilder{
-	"method":               {validate: validateMethodCriterion, build: buildMethodCriterion},
-	"path":                 {validate: validatePathCriterion, build: buildPathCriterion},
-	"body_fuzzy":           {validate: validateBodyFuzzyCriterion, build: buildBodyFuzzyCriterion},
-	"content_negotiation":  {validate: validateContentNegotiationCriterion, build: buildContentNegotiationCriterion},
+	"method":              {validate: validateMethodCriterion, build: buildMethodCriterion},
+	"path":                {validate: validatePathCriterion, build: buildPathCriterion},
+	"body_fuzzy":          {validate: validateBodyFuzzyCriterion, build: buildBodyFuzzyCriterion},
+	"content_negotiation": {validate: validateContentNegotiationCriterion, build: buildContentNegotiationCriterion},
+	"path_pattern":        {validate: validatePathPatternCriterion, build: buildPathPatternCriterion},
 }
 
 func validateMethodCriterion(cc CriterionConfig) error {
 	if len(cc.Paths) > 0 {
 		return fmt.Errorf("%q does not use \"paths\"", cc.Type)
+	}
+	if cc.Pattern != "" {
+		return fmt.Errorf("%q does not use \"pattern\"", cc.Type)
 	}
 	return nil
 }
@@ -262,6 +268,9 @@ func validatePathCriterion(cc CriterionConfig) error {
 	if len(cc.Paths) > 0 {
 		return fmt.Errorf("%q does not use \"paths\"", cc.Type)
 	}
+	if cc.Pattern != "" {
+		return fmt.Errorf("%q does not use \"pattern\"", cc.Type)
+	}
 	return nil
 }
 
@@ -272,6 +281,9 @@ func buildPathCriterion(_ CriterionConfig) (Criterion, error) {
 func validateBodyFuzzyCriterion(cc CriterionConfig) error {
 	if len(cc.Paths) == 0 {
 		return fmt.Errorf("%q requires non-empty \"paths\"", cc.Type)
+	}
+	if cc.Pattern != "" {
+		return fmt.Errorf("%q does not use \"pattern\"", cc.Type)
 	}
 	for _, p := range cc.Paths {
 		if _, ok := parsePath(p); !ok {
@@ -289,7 +301,29 @@ func validateContentNegotiationCriterion(cc CriterionConfig) error {
 	if len(cc.Paths) > 0 {
 		return fmt.Errorf("%q does not use \"paths\"", cc.Type)
 	}
+	if cc.Pattern != "" {
+		return fmt.Errorf("%q does not use \"pattern\"", cc.Type)
+	}
 	return nil
+}
+
+func validatePathPatternCriterion(cc CriterionConfig) error {
+	if cc.Pattern == "" {
+		return fmt.Errorf("%q requires non-empty \"pattern\"", cc.Type)
+	}
+	if len(cc.Paths) > 0 {
+		return fmt.Errorf("%q does not use \"paths\"", cc.Type)
+	}
+	// Validate the pattern by attempting to compile it.
+	_, err := NewPathPatternCriterion(cc.Pattern)
+	if err != nil {
+		return fmt.Errorf("%q invalid pattern: %w", cc.Type, err)
+	}
+	return nil
+}
+
+func buildPathPatternCriterion(cc CriterionConfig) (Criterion, error) {
+	return NewPathPatternCriterion(cc.Pattern)
 }
 
 func buildContentNegotiationCriterion(_ CriterionConfig) (Criterion, error) {
@@ -434,4 +468,3 @@ func parseFakerSpec(spec any) (Faker, error) {
 		return nil, fmt.Errorf("faker spec must be a string or object, got %T", spec)
 	}
 }
-

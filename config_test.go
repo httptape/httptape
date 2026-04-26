@@ -3,6 +3,7 @@ package httptape
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -970,6 +971,146 @@ func TestLoadConfig_ContentNegotiationCriterion(t *testing.T) {
 		if cm.criteria[i].Name() != want {
 			t.Errorf("criteria[%d].Name() = %q, want %q", i, cm.criteria[i].Name(), want)
 		}
+	}
+}
+
+func TestLoadConfig_PathPatternCriterion(t *testing.T) {
+	input := `{
+		"version": "1",
+		"matcher": {
+			"criteria": [
+				{"type": "method"},
+				{"type": "path_pattern", "pattern": "/users/:id"}
+			]
+		},
+		"rules": []
+	}`
+
+	cfg, err := LoadConfig(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if len(cfg.Matcher.Criteria) != 2 {
+		t.Fatalf("criteria count = %d, want 2", len(cfg.Matcher.Criteria))
+	}
+	if cfg.Matcher.Criteria[1].Type != "path_pattern" {
+		t.Errorf("type = %q, want %q", cfg.Matcher.Criteria[1].Type, "path_pattern")
+	}
+	if cfg.Matcher.Criteria[1].Pattern != "/users/:id" {
+		t.Errorf("pattern = %q, want %q", cfg.Matcher.Criteria[1].Pattern, "/users/:id")
+	}
+}
+
+func TestConfig_BuildMatcher_PathPattern(t *testing.T) {
+	cfg := &Config{
+		Version: "1",
+		Matcher: &MatcherConfig{
+			Criteria: []CriterionConfig{
+				{Type: "method"},
+				{Type: "path_pattern", Pattern: "/users/:id"},
+			},
+		},
+	}
+
+	matcher, err := cfg.BuildMatcher()
+	if err != nil {
+		t.Fatalf("BuildMatcher failed: %v", err)
+	}
+
+	cm, ok := matcher.(*CompositeMatcher)
+	if !ok {
+		t.Fatalf("expected *CompositeMatcher, got %T", matcher)
+	}
+	if len(cm.criteria) != 2 {
+		t.Fatalf("criteria count = %d, want 2", len(cm.criteria))
+	}
+	if cm.criteria[1].Name() != "path_pattern" {
+		t.Errorf("criteria[1].Name() = %q, want %q", cm.criteria[1].Name(), "path_pattern")
+	}
+
+	// Verify it matches patterned paths.
+	tape := Tape{Request: RecordedReq{Method: "GET", URL: "/users/42"}}
+	req := httptest.NewRequest("GET", "/users/99", nil)
+	matched, ok := matcher.Match(req, []Tape{tape})
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if matched.Request.URL != "/users/42" {
+		t.Errorf("matched tape URL = %q, want %q", matched.Request.URL, "/users/42")
+	}
+}
+
+func TestLoadConfig_PathPatternValidationErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "missing pattern",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "path_pattern"}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "paths on path_pattern",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "path_pattern", "pattern": "/users/:id", "paths": ["$.x"]}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "pattern on method",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "method", "pattern": "/users/:id"}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "pattern on path",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "path", "pattern": "/users/:id"}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "pattern on content_negotiation",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "content_negotiation", "pattern": "/x"}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "pattern on body_fuzzy",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "body_fuzzy", "paths": ["$.x"], "pattern": "/x"}]},
+				"rules": []
+			}`,
+		},
+		{
+			name: "invalid pattern (no leading slash)",
+			input: `{
+				"version": "1",
+				"matcher": {"criteria": [{"type": "path_pattern", "pattern": "users/:id"}]},
+				"rules": []
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadConfig(strings.NewReader(tt.input))
+			if err == nil {
+				t.Error("expected validation error, got nil")
+			}
+		})
 	}
 }
 

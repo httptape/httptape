@@ -2,6 +2,7 @@ package httptape
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1042,5 +1043,78 @@ func TestIntegration_ContentNegotiation_MultiCT(t *testing.T) {
 	// Verify they got different responses.
 	if string(body1) == string(body2) {
 		t.Error("both requests returned the same response; content negotiation did not distinguish them")
+	}
+}
+
+func TestIntegration_PathParamFaker(t *testing.T) {
+	store := NewMemoryStore()
+
+	// Create a tape with path pattern and nested faker template.
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/users/42",
+	}, RecordedResp{
+		StatusCode: 200,
+		Body:       []byte(`name={{faker.name seed=user-{{pathParam.id}}}}`),
+	})
+	if err := store.Save(context.Background(), tape); err != nil {
+		t.Fatal(err)
+	}
+
+	criterion, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(store, WithMatcher(NewCompositeMatcher(
+		MethodCriterion{},
+		criterion,
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Request for /users/1.
+	resp1, err := http.Get(ts.URL + "/users/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	// Request for /users/2.
+	resp2, err := http.Get(ts.URL + "/users/2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	// Different paths -> different names.
+	if string(body1) == string(body2) {
+		t.Errorf("different user IDs produced same response: %q", string(body1))
+	}
+
+	// Same path again -> same name (deterministic).
+	resp1b, err := http.Get(ts.URL + "/users/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body1b, _ := io.ReadAll(resp1b.Body)
+	resp1b.Body.Close()
+
+	if string(body1) != string(body1b) {
+		t.Errorf("same user ID produced different responses: %q vs %q", string(body1), string(body1b))
+	}
+
+	// Verify the output contains "name=" prefix and a name.
+	if !strings.HasPrefix(string(body1), "name=") {
+		t.Errorf("expected name= prefix, got %q", string(body1))
+	}
+	name := strings.TrimPrefix(string(body1), "name=")
+	parts := strings.Fields(name)
+	if len(parts) != 2 {
+		t.Errorf("expected first+last name, got %q", name)
 	}
 }

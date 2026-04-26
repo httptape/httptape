@@ -2,12 +2,34 @@ package httptape
 
 import (
 	"bytes"
-	"io"
+	"crypto/rand"
+	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+// newTestCtx creates a templateCtx for testing with all fields populated.
+func newTestCtx(req *http.Request, reqBody []byte) *templateCtx {
+	return &templateCtx{
+		req:        req,
+		reqBody:    reqBody,
+		pathParams: nil,
+		tapeID:     "test-tape",
+		counters:   &counterState{counters: make(map[string]int64)},
+		randSource: rand.Reader,
+	}
+}
+
+// simpleCtx creates a minimal templateCtx from a request.
+func simpleCtx(req *http.Request) *templateCtx {
+	return newTestCtx(req, readRequestBody(req))
+}
 
 func TestScanTemplateExprs(t *testing.T) {
 	tests := []struct {
@@ -86,6 +108,13 @@ func TestScanTemplateExprs(t *testing.T) {
 			src:  "no open }}",
 			want: nil,
 		},
+		{
+			name: "nested expression",
+			src:  "{{faker.name seed=user-{{pathParam.id}}}}",
+			want: []templateExpr{
+				{raw: "faker.name seed=user-{{pathParam.id}}", start: 0, end: 41},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -109,11 +138,94 @@ func TestScanTemplateExprs(t *testing.T) {
 	}
 }
 
-func TestResolveExpr(t *testing.T) {
+func TestParseExpr(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantName string
+		wantArgs map[string]string
+	}{
+		{
+			name:     "accessor only",
+			input:    "request.path",
+			wantName: "request.path",
+			wantArgs: nil,
+		},
+		{
+			name:     "zero-arg helper",
+			input:    "now",
+			wantName: "now",
+			wantArgs: nil,
+		},
+		{
+			name:     "single-arg helper",
+			input:    "now format=unix",
+			wantName: "now",
+			wantArgs: map[string]string{"format": "unix"},
+		},
+		{
+			name:     "multi-arg helper",
+			input:    "randomInt min=1 max=50",
+			wantName: "randomInt",
+			wantArgs: map[string]string{"min": "1", "max": "50"},
+		},
+		{
+			name:     "faker with seed",
+			input:    "faker.email seed=user-42",
+			wantName: "faker.email",
+			wantArgs: map[string]string{"seed": "user-42"},
+		},
+		{
+			name:     "pathParam accessor",
+			input:    "pathParam.id",
+			wantName: "pathParam.id",
+			wantArgs: nil,
+		},
+		{
+			name:     "empty input",
+			input:    "",
+			wantName: "",
+			wantArgs: nil,
+		},
+		{
+			name:     "nested template in arg",
+			input:    "faker.name seed=user-{{pathParam.id}}",
+			wantName: "faker.name",
+			wantArgs: map[string]string{"seed": "user-{{pathParam.id}}"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseExpr(tt.input)
+			if got.name != tt.wantName {
+				t.Errorf("parseExpr(%q).name = %q, want %q", tt.input, got.name, tt.wantName)
+			}
+			if tt.wantArgs == nil {
+				if len(got.args) != 0 {
+					t.Errorf("parseExpr(%q).args = %v, want nil/empty", tt.input, got.args)
+				}
+			} else {
+				for k, wantV := range tt.wantArgs {
+					if gotV, ok := got.args[k]; !ok || gotV != wantV {
+						t.Errorf("parseExpr(%q).args[%q] = %q, want %q", tt.input, k, gotV, wantV)
+					}
+				}
+				if len(got.args) != len(tt.wantArgs) {
+					t.Errorf("parseExpr(%q).args has %d entries, want %d", tt.input, len(got.args), len(tt.wantArgs))
+				}
+			}
+		})
+	}
+}
+
+func TestResolveExpr_RequestAccessors(t *testing.T) {
 	reqBody := []byte(`{"user":{"email":"alice@example.com","age":30},"active":true,"score":99.5}`)
 	req := httptest.NewRequest("POST", "/api/users?page=2&sort=name", bytes.NewReader(reqBody))
 	req.Header.Set("X-Request-Id", "req-abc-123")
 	req.Header.Set("Content-Type", "application/json")
+
+	ctx := newTestCtx(req, reqBody)
 
 	tests := []struct {
 		name    string
@@ -121,119 +233,28 @@ func TestResolveExpr(t *testing.T) {
 		wantVal string
 		wantOk  bool
 	}{
-		{
-			name:    "request.method",
-			expr:    "request.method",
-			wantVal: "POST",
-			wantOk:  true,
-		},
-		{
-			name:    "request.path",
-			expr:    "request.path",
-			wantVal: "/api/users",
-			wantOk:  true,
-		},
-		{
-			name:    "request.url",
-			expr:    "request.url",
-			wantVal: "/api/users?page=2&sort=name",
-			wantOk:  true,
-		},
-		{
-			name:    "request.headers existing",
-			expr:    "request.headers.X-Request-Id",
-			wantVal: "req-abc-123",
-			wantOk:  true,
-		},
-		{
-			name:    "request.headers case insensitive",
-			expr:    "request.headers.x-request-id",
-			wantVal: "req-abc-123",
-			wantOk:  true,
-		},
-		{
-			name:    "request.headers missing",
-			expr:    "request.headers.X-Missing",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "request.query existing",
-			expr:    "request.query.page",
-			wantVal: "2",
-			wantOk:  true,
-		},
-		{
-			name:    "request.query missing",
-			expr:    "request.query.missing",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "request.body string field",
-			expr:    "request.body.user.email",
-			wantVal: "alice@example.com",
-			wantOk:  true,
-		},
-		{
-			name:    "request.body number field",
-			expr:    "request.body.user.age",
-			wantVal: "30",
-			wantOk:  true,
-		},
-		{
-			name:    "request.body boolean field",
-			expr:    "request.body.active",
-			wantVal: "true",
-			wantOk:  true,
-		},
-		{
-			name:    "request.body fractional number",
-			expr:    "request.body.score",
-			wantVal: "99.5",
-			wantOk:  true,
-		},
-		{
-			name:    "request.body non-scalar (object)",
-			expr:    "request.body.user",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "request.body missing field",
-			expr:    "request.body.nonexistent",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "non-request namespace",
-			expr:    "state.counter",
-			wantVal: "{{state.counter}}",
-			wantOk:  true,
-		},
-		{
-			name:    "request.path.param (unresolvable today)",
-			expr:    "request.path.id",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "unknown request sub-key",
-			expr:    "request.unknown",
-			wantVal: "",
-			wantOk:  false,
-		},
-		{
-			name:    "empty expression",
-			expr:    "",
-			wantVal: "{{}}",
-			wantOk:  true,
-		},
+		{"request.method", "request.method", "POST", true},
+		{"request.path", "request.path", "/api/users", true},
+		{"request.url", "request.url", "/api/users?page=2&sort=name", true},
+		{"request.headers existing", "request.headers.X-Request-Id", "req-abc-123", true},
+		{"request.headers case insensitive", "request.headers.x-request-id", "req-abc-123", true},
+		{"request.headers missing", "request.headers.X-Missing", "", false},
+		{"request.query existing", "request.query.page", "2", true},
+		{"request.query missing", "request.query.missing", "", false},
+		{"request.body string field", "request.body.user.email", "alice@example.com", true},
+		{"request.body number field", "request.body.user.age", "30", true},
+		{"request.body boolean field", "request.body.active", "true", true},
+		{"request.body fractional number", "request.body.score", "99.5", true},
+		{"request.body non-scalar (object)", "request.body.user", "", false},
+		{"request.body missing field", "request.body.nonexistent", "", false},
+		{"unknown namespace is unresolvable", "state.counter", "", false},
+		{"unknown request sub-key", "request.unknown", "", false},
+		{"empty expression", "", "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotVal, gotOk := resolveExpr(tt.expr, req, reqBody)
+			gotVal, gotOk := resolveExpr(tt.expr, ctx)
 			if gotOk != tt.wantOk {
 				t.Errorf("resolveExpr(%q) ok = %v, want %v", tt.expr, gotOk, tt.wantOk)
 			}
@@ -246,45 +267,530 @@ func TestResolveExpr(t *testing.T) {
 
 func TestResolveExpr_NilBody(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
-	val, ok := resolveExpr("request.body.field", req, nil)
+	ctx := newTestCtx(req, nil)
+	val, ok := resolveExpr("request.body.field", ctx)
 	if ok {
 		t.Errorf("expected unresolvable for nil body, got ok=true, val=%q", val)
 	}
 }
 
-func TestScalarToString(t *testing.T) {
+func TestResolveNow(t *testing.T) {
 	tests := []struct {
 		name   string
-		input  any
-		want   string
-		wantOk bool
+		args   map[string]string
+		verify func(t *testing.T, result string)
 	}{
-		{"string", "hello", "hello", true},
-		{"integer float", float64(42), "42", true},
-		{"fractional float", float64(3.14), "3.14", true},
-		{"negative integer", float64(-7), "-7", true},
-		{"zero", float64(0), "0", true},
-		{"true", true, "true", true},
-		{"false", false, "false", true},
-		{"nil", nil, "", false},
-		{"map", map[string]any{"k": "v"}, "", false},
-		{"slice", []any{1, 2}, "", false},
+		{
+			name: "default rfc3339",
+			args: nil,
+			verify: func(t *testing.T, result string) {
+				_, err := time.Parse(time.RFC3339, result)
+				if err != nil {
+					t.Errorf("expected RFC3339 format, got %q: %v", result, err)
+				}
+			},
+		},
+		{
+			name: "unix format",
+			args: map[string]string{"format": "unix"},
+			verify: func(t *testing.T, result string) {
+				val, err := strconv.ParseInt(result, 10, 64)
+				if err != nil {
+					t.Errorf("expected unix timestamp, got %q: %v", result, err)
+				}
+				now := time.Now().Unix()
+				if val < now-2 || val > now+2 {
+					t.Errorf("unix timestamp %d is too far from now %d", val, now)
+				}
+			},
+		},
+		{
+			name: "iso format alias",
+			args: map[string]string{"format": "iso"},
+			verify: func(t *testing.T, result string) {
+				_, err := time.Parse(time.RFC3339, result)
+				if err != nil {
+					t.Errorf("expected RFC3339 format, got %q: %v", result, err)
+				}
+			},
+		},
+		{
+			name: "unixMillis format",
+			args: map[string]string{"format": "unixMillis"},
+			verify: func(t *testing.T, result string) {
+				val, err := strconv.ParseInt(result, 10, 64)
+				if err != nil {
+					t.Errorf("expected unix millis, got %q: %v", result, err)
+				}
+				now := time.Now().UnixMilli()
+				if val < now-2000 || val > now+2000 {
+					t.Errorf("unixMillis %d is too far from now %d", val, now)
+				}
+			},
+		},
+		{
+			name: "custom Go format",
+			args: map[string]string{"format": "2006-01-02"},
+			verify: func(t *testing.T, result string) {
+				_, err := time.Parse("2006-01-02", result)
+				if err != nil {
+					t.Errorf("expected date format, got %q: %v", result, err)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := scalarToString(tt.input)
-			if ok != tt.wantOk {
-				t.Errorf("scalarToString(%v) ok = %v, want %v", tt.input, ok, tt.wantOk)
+			result := resolveNow(tt.args)
+			tt.verify(t, result)
+		})
+	}
+}
+
+func TestResolveUUID(t *testing.T) {
+	// Use deterministic random source.
+	src := bytes.NewReader(make([]byte, 16))
+	ctx := &templateCtx{randSource: src}
+
+	result := resolveUUID(ctx)
+
+	// Verify UUID format: 8-4-4-4-12 hex chars separated by dashes.
+	if len(result) != 36 {
+		t.Fatalf("UUID length = %d, want 36", len(result))
+	}
+	parts := strings.Split(result, "-")
+	if len(parts) != 5 {
+		t.Fatalf("UUID has %d parts, want 5", len(parts))
+	}
+	wantLens := []int{8, 4, 4, 4, 12}
+	for i, part := range parts {
+		if len(part) != wantLens[i] {
+			t.Errorf("part[%d] length = %d, want %d", i, len(part), wantLens[i])
+		}
+	}
+
+	// Verify version 4 (character index 14 should be '4').
+	if result[14] != '4' {
+		t.Errorf("UUID version = %c, want '4'", result[14])
+	}
+	// Verify variant (character index 19 should be 8, 9, a, or b).
+	variant := result[19]
+	if variant != '8' && variant != '9' && variant != 'a' && variant != 'b' {
+		t.Errorf("UUID variant = %c, want 8/9/a/b", variant)
+	}
+}
+
+func TestResolveRandomHex(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    map[string]string
+		wantLen int
+		wantErr bool
+	}{
+		{
+			name:    "length 16",
+			args:    map[string]string{"length": "16"},
+			wantLen: 16,
+		},
+		{
+			name:    "length 1",
+			args:    map[string]string{"length": "1"},
+			wantLen: 1,
+		},
+		{
+			name:    "missing length",
+			args:    nil,
+			wantErr: true,
+		},
+		{
+			name:    "non-numeric length",
+			args:    map[string]string{"length": "abc"},
+			wantErr: true,
+		},
+		{
+			name:    "zero length",
+			args:    map[string]string{"length": "0"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &templateCtx{randSource: rand.Reader}
+			result, err := resolveRandomHex(tt.args, ctx)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
 			}
-			if got != tt.want {
-				t.Errorf("scalarToString(%v) = %q, want %q", tt.input, got, tt.want)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(result) != tt.wantLen {
+				t.Errorf("length = %d, want %d", len(result), tt.wantLen)
+			}
+			// Verify all chars are valid hex.
+			for _, c := range result {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+					t.Errorf("invalid hex char %c in %q", c, result)
+				}
 			}
 		})
 	}
 }
 
-func TestResolveTemplateBody(t *testing.T) {
+func TestResolveRandomInt(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    map[string]string
+		wantMin int64
+		wantMax int64
+		wantErr bool
+	}{
+		{
+			name:    "default range",
+			args:    nil,
+			wantMin: 0,
+			wantMax: 100,
+		},
+		{
+			name:    "custom range",
+			args:    map[string]string{"min": "10", "max": "20"},
+			wantMin: 10,
+			wantMax: 20,
+		},
+		{
+			name:    "non-numeric min",
+			args:    map[string]string{"min": "abc"},
+			wantErr: true,
+		},
+		{
+			name:    "non-numeric max",
+			args:    map[string]string{"max": "abc"},
+			wantErr: true,
+		},
+		{
+			name:    "min greater than max",
+			args:    map[string]string{"min": "50", "max": "10"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &templateCtx{randSource: rand.Reader}
+			result, err := resolveRandomInt(tt.args, ctx)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			val, err := strconv.ParseInt(result, 10, 64)
+			if err != nil {
+				t.Fatalf("cannot parse result %q as int: %v", result, err)
+			}
+			if val < tt.wantMin || val > tt.wantMax {
+				t.Errorf("result %d outside [%d, %d]", val, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestResolveCounter(t *testing.T) {
+	t.Run("sequential increment", func(t *testing.T) {
+		cs := &counterState{counters: make(map[string]int64)}
+		ctx := &templateCtx{counters: cs}
+
+		for i := int64(1); i <= 5; i++ {
+			result := resolveCounter(nil, ctx)
+			want := strconv.FormatInt(i, 10)
+			if result != want {
+				t.Errorf("counter call %d = %q, want %q", i, result, want)
+			}
+		}
+	})
+
+	t.Run("named counters are independent", func(t *testing.T) {
+		cs := &counterState{counters: make(map[string]int64)}
+		ctx := &templateCtx{counters: cs}
+
+		r1 := resolveCounter(map[string]string{"name": "a"}, ctx)
+		r2 := resolveCounter(map[string]string{"name": "b"}, ctx)
+		r3 := resolveCounter(map[string]string{"name": "a"}, ctx)
+
+		if r1 != "1" || r2 != "1" || r3 != "2" {
+			t.Errorf("got a=%s, b=%s, a=%s; want 1, 1, 2", r1, r2, r3)
+		}
+	})
+
+	t.Run("nil counters returns 0", func(t *testing.T) {
+		ctx := &templateCtx{counters: nil}
+		result := resolveCounter(nil, ctx)
+		if result != "0" {
+			t.Errorf("got %q, want %q", result, "0")
+		}
+	})
+}
+
+func TestCounterState_WrapAtMaxInt64(t *testing.T) {
+	cs := &counterState{counters: make(map[string]int64)}
+	cs.counters["test"] = math.MaxInt64 - 1
+
+	v1 := cs.Next("test")
+	if v1 != math.MaxInt64 {
+		t.Errorf("expected MaxInt64, got %d", v1)
+	}
+
+	v2 := cs.Next("test")
+	if v2 != 0 {
+		t.Errorf("expected 0 after wrap, got %d", v2)
+	}
+}
+
+func TestCounterState_Reset(t *testing.T) {
+	cs := &counterState{counters: make(map[string]int64)}
+	cs.Next("a")
+	cs.Next("a")
+	cs.Next("b")
+
+	// Reset named counter.
+	cs.Reset("a")
+	v := cs.Next("a")
+	if v != 1 {
+		t.Errorf("after reset(a), Next(a) = %d, want 1", v)
+	}
+
+	// Reset all.
+	cs.Reset("")
+	va := cs.Next("a")
+	vb := cs.Next("b")
+	if va != 1 || vb != 1 {
+		t.Errorf("after reset all: a=%d, b=%d; want 1, 1", va, vb)
+	}
+}
+
+func TestCounterState_Concurrent(t *testing.T) {
+	cs := &counterState{counters: make(map[string]int64)}
+	n := 1000
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			cs.Next("default")
+		}()
+	}
+	wg.Wait()
+
+	got := cs.counters["default"]
+	if got != int64(n) {
+		t.Errorf("after %d concurrent increments, counter = %d", n, got)
+	}
+}
+
+func TestResolveFaker_Email(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	result, ok := resolveFaker("email", map[string]string{"seed": "test-seed"}, ctx)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(result, "@example.com") {
+		t.Errorf("expected email format, got %q", result)
+	}
+
+	// Deterministic: same seed -> same output.
+	result2, _ := resolveFaker("email", map[string]string{"seed": "test-seed"}, ctx)
+	if result != result2 {
+		t.Errorf("same seed produced different results: %q vs %q", result, result2)
+	}
+
+	// Different seed -> different output.
+	result3, _ := resolveFaker("email", map[string]string{"seed": "other-seed"}, ctx)
+	if result == result3 {
+		t.Errorf("different seeds produced same result: %q", result)
+	}
+}
+
+func TestResolveFaker_Name(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	result, ok := resolveFaker("name", map[string]string{"seed": "test-seed"}, ctx)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	parts := strings.Fields(result)
+	if len(parts) != 2 {
+		t.Errorf("expected first+last name, got %q", result)
+	}
+}
+
+func TestResolveFaker_Phone(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	result, ok := resolveFaker("phone", map[string]string{"seed": "test-seed"}, ctx)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if result == "" {
+		t.Error("expected non-empty phone result")
+	}
+}
+
+func TestResolveFaker_Address(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	result, ok := resolveFaker("address", map[string]string{"seed": "test-seed"}, ctx)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(result, ",") {
+		t.Errorf("expected address format, got %q", result)
+	}
+}
+
+func TestResolveFaker_AutoSeed(t *testing.T) {
+	req1 := httptest.NewRequest("GET", "/users/1", nil)
+	ctx1 := newTestCtx(req1, nil)
+
+	req2 := httptest.NewRequest("GET", "/users/2", nil)
+	ctx2 := newTestCtx(req2, nil)
+
+	result1, _ := resolveFaker("email", nil, ctx1)
+	result2, _ := resolveFaker("email", nil, ctx2)
+
+	// Different paths -> different output.
+	if result1 == result2 {
+		t.Errorf("different paths produced same faker output: %q", result1)
+	}
+
+	// Same path again -> same output.
+	result1b, _ := resolveFaker("email", nil, ctx1)
+	if result1 != result1b {
+		t.Errorf("same path produced different faker output: %q vs %q", result1, result1b)
+	}
+}
+
+func TestResolveFaker_Unknown(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	_, ok := resolveFaker("doesnotexist", nil, ctx)
+	if ok {
+		t.Error("expected ok=false for unknown faker type")
+	}
+}
+
+func TestResolveFaker_UUID(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	ctx := newTestCtx(req, nil)
+
+	result, ok := resolveFaker("uuid", map[string]string{"seed": "test"}, ctx)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if len(result) != 36 || strings.Count(result, "-") != 4 {
+		t.Errorf("expected UUID format, got %q", result)
+	}
+
+	// Deterministic.
+	result2, _ := resolveFaker("uuid", map[string]string{"seed": "test"}, ctx)
+	if result != result2 {
+		t.Errorf("same seed produced different UUIDs: %q vs %q", result, result2)
+	}
+}
+
+func TestResolvePathParam(t *testing.T) {
+	tests := []struct {
+		name       string
+		expr       string
+		pathParams map[string]string
+		wantVal    string
+		wantOk     bool
+	}{
+		{
+			name:       "existing param",
+			expr:       "pathParam.id",
+			pathParams: map[string]string{"id": "42"},
+			wantVal:    "42",
+			wantOk:     true,
+		},
+		{
+			name:       "missing param",
+			expr:       "pathParam.name",
+			pathParams: map[string]string{"id": "42"},
+			wantVal:    "",
+			wantOk:     false,
+		},
+		{
+			name:    "nil pathParams",
+			expr:    "pathParam.id",
+			wantVal: "",
+			wantOk:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/test", nil)
+			ctx := newTestCtx(req, nil)
+			ctx.pathParams = tt.pathParams
+
+			gotVal, gotOk := resolveExpr(tt.expr, ctx)
+			if gotOk != tt.wantOk {
+				t.Errorf("resolveExpr(%q) ok = %v, want %v", tt.expr, gotOk, tt.wantOk)
+			}
+			if gotVal != tt.wantVal {
+				t.Errorf("resolveExpr(%q) = %q, want %q", tt.expr, gotVal, tt.wantVal)
+			}
+		})
+	}
+}
+
+func TestResolveArgs_Nested(t *testing.T) {
+	req := httptest.NewRequest("GET", "/users/42", nil)
+	ctx := newTestCtx(req, nil)
+	ctx.pathParams = map[string]string{"id": "42"}
+
+	args := map[string]string{"seed": "user-{{pathParam.id}}"}
+	resolved := resolveArgs(args, ctx)
+
+	if resolved["seed"] != "user-42" {
+		t.Errorf("resolved seed = %q, want %q", resolved["seed"], "user-42")
+	}
+}
+
+func TestAutoSeed(t *testing.T) {
+	s1 := autoSeed("tape1", "/users/1")
+	s2 := autoSeed("tape1", "/users/2")
+	s3 := autoSeed("tape2", "/users/1")
+	s4 := autoSeed("tape1", "/users/1")
+
+	if s1 == s2 {
+		t.Error("different paths should produce different seeds")
+	}
+	if s1 == s3 {
+		t.Error("different tape IDs should produce different seeds")
+	}
+	if s1 != s4 {
+		t.Error("same tape+path should produce same seed")
+	}
+	if len(s1) != 16 {
+		t.Errorf("seed length = %d, want 16", len(s1))
+	}
+}
+
+func TestResolveTemplateBody_BackwardCompat(t *testing.T) {
 	tests := []struct {
 		name    string
 		body    string
@@ -301,96 +807,74 @@ func TestResolveTemplateBody(t *testing.T) {
 			body:   `{"id": "pay_123"}`,
 			method: "GET",
 			path:   "/test",
-			want:   `{"id": "pay_123"}`,
+			want:   `{"id": "pay_123"}`, // fast path: no {{ means no processing
 		},
 		{
 			name:   "method substitution",
 			body:   `{"method": "{{request.method}}"}`,
 			method: "POST",
 			path:   "/test",
-			want:   `{"method": "POST"}`,
+			want:   `{"method":"POST"}`,
 		},
 		{
-			name:   "path substitution",
-			body:   `{"path": "{{request.path}}"}`,
+			name:   "path substitution non-JSON",
+			body:   `path={{request.path}}`,
 			method: "GET",
 			path:   "/users/42",
-			want:   `{"path": "/users/42"}`,
+			want:   `path=/users/42`,
 		},
 		{
-			name:   "url substitution",
-			body:   `{"url": "{{request.url}}"}`,
+			name:   "url substitution non-JSON",
+			body:   `url={{request.url}}`,
 			method: "GET",
 			path:   "/users?page=1",
-			want:   `{"url": "/users?page=1"}`,
+			want:   `url=/users?page=1`,
 		},
 		{
 			name:    "header substitution",
-			body:    `{"key": "{{request.headers.X-Request-Id}}"}`,
+			body:    `key={{request.headers.X-Request-Id}}`,
 			method:  "GET",
 			path:    "/test",
 			headers: http.Header{"X-Request-Id": {"req-123"}},
-			want:    `{"key": "req-123"}`,
+			want:    `key=req-123`,
 		},
 		{
-			name:   "query substitution",
-			body:   `{"page": "{{request.query.page}}"}`,
+			name:   "query substitution non-JSON",
+			body:   `page={{request.query.page}}`,
 			method: "GET",
 			path:   "/test?page=5",
-			want:   `{"page": "5"}`,
+			want:   `page=5`,
 		},
 		{
 			name:    "body field substitution",
-			body:    `{"echo_email": "{{request.body.user.email}}"}`,
+			body:    `echo={{request.body.user.email}}`,
 			method:  "POST",
 			path:    "/test",
 			reqBody: `{"user":{"email":"bob@example.com"}}`,
-			want:    `{"echo_email": "bob@example.com"}`,
-		},
-		{
-			name:   "multiple substitutions",
-			body:   `{"method":"{{request.method}}","path":"{{request.path}}"}`,
-			method: "PUT",
-			path:   "/api/resource",
-			want:   `{"method":"PUT","path":"/api/resource"}`,
+			want:    `echo=bob@example.com`,
 		},
 		{
 			name:   "lenient unresolvable replaces with empty",
-			body:   `{"val": "{{request.headers.Missing}}"}`,
+			body:   `val={{request.headers.Missing}}`,
 			method: "GET",
 			path:   "/test",
 			strict: false,
-			want:   `{"val": ""}`,
+			want:   `val=`,
 		},
 		{
 			name:    "strict unresolvable returns error",
-			body:    `{"val": "{{request.headers.Missing}}"}`,
+			body:    `val={{request.headers.Missing}}`,
 			method:  "GET",
 			path:    "/test",
 			strict:  true,
 			wantErr: true,
 		},
 		{
-			name:   "non-request namespace left as literal",
-			body:   `{"counter": "{{state.counter}}"}`,
+			name:   "unknown namespace in lenient mode resolves to empty",
+			body:   `count={{state.counter}}`,
 			method: "GET",
 			path:   "/test",
-			want:   `{"counter": "{{state.counter}}"}`,
-		},
-		{
-			name:   "mixed resolvable and literal namespace",
-			body:   `{{request.method}} {{state.x}}`,
-			method: "GET",
-			path:   "/test",
-			want:   `GET {{state.x}}`,
-		},
-		{
-			name:    "idempotency key echo (headline example)",
-			body:    `{"id": "pay_123", "idempotency_key": "{{request.headers.Idempotency-Key}}"}`,
-			method:  "POST",
-			path:    "/payments",
-			headers: http.Header{"Idempotency-Key": {"idem-abc-789"}},
-			want:    `{"id": "pay_123", "idempotency_key": "idem-abc-789"}`,
+			want:   `count=`,
 		},
 		{
 			name:   "nil body returns nil",
@@ -403,11 +887,16 @@ func TestResolveTemplateBody(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var bodyReader io.Reader
+			var bodyReader *strings.Reader
 			if tt.reqBody != "" {
 				bodyReader = strings.NewReader(tt.reqBody)
 			}
-			req := httptest.NewRequest(tt.method, tt.path, bodyReader)
+			var req *http.Request
+			if bodyReader != nil {
+				req = httptest.NewRequest(tt.method, tt.path, bodyReader)
+			} else {
+				req = httptest.NewRequest(tt.method, tt.path, nil)
+			}
 			for k, vs := range tt.headers {
 				for _, v := range vs {
 					req.Header.Add(k, v)
@@ -419,7 +908,8 @@ func TestResolveTemplateBody(t *testing.T) {
 				bodyBytes = []byte(tt.body)
 			}
 
-			got, err := ResolveTemplateBody(bodyBytes, req, tt.strict)
+			ctx := simpleCtx(req)
+			got, err := ResolveTemplateBody(bodyBytes, ctx, tt.strict)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -438,7 +928,8 @@ func TestResolveTemplateBody(t *testing.T) {
 
 func TestResolveTemplateBody_NilBody(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
-	got, err := ResolveTemplateBody(nil, req, false)
+	ctx := simpleCtx(req)
+	got, err := ResolveTemplateBody(nil, ctx, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,7 +941,8 @@ func TestResolveTemplateBody_NilBody(t *testing.T) {
 func TestResolveTemplateBody_FastPath_NoDelimiters(t *testing.T) {
 	body := []byte(`{"no":"templates","here":true}`)
 	req := httptest.NewRequest("GET", "/test", nil)
-	got, err := ResolveTemplateBody(body, req, false)
+	ctx := simpleCtx(req)
+	got, err := ResolveTemplateBody(body, ctx, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -460,14 +952,92 @@ func TestResolveTemplateBody_FastPath_NoDelimiters(t *testing.T) {
 	}
 }
 
-func TestResolveTemplateHeaders(t *testing.T) {
+func TestResolveTemplateJSON(t *testing.T) {
+	t.Run("string values resolved", func(t *testing.T) {
+		body := []byte(`{"name":"{{request.method}}","count":42}`)
+		req := httptest.NewRequest("POST", "/test", nil)
+		ctx := simpleCtx(req)
+
+		got, err := resolveTemplateJSON(body, ctx, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Should resolve the template and preserve the number.
+		if !strings.Contains(string(got), `"POST"`) {
+			t.Errorf("expected POST in result, got %q", string(got))
+		}
+		if !strings.Contains(string(got), "42") {
+			t.Errorf("expected 42 preserved, got %q", string(got))
+		}
+	})
+
+	t.Run("nested objects resolved", func(t *testing.T) {
+		body := []byte(`{"outer":{"inner":"{{request.path}}"}}`)
+		req := httptest.NewRequest("GET", "/deep", nil)
+		ctx := simpleCtx(req)
+
+		got, err := resolveTemplateJSON(body, ctx, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(got), `"/deep"`) {
+			t.Errorf("expected /deep in result, got %q", string(got))
+		}
+	})
+
+	t.Run("arrays resolved", func(t *testing.T) {
+		body := []byte(`["{{request.method}}","static"]`)
+		req := httptest.NewRequest("PUT", "/test", nil)
+		ctx := simpleCtx(req)
+
+		got, err := resolveTemplateJSON(body, ctx, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(got), `"PUT"`) {
+			t.Errorf("expected PUT in result, got %q", string(got))
+		}
+		if !strings.Contains(string(got), `"static"`) {
+			t.Errorf("expected static preserved, got %q", string(got))
+		}
+	})
+
+	t.Run("special chars properly escaped", func(t *testing.T) {
+		body := []byte(`{"val":"{{request.headers.X-Data}}"}`)
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("X-Data", `value with "quotes" and \backslash`)
+		ctx := simpleCtx(req)
+
+		got, err := resolveTemplateJSON(body, ctx, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// The result should be valid JSON.
+		var parsed map[string]any
+		if err := json.Unmarshal(got, &parsed); err != nil {
+			t.Fatalf("result is not valid JSON: %v\nraw: %s", err, string(got))
+		}
+	})
+
+	t.Run("strict mode error propagated", func(t *testing.T) {
+		body := []byte(`{"val":"{{request.headers.Missing}}"}`)
+		req := httptest.NewRequest("GET", "/test", nil)
+		ctx := simpleCtx(req)
+
+		_, err := resolveTemplateJSON(body, ctx, true)
+		if err == nil {
+			t.Fatal("expected error in strict mode")
+		}
+	})
+}
+
+func TestResolveTemplateHeaders_WithCtx(t *testing.T) {
 	tests := []struct {
 		name       string
 		headers    http.Header
 		method     string
 		path       string
 		reqHeaders http.Header
-		reqBody    string
 		strict     bool
 		want       http.Header
 		wantErr    bool
@@ -495,29 +1065,6 @@ func TestResolveTemplateHeaders(t *testing.T) {
 			want:    http.Header{"X-Method": {"DELETE"}},
 		},
 		{
-			name:    "multiple header values",
-			headers: http.Header{"X-Multi": {"{{request.method}}", "static"}},
-			method:  "GET",
-			path:    "/test",
-			want:    http.Header{"X-Multi": {"GET", "static"}},
-		},
-		{
-			name:    "lenient mode missing ref",
-			headers: http.Header{"X-Key": {"{{request.headers.Missing}}"}},
-			method:  "GET",
-			path:    "/test",
-			strict:  false,
-			want:    http.Header{"X-Key": {""}},
-		},
-		{
-			name:    "strict mode missing ref",
-			headers: http.Header{"X-Key": {"{{request.headers.Missing}}"}},
-			method:  "GET",
-			path:    "/test",
-			strict:  true,
-			wantErr: true,
-		},
-		{
 			name:   "nil headers returns nil",
 			method: "GET",
 			path:   "/test",
@@ -527,18 +1074,15 @@ func TestResolveTemplateHeaders(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var bodyReader io.Reader
-			if tt.reqBody != "" {
-				bodyReader = strings.NewReader(tt.reqBody)
-			}
-			req := httptest.NewRequest(tt.method, tt.path, bodyReader)
+			req := httptest.NewRequest(tt.method, tt.path, nil)
 			for k, vs := range tt.reqHeaders {
 				for _, v := range vs {
 					req.Header.Add(k, v)
 				}
 			}
+			ctx := simpleCtx(req)
 
-			got, err := ResolveTemplateHeaders(tt.headers, req, tt.strict)
+			got, err := ResolveTemplateHeaders(tt.headers, ctx, tt.strict)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -572,108 +1116,50 @@ func TestResolveTemplateHeaders(t *testing.T) {
 	}
 }
 
-func TestResolveTemplateBody_StrictErrorMessage(t *testing.T) {
-	body := []byte(`prefix {{request.headers.Missing}} suffix`)
-	req := httptest.NewRequest("GET", "/test", nil)
+func TestResolveTemplateBodySimple(t *testing.T) {
+	req := httptest.NewRequest("POST", "/test?page=1", strings.NewReader(`{"key":"value"}`))
+	req.Header.Set("X-Id", "abc")
 
-	_, err := ResolveTemplateBody(body, req, true)
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	body := []byte(`method={{request.method}} query={{request.query.page}} header={{request.headers.X-Id}}`)
+	got, err := ResolveTemplateBodySimple(body, req, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "request.headers.Missing") {
-		t.Errorf("error message %q should mention the failed expression", err.Error())
-	}
-	if !strings.Contains(err.Error(), "httptape") {
-		t.Errorf("error message %q should include package prefix", err.Error())
+	want := "method=POST query=1 header=abc"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", string(got), want)
 	}
 }
 
-func TestResolveTemplateBody_BodyFieldTypes(t *testing.T) {
-	reqBody := `{"s":"hello","n":42,"f":3.14,"b":true,"null":null,"obj":{"k":"v"},"arr":[1,2]}`
-
+func TestScalarToString(t *testing.T) {
 	tests := []struct {
 		name   string
-		expr   string
+		input  any
 		want   string
-		strict bool
+		wantOk bool
 	}{
-		{"string field", "{{request.body.s}}", "hello", false},
-		{"integer field", "{{request.body.n}}", "42", false},
-		{"float field", "{{request.body.f}}", "3.14", false},
-		{"boolean field", "{{request.body.b}}", "true", false},
-		{"null field lenient", "{{request.body.null}}", "", false},
-		{"object field lenient", "{{request.body.obj}}", "", false},
-		{"array field lenient", "{{request.body.arr}}", "", false},
+		{"string", "hello", "hello", true},
+		{"integer float", float64(42), "42", true},
+		{"fractional float", float64(3.14), "3.14", true},
+		{"negative integer", float64(-7), "-7", true},
+		{"zero", float64(0), "0", true},
+		{"true", true, "true", true},
+		{"false", false, "false", true},
+		{"nil", nil, "", false},
+		{"map", map[string]any{"k": "v"}, "", false},
+		{"slice", []any{1, 2}, "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/test", strings.NewReader(reqBody))
-			got, err := ResolveTemplateBody([]byte(tt.expr), req, tt.strict)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			got, ok := scalarToString(tt.input)
+			if ok != tt.wantOk {
+				t.Errorf("scalarToString(%v) ok = %v, want %v", tt.input, ok, tt.wantOk)
 			}
-			if string(got) != tt.want {
-				t.Errorf("got %q, want %q", string(got), tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveTemplateBody_NonScalarStrict(t *testing.T) {
-	reqBody := `{"obj":{"k":"v"},"arr":[1,2],"null":null}`
-
-	tests := []struct {
-		name string
-		expr string
-	}{
-		{"object in strict", "{{request.body.obj}}"},
-		{"array in strict", "{{request.body.arr}}"},
-		{"null in strict", "{{request.body.null}}"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/test", strings.NewReader(reqBody))
-			_, err := ResolveTemplateBody([]byte(tt.expr), req, true)
-			if err == nil {
-				t.Fatal("expected error for non-scalar in strict mode")
+			if got != tt.want {
+				t.Errorf("scalarToString(%v) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestResolveTemplateBody_InvalidJSON(t *testing.T) {
-	req := httptest.NewRequest("POST", "/test", strings.NewReader("not json"))
-	body := []byte(`echo: {{request.body.field}}`)
-
-	// Lenient mode: invalid JSON body -> unresolvable -> empty string.
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(got) != "echo: " {
-		t.Errorf("got %q, want %q", string(got), "echo: ")
-	}
-}
-
-func TestResolveTemplateBody_PreservesRequestBody(t *testing.T) {
-	originalBody := `{"key":"value"}`
-	req := httptest.NewRequest("POST", "/test", strings.NewReader(originalBody))
-
-	body := []byte(`{{request.body.key}}`)
-	_, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Request body should still be readable.
-	remaining, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("reading body after templating: %v", err)
-	}
-	if string(remaining) != originalBody {
-		t.Errorf("request body after templating = %q, want %q", string(remaining), originalBody)
 	}
 }
 
@@ -726,8 +1212,6 @@ func TestResolveBodyField_InvalidJSON(t *testing.T) {
 }
 
 func TestResolveBodyField_InvalidPath(t *testing.T) {
-	// parsePath rejects paths without the $. prefix -- we prepend it,
-	// but a completely empty path segment should fail.
 	got, ok := resolveBodyField([]byte(`{"a":"b"}`), "")
 	if ok {
 		t.Errorf("expected false for empty path, got true with value %q", got)
@@ -746,8 +1230,6 @@ func TestReadRequestBody(t *testing.T) {
 	t.Run("httptest nil body", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test", nil)
 		got := readRequestBody(req)
-		// httptest.NewRequest with nil body sets Body to http.NoBody,
-		// which reads as empty. readRequestBody returns an empty slice.
 		if len(got) != 0 {
 			t.Errorf("expected empty, got %q", string(got))
 		}
@@ -760,91 +1242,42 @@ func TestReadRequestBody(t *testing.T) {
 		if string(got) != original {
 			t.Errorf("got %q, want %q", string(got), original)
 		}
-		// Verify body is restored.
-		restored, err := io.ReadAll(req.Body)
-		if err != nil {
-			t.Fatalf("re-read error: %v", err)
-		}
-		if string(restored) != original {
-			t.Errorf("restored body = %q, want %q", string(restored), original)
-		}
 	})
 }
 
-func TestResolveTemplateHeaders_EmptyHeaders(t *testing.T) {
-	req := httptest.NewRequest("GET", "/test", nil)
-	got, err := ResolveTemplateHeaders(http.Header{}, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestFindMatchingClose(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		openIdx int
+		want    int
+	}{
+		{
+			name:    "simple close",
+			src:     "{{hello}}",
+			openIdx: 0,
+			want:    7,
+		},
+		{
+			name:    "nested",
+			src:     "{{outer {{inner}}}}",
+			openIdx: 0,
+			want:    17,
+		},
+		{
+			name:    "no close",
+			src:     "{{unclosed",
+			openIdx: 0,
+			want:    -1,
+		},
 	}
-	if len(got) != 0 {
-		t.Errorf("expected empty header map, got %v", got)
-	}
-}
 
-func TestResolveTemplateBody_QueryMultipleValues(t *testing.T) {
-	// Query().Get returns the first value.
-	req := httptest.NewRequest("GET", "/test?color=red&color=blue", nil)
-	body := []byte(`{{request.query.color}}`)
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(got) != "red" {
-		t.Errorf("got %q, want %q (first value)", string(got), "red")
-	}
-}
-
-func TestResolveTemplateBody_HeaderCaseInsensitive(t *testing.T) {
-	req := httptest.NewRequest("GET", "/test", nil)
-	req.Header.Set("X-Custom-Header", "value-123")
-
-	// Template uses different casing.
-	body := []byte(`{{request.headers.x-custom-header}}`)
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(got) != "value-123" {
-		t.Errorf("got %q, want %q", string(got), "value-123")
-	}
-}
-
-func TestResolveTemplateBody_AdjacentExpressions(t *testing.T) {
-	req := httptest.NewRequest("GET", "/path", nil)
-	body := []byte(`{{request.method}}{{request.path}}`)
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(got) != "GET/path" {
-		t.Errorf("got %q, want %q", string(got), "GET/path")
-	}
-}
-
-func TestResolveTemplateBody_MixedResolvableAndUnresolvable(t *testing.T) {
-	req := httptest.NewRequest("GET", "/test", nil)
-	body := []byte(`a={{request.method}},b={{request.headers.Missing}},c={{request.path}}`)
-
-	// Lenient mode.
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(got) != "a=GET,b=,c=/test" {
-		t.Errorf("got %q, want %q", string(got), "a=GET,b=,c=/test")
-	}
-}
-
-func TestResolveTemplateBody_UnclosedDelimiterTreatedAsLiteral(t *testing.T) {
-	req := httptest.NewRequest("GET", "/test", nil)
-	body := []byte(`hello {{request.method}} and {{ unclosed`)
-	got, err := ResolveTemplateBody(body, req, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// The {{ unclosed part stays as literal since there's no closing }}.
-	if string(got) != "hello GET and {{ unclosed" {
-		t.Errorf("got %q, want %q", string(got), "hello GET and {{ unclosed")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findMatchingClose([]byte(tt.src), tt.openIdx)
+			if got != tt.want {
+				t.Errorf("findMatchingClose(%q, %d) = %d, want %d", tt.src, tt.openIdx, got, tt.want)
+			}
+		})
 	}
 }

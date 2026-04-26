@@ -176,11 +176,12 @@ Panics if `l1` or `l2` is nil.
 ```go
 type Server struct { /* unexported */ }
 
-func NewServer(store Store, opts ...ServerOption) *Server
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements http.Handler
+func (s *Server) ResetCounter(name string)                         // reset named or all template counters
 ```
 
-Panics if `store` is nil.
+Returns an error if option values are invalid. Panics if `store` is nil.
 
 ### ServerOption
 
@@ -321,6 +322,7 @@ func NewCompositeMatcher(criteria ...Criterion) *CompositeMatcher
 | MethodCriterion | `MethodCriterion{}` | 1 |
 | PathCriterion | `PathCriterion{}` | 2 |
 | PathRegexCriterion | `NewPathRegexCriterion(pattern string) (*PathRegexCriterion, error)` | 1 |
+| PathPatternCriterion | `NewPathPatternCriterion(pattern string) (*PathPatternCriterion, error)` | 3 |
 | RouteCriterion | `RouteCriterion{Route: route}` | 1 |
 | HeadersCriterion | `HeadersCriterion{Key: key, Value: value}` | 3 |
 | QueryParamsCriterion | `QueryParamsCriterion{}` | 4 |
@@ -329,6 +331,16 @@ func NewCompositeMatcher(criteria ...Criterion) *CompositeMatcher
 | BodyHashCriterion | `BodyHashCriterion{}` | 8 |
 
 **Details:** [Matching](matching.md)
+
+---
+
+## Templating
+
+```go
+func ResolveTemplateBodySimple(body []byte, r *http.Request, strict bool) ([]byte, error)
+```
+
+Backward-compatible convenience wrapper for template resolution using only request data (no path params, counters, or faker). See [Template Helpers](template-helpers.md) for the full template expression reference.
 
 ---
 
