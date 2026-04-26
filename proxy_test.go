@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -993,5 +994,753 @@ func TestProxy_CompositionSanitizationPath(t *testing.T) {
 	l2Secret := l2Tapes[0].Request.Headers.Get("X-Secret")
 	if l2Secret == "top-secret-value" {
 		t.Errorf("L2 X-Secret should be redacted, got raw value %q", l2Secret)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// errReadCloser is a body that returns an error after N bytes.
+// ---------------------------------------------------------------------------
+
+type errReadCloser struct {
+	remaining int
+	err       error
+	closed    bool
+}
+
+func (r *errReadCloser) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, r.err
+	}
+	n := len(p)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	return n, nil
+}
+
+func (r *errReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+// failingListStore wraps a MemoryStore to fail on List calls.
+type failingListStore struct {
+	*MemoryStore
+}
+
+func (s *failingListStore) List(_ context.Context, _ Filter) ([]Tape, error) {
+	return nil, errors.New("store list failure")
+}
+
+// failingSaveStore wraps a MemoryStore to fail on Save calls but still
+// support List and Load.
+type failingSaveStore struct {
+	*MemoryStore
+}
+
+func (s *failingSaveStore) Save(_ context.Context, _ Tape) error {
+	return errors.New("store save failure")
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: response body read error triggers onError
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_ResponseBodyReadError(t *testing.T) {
+	l1 := NewMemoryStore()
+	var capturedErr error
+
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       &errReadCloser{remaining: 5, err: errors.New("read failed")},
+		}, nil
+	})
+
+	l1rt := &l1RecordingTransport{
+		inner:   transport,
+		l1:      l1,
+		route:   "test",
+		onError: func(err error) { capturedErr = err },
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	// Response should still be returned even though reading body failed.
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// The onError callback should have been called with the read error.
+	if capturedErr == nil {
+		t.Fatal("expected onError to be called")
+	}
+	if !strings.Contains(capturedErr.Error(), "l1 recording read response body") {
+		t.Errorf("error = %q, want mention of l1 recording", capturedErr.Error())
+	}
+
+	// L1 should have no tape saved (because reading failed).
+	tapes, _ := l1.List(context.Background(), Filter{})
+	if len(tapes) != 0 {
+		t.Errorf("L1 has %d tapes, want 0 (body read failed)", len(tapes))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: L1 save error triggers onError
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_SaveError(t *testing.T) {
+	l1 := &failingSaveStore{MemoryStore: NewMemoryStore()}
+	var capturedErr error
+
+	transport := successTransport(200, "ok")
+
+	l1rt := &l1RecordingTransport{
+		inner:   transport,
+		l1:      l1,
+		route:   "test",
+		onError: func(err error) { capturedErr = err },
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want %q", string(body), "ok")
+	}
+	if capturedErr == nil {
+		t.Fatal("expected onError for save failure")
+	}
+	if !strings.Contains(capturedErr.Error(), "store save failure") {
+		t.Errorf("error = %q, want mention of store save failure", capturedErr.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport.onErrorSafe: nil callback does not panic
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_OnErrorSafeNilCallback(t *testing.T) {
+	l1rt := &l1RecordingTransport{
+		onError: nil,
+	}
+	// Should not panic.
+	l1rt.onErrorSafe(errors.New("test error"))
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport.onErrorSafe: non-nil callback is invoked
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_OnErrorSafeInvokesCallback(t *testing.T) {
+	var got error
+	l1rt := &l1RecordingTransport{
+		onError: func(err error) { got = err },
+	}
+	l1rt.onErrorSafe(errors.New("test error"))
+	if got == nil || got.Error() != "test error" {
+		t.Errorf("onErrorSafe did not invoke callback; got = %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.onErrorSafe: nil callback does not panic
+// ---------------------------------------------------------------------------
+
+func TestProxy_OnErrorSafeNilCallback(t *testing.T) {
+	p := &Proxy{onError: nil}
+	// Should not panic.
+	p.onErrorSafe(errors.New("test error"))
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.onErrorSafe: non-nil callback is invoked
+// ---------------------------------------------------------------------------
+
+func TestProxy_OnErrorSafeInvokesCallback(t *testing.T) {
+	var got error
+	p := &Proxy{onError: func(err error) { got = err }}
+	p.onErrorSafe(errors.New("test error"))
+	if got == nil || got.Error() != "test error" {
+		t.Errorf("onErrorSafe did not invoke callback; got = %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WithProxySanitizer: nil sanitizer defaults to no-op pipeline
+// ---------------------------------------------------------------------------
+
+func TestWithProxySanitizer_NilDefaultsToNoopPipeline(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(successTransport(200, "ok")),
+		WithProxySanitizer(nil),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	// With nil sanitizer (defaulting to no-op), L2 should have the raw header.
+	l2Tapes, _ := l2.List(context.Background(), Filter{})
+	if len(l2Tapes) != 1 {
+		t.Fatalf("L2 has %d tapes, want 1", len(l2Tapes))
+	}
+	l2Auth := l2Tapes[0].Request.Headers.Get("Authorization")
+	if l2Auth != "Bearer secret" {
+		t.Errorf("L2 Authorization=%q, want raw (no sanitization)", l2Auth)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WithProxyTLSConfig: non-http.Transport uses new Transport
+// ---------------------------------------------------------------------------
+
+func TestWithProxyTLSConfig_NonHTTPTransport(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	customRT := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	// When transport is a custom RoundTripper (not *http.Transport),
+	// WithProxyTLSConfig should replace it with a new *http.Transport.
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(customRT),
+		WithProxyTLSConfig(&tls.Config{InsecureSkipVerify: true}), //nolint:gosec
+	)
+
+	// The transport should now be an *http.Transport with the TLS config.
+	if _, ok := proxy.transport.(*http.Transport); !ok {
+		t.Errorf("transport type = %T, want *http.Transport", proxy.transport)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WithProxyProbeInterval: negative duration clamped to zero
+// ---------------------------------------------------------------------------
+
+func TestWithProxyProbeInterval_NegativeClamped(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(successTransport(200, "ok")),
+		WithProxyUpstreamURL("http://up"),
+		WithProxyHealthEndpoint(),
+		WithProxyProbeInterval(-5*time.Second),
+	)
+	defer proxy.Close() //nolint:errcheck
+
+	// The negative probe interval should be clamped to 0 (which means
+	// no probe loop). Verify by starting and confirming no panic.
+	proxy.Start()
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.RoundTrip: request body read error
+// ---------------------------------------------------------------------------
+
+func TestProxy_RequestBodyReadError(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(successTransport(200, "ok")),
+	)
+
+	req, _ := http.NewRequest("POST", "http://example.com/api", &errReadCloser{
+		remaining: 3,
+		err:       errors.New("request body read failed"),
+	})
+	resp, err := proxy.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error for request body read failure")
+	}
+	if resp != nil {
+		resp.Body.Close()
+		t.Error("expected nil response on request body read error")
+	}
+	if !strings.Contains(err.Error(), "proxy read request body") {
+		t.Errorf("error = %q, want mention of proxy read request body", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.RoundTrip: response body read error during 5xx fallback drain
+// ---------------------------------------------------------------------------
+
+func TestProxy_FallbackDrainReadError(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	// Pre-populate L1 with a cached tape so fallback succeeds.
+	tape := NewTape("", RecordedReq{
+		Method: "GET", URL: "http://example.com/api", Headers: http.Header{},
+	}, RecordedResp{
+		StatusCode: 200, Headers: http.Header{}, Body: []byte("cached"),
+	})
+	l1.Save(context.Background(), tape) //nolint:errcheck
+
+	// Transport returns a 503 with a body that errors on read.
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 503,
+			Header:     http.Header{},
+			Body:       &errReadCloser{remaining: 2, err: errors.New("drain failed")},
+		}, nil
+	})
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(transport),
+		WithProxyFallbackOn(func(err error, resp *http.Response) bool {
+			if err != nil {
+				return true
+			}
+			return resp != nil && resp.StatusCode >= 500
+		}),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected fallback success, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Should fall back to L1 cache.
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "cached" {
+		t.Errorf("body = %q, want %q", string(body), "cached")
+	}
+	if src := resp.Header.Get("X-Httptape-Source"); src != "l1-cache" {
+		t.Errorf("X-Httptape-Source = %q, want l1-cache", src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.matchFromStore: store.List error invokes onError and returns no match
+// ---------------------------------------------------------------------------
+
+func TestProxy_MatchFromStoreListError(t *testing.T) {
+	l1 := &failingListStore{MemoryStore: NewMemoryStore()}
+	l2 := NewMemoryStore()
+
+	var capturedErr error
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+		WithProxyOnError(func(err error) { capturedErr = err }),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := proxy.RoundTrip(req)
+
+	// Both L1 (failing list) and L2 (empty) miss -> original error returned.
+	if resp != nil {
+		resp.Body.Close()
+		t.Error("expected nil response")
+	}
+	if err == nil {
+		t.Fatal("expected original transport error")
+	}
+	if !strings.Contains(err.Error(), "down") {
+		t.Errorf("error = %q, want original error", err)
+	}
+
+	// onError should have been called with the store list failure.
+	if capturedErr == nil {
+		t.Fatal("expected onError for store list failure")
+	}
+	if !strings.Contains(capturedErr.Error(), "store list failure") {
+		t.Errorf("captured error = %q, want mention of store list failure", capturedErr.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.tapeToResponse: tape with nil response headers
+// ---------------------------------------------------------------------------
+
+func TestProxy_TapeToResponse_NilHeaders(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	// Pre-populate L1 with a tape that has nil headers.
+	tape := NewTape("", RecordedReq{
+		Method: "GET", URL: "http://example.com/api", Headers: http.Header{},
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    nil,
+		Body:       []byte("body"),
+	})
+	l1.Save(context.Background(), tape) //nolint:errcheck
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Should still work even with nil original headers.
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if src := resp.Header.Get("X-Httptape-Source"); src != "l1-cache" {
+		t.Errorf("X-Httptape-Source = %q, want l1-cache", src)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "body" {
+		t.Errorf("body = %q, want %q", string(body), "body")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.tapeToResponse: tape with nil body (non-SSE)
+// ---------------------------------------------------------------------------
+
+func TestProxy_TapeToResponse_NilBody(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	// Pre-populate L1 with a tape that has nil body.
+	tape := NewTape("", RecordedReq{
+		Method: "GET", URL: "http://example.com/api", Headers: http.Header{},
+	}, RecordedResp{
+		StatusCode: 204,
+		Headers:    http.Header{},
+		Body:       nil,
+	})
+	l1.Save(context.Background(), tape) //nolint:errcheck
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 204 {
+		t.Errorf("status = %d, want 204", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 0 {
+		t.Errorf("body length = %d, want 0 (nil body tape)", len(body))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.sseResponseFromTape: SSE event write error closes pipe
+// ---------------------------------------------------------------------------
+
+func TestProxy_SSEResponseFromTape_WriteErrorClosesPipe(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	// Create an SSE tape where events will be written via io.Pipe.
+	tape := NewTape("", RecordedReq{
+		Method: "GET", URL: "http://example.com/stream", Headers: http.Header{},
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+		SSEEvents: []SSEEvent{
+			{OffsetMS: 0, Data: "hello"},
+			{OffsetMS: 100, Data: "world"},
+		},
+	})
+	l1.Save(context.Background(), tape) //nolint:errcheck
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+		WithProxySSETiming(SSETimingInstant()),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Close the pipe reader immediately to trigger a write error in the
+	// goroutine. The goroutine should detect the error and close the pipe.
+	// Note: we read a tiny bit first to give the goroutine a chance to start,
+	// then close the body to cause the write error.
+	buf := make([]byte, 1)
+	resp.Body.Read(buf)
+	resp.Body.Close()
+	// The goroutine should not hang or panic.
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.fallback: body restore for second match attempt (L2 lookup)
+// ---------------------------------------------------------------------------
+
+func TestProxy_Fallback_BodyRestoredForL2Match(t *testing.T) {
+	l1 := NewMemoryStore() // empty -- force L1 miss
+	l2 := NewMemoryStore()
+
+	// Pre-populate L2 with a tape that matches by body hash.
+	postBody := []byte(`{"action":"test"}`)
+	tape := NewTape("", RecordedReq{
+		Method:   "POST",
+		URL:      "http://example.com/api",
+		Headers:  http.Header{},
+		Body:     postBody,
+		BodyHash: BodyHashFromBytes(postBody),
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{},
+		Body:       []byte("from-l2"),
+	})
+	l2.Save(context.Background(), tape) //nolint:errcheck
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+		WithProxyMatcher(NewCompositeMatcher(MethodCriterion{}, PathCriterion{})),
+	)
+
+	req, _ := http.NewRequest("POST", "http://example.com/api", bytes.NewReader(postBody))
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected L2 fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "from-l2" {
+		t.Errorf("body = %q, want %q", string(body), "from-l2")
+	}
+	if src := resp.Header.Get("X-Httptape-Source"); src != "l2-cache" {
+		t.Errorf("X-Httptape-Source = %q, want l2-cache", src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: SSE stream truncation triggers onError
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_SSETruncation(t *testing.T) {
+	l1 := NewMemoryStore()
+	var capturedErrors []string
+	var mu sync.Mutex
+
+	// Transport that returns an SSE response with a body that errors mid-stream.
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			pw.Write([]byte("data: event1\n\n"))
+			pw.CloseWithError(errors.New("upstream disconnected"))
+		}()
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       pr,
+		}, nil
+	})
+
+	l1rt := &l1RecordingTransport{
+		inner: transport,
+		l1:    l1,
+		route: "test",
+		onError: func(err error) {
+			mu.Lock()
+			capturedErrors = append(capturedErrors, err.Error())
+			mu.Unlock()
+		},
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Read the body to drive the SSE recording.
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Wait for background parser to complete.
+	time.Sleep(100 * time.Millisecond)
+
+	// The truncation error should have been reported via onError.
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, e := range capturedErrors {
+		if strings.Contains(e, "l1 SSE stream truncated") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'l1 SSE stream truncated' error, got %v", capturedErrors)
+	}
+
+	// L1 should still have the tape with the Truncated flag set.
+	tapes, _ := l1.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("L1 has %d tapes, want 1", len(tapes))
+	}
+	if !tapes[0].Response.Truncated {
+		t.Error("tape should have Truncated=true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: SSE L1 save error triggers onError
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_SSESaveError(t *testing.T) {
+	l1 := &failingSaveStore{MemoryStore: NewMemoryStore()}
+	var capturedErrors []string
+	var mu sync.Mutex
+
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: hello\n\n")),
+		}, nil
+	})
+
+	l1rt := &l1RecordingTransport{
+		inner: transport,
+		l1:    l1,
+		route: "test",
+		onError: func(err error) {
+			mu.Lock()
+			capturedErrors = append(capturedErrors, err.Error())
+			mu.Unlock()
+		},
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Read body to drive SSE recording completion.
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Wait for background parser.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, e := range capturedErrors {
+		if strings.Contains(e, "store save failure") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'store save failure' error, got %v", capturedErrors)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy.sseResponseFromTape: timing delay exercised via pipe
+// ---------------------------------------------------------------------------
+
+func TestProxy_SSEResponseFromTape_WithTiming(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	// Pre-populate L1 with an SSE tape that has non-zero offsets.
+	tape := NewTape("", RecordedReq{
+		Method: "GET", URL: "http://example.com/stream", Headers: http.Header{},
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+		SSEEvents: []SSEEvent{
+			{OffsetMS: 0, Data: "first"},
+			{OffsetMS: 80, Data: "second"},
+		},
+	})
+	l1.Save(context.Background(), tape) //nolint:errcheck
+
+	proxy := NewProxy(l1, l2,
+		WithProxyTransport(failingTransport(errors.New("down"))),
+		WithProxySSETiming(SSETimingRealtime()),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	start := time.Now()
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the full body, which goes through the pipe with timing delays.
+	var events []SSEEvent
+	parseSSEStream(resp.Body, time.Now(), func(ev SSEEvent) {
+		ev.OffsetMS = 0
+		events = append(events, ev)
+	})
+	elapsed := time.Since(start)
+
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2", len(events))
+	}
+	if events[0].Data != "first" {
+		t.Errorf("events[0].Data = %q, want %q", events[0].Data, "first")
+	}
+	if events[1].Data != "second" {
+		t.Errorf("events[1].Data = %q, want %q", events[1].Data, "second")
+	}
+
+	// The 80ms inter-event delay should be applied (within tolerance).
+	if elapsed < 50*time.Millisecond {
+		t.Errorf("elapsed %v, expected >= 50ms for 80ms timing delay", elapsed)
 	}
 }

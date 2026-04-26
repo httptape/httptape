@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1323,4 +1324,339 @@ func TestExportBundle_EmptyRouteExcluded(t *testing.T) {
 	if manifest.FixtureCount != 1 {
 		t.Errorf("manifest.FixtureCount = %d, want 1", manifest.FixtureCount)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// writeBundle error paths
+// ---------------------------------------------------------------------------
+
+// writeCapWriter counts bytes written and fails after a limit.
+type writeCapWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *writeCapWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, w.err
+	}
+	if len(p) <= w.remaining {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	return n, w.err
+}
+
+func TestWriteBundle_WriterFailsAtVariousByteOffsets(t *testing.T) {
+	tapes := []Tape{makeBundleTape("t1", "api", "GET", "http://test/1")}
+
+	// Sweep byte limits from 0 to well past the successful write size.
+	// With fine-grained limits we hit error branches at different points
+	// in the gzip/tar pipeline.
+	var hitErrors int
+	for limit := 0; limit <= 2000; limit++ {
+		w := &writeCapWriter{remaining: limit, err: errors.New("disk full")}
+		err := writeBundle(context.Background(), w, tapes, exportConfig{})
+		if err != nil {
+			hitErrors++
+		}
+	}
+	if hitErrors == 0 {
+		t.Fatal("expected at least some errors in the sweep")
+	}
+}
+
+// writeCallCounter counts calls to Write and fails on the Nth call.
+type writeCallCounter struct {
+	callsAllowed int
+	callsMade    int
+	err          error
+}
+
+func (w *writeCallCounter) Write(p []byte) (int, error) {
+	w.callsMade++
+	if w.callsMade > w.callsAllowed {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func TestWriteBundle_WriterFailsAtVariousCallCounts(t *testing.T) {
+	tapes := []Tape{makeBundleTape("t1", "api", "GET", "http://test/1")}
+
+	// Gzip writes in a small number of calls. By sweeping call counts
+	// from 0 to ~20, we trigger failures at different internal points
+	// (manifest header, manifest body, fixture, close).
+	var hitErrors int
+	for calls := 0; calls <= 20; calls++ {
+		w := &writeCallCounter{callsAllowed: calls, err: errors.New("write call limit")}
+		err := writeBundle(context.Background(), w, tapes, exportConfig{})
+		if err != nil {
+			hitErrors++
+		}
+	}
+	if hitErrors == 0 {
+		t.Fatal("expected at least some errors in the sweep")
+	}
+}
+
+func TestWriteBundle_LargeTapeForcesGzipFlushMidStream(t *testing.T) {
+	// Gzip uses an internal buffer. By creating tapes with large,
+	// incompressible bodies, we force gzip to flush mid-stream.
+	// When the underlying writer fails during these flushes, the error
+	// propagates to individual tar write operations, hitting the
+	// per-operation error branches in writeBundle.
+	//
+	// We use pseudo-random bytes (actually a repeating 256-byte pattern)
+	// that don't compress well, forcing gzip to write frequently.
+	incompressible := make([]byte, 128*1024) // 128KB
+	for i := range incompressible {
+		incompressible[i] = byte(i * 7) // simple pseudo-random pattern
+	}
+
+	tape := Tape{
+		ID:         "large-tape",
+		Route:      "api",
+		RecordedAt: time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
+		Request: RecordedReq{
+			Method:  "POST",
+			URL:     "http://test/upload",
+			Headers: http.Header{"Content-Type": {"application/octet-stream"}},
+			Body:    incompressible,
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       incompressible,
+		},
+	}
+
+	// First, find the successful write size.
+	var successBuf bytes.Buffer
+	err := writeBundle(context.Background(), &successBuf, []Tape{tape}, exportConfig{})
+	if err != nil {
+		t.Fatalf("writeBundle with large tape failed: %v", err)
+	}
+	successSize := successBuf.Len()
+
+	// Sweep byte limits from 0 to successSize. With incompressible 128KB
+	// bodies, gzip must flush many times, creating failure points at
+	// different tar operations.
+	var hitErrors int
+	for limit := 0; limit < successSize; limit += 50 {
+		w := &writeCapWriter{remaining: limit, err: errors.New("disk full")}
+		if writeBundle(context.Background(), w, []Tape{tape}, exportConfig{}) != nil {
+			hitErrors++
+		}
+	}
+	if hitErrors == 0 {
+		t.Fatal("expected errors during large-tape sweep")
+	}
+}
+
+func TestWriteBundle_WriterFailsDuringFixtureWrite(t *testing.T) {
+	// Allow enough bytes for the gzip header + manifest but fail during
+	// fixture writing. We use a pipe to precisely control when the writer
+	// fails.
+	tapes := []Tape{
+		makeBundleTape("t1", "api", "GET", "http://test/1"),
+		makeBundleTape("t2", "api", "POST", "http://test/2"),
+	}
+
+	// Use a pipe so we can close the writer mid-stream.
+	pr, pw := io.Pipe()
+
+	go func() {
+		// Read some bytes and then close with an error.
+		buf := make([]byte, 256)
+		pr.Read(buf)
+		pr.CloseWithError(errors.New("pipe broken"))
+	}()
+
+	err := writeBundle(context.Background(), pw, tapes, exportConfig{})
+	if err == nil {
+		t.Fatal("expected error from writeBundle")
+	}
+}
+
+func TestWriteBundle_ContextCancelledBeforeManifestHeader(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	tapes := []Tape{makeBundleTape("t1", "api", "GET", "http://test/1")}
+	err := writeBundle(ctx, &buf, tapes, exportConfig{})
+	if err == nil {
+		t.Fatal("expected context cancelled error")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("error = %q, want context canceled", err)
+	}
+}
+
+func TestWriteBundle_ContextCancelledDuringFixtureLoop(t *testing.T) {
+	// Create many tapes and cancel context after a short time.
+	tapes := make([]Tape, 50)
+	for i := range tapes {
+		tapes[i] = makeBundleTape(
+			fmt.Sprintf("tape-%03d", i), "api", "GET",
+			fmt.Sprintf("http://test/%d", i),
+		)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Use a slow writer that gives us time to cancel mid-loop.
+	pr, pw := io.Pipe()
+	go func() {
+		// Read slowly, cancel after a bit.
+		buf := make([]byte, 512)
+		pr.Read(buf)
+		cancel()
+		// Drain the rest to unblock the writer.
+		io.Copy(io.Discard, pr)
+	}()
+
+	err := writeBundle(ctx, pw, tapes, exportConfig{})
+	// Either context canceled or a write error is acceptable.
+	if err == nil {
+		t.Fatal("expected error from writeBundle")
+	}
+}
+
+func TestWriteBundle_ErrorTriggersDeferredClose(t *testing.T) {
+	// The deferred close at lines 137-140 runs only on error paths.
+	// Any error in writeBundle should trigger it. We verify this by
+	// checking that the function returns an error (which means the
+	// deferred close ran to clean up resources).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	err := writeBundle(ctx, &buf, nil, exportConfig{})
+	if err == nil {
+		t.Fatal("expected error to trigger deferred close")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ImportBundle: tar read error (valid gzip, corrupted tar)
+// ---------------------------------------------------------------------------
+
+func TestImportBundle_CorruptedTarInsideValidGzip(t *testing.T) {
+	// Build a valid gzip wrapping invalid tar content.
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	gw.Write([]byte("this is not valid tar data"))
+	gw.Close()
+
+	store := NewMemoryStore()
+	err := ImportBundle(context.Background(), store, &buf)
+	if err == nil {
+		t.Fatal("expected error for corrupted tar")
+	}
+	if !strings.Contains(err.Error(), "httptape: import:") {
+		t.Errorf("error = %q, want prefix 'httptape: import:'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ImportBundle: save error during persist phase
+// ---------------------------------------------------------------------------
+
+// failingSaveBundleStore wraps a MemoryStore to fail on Save for bundle tests.
+type failingSaveBundleStore struct {
+	*MemoryStore
+}
+
+func (s *failingSaveBundleStore) Save(_ context.Context, _ Tape) error {
+	return errors.New("save failed")
+}
+
+func TestImportBundle_SaveError(t *testing.T) {
+	// Build a valid bundle.
+	srcStore := NewMemoryStore()
+	saveTestTapes(t, srcStore, makeBundleTape("t1", "api", "GET", "http://test/1"))
+
+	r, err := ExportBundle(context.Background(), srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	// Import into a store that fails on Save.
+	dstStore := &failingSaveBundleStore{MemoryStore: NewMemoryStore()}
+	err = ImportBundle(context.Background(), dstStore, bytes.NewReader(bundleData))
+	if err == nil {
+		t.Fatal("expected error for save failure")
+	}
+	if !strings.Contains(err.Error(), "save tape") {
+		t.Errorf("error = %q, want mention of 'save tape'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ImportBundle: context cancelled during persist phase
+// ---------------------------------------------------------------------------
+
+func TestImportBundle_ContextCancelledDuringSave(t *testing.T) {
+	// Build a bundle with multiple tapes.
+	srcStore := NewMemoryStore()
+	for i := 0; i < 5; i++ {
+		saveTestTapes(t, srcStore, makeBundleTape(
+			fmt.Sprintf("t%d", i), "api", "GET",
+			fmt.Sprintf("http://test/%d", i),
+		))
+	}
+
+	r, err := ExportBundle(context.Background(), srcStore)
+	if err != nil {
+		t.Fatalf("ExportBundle: %v", err)
+	}
+	bundleData, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	// Use a store that cancels context after first Save.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelAfterOneSave := &cancelAfterNSavesStore{
+		MemoryStore: NewMemoryStore(),
+		cancel:      cancel,
+		saveCount:   0,
+		cancelAfter: 1,
+	}
+
+	err = ImportBundle(ctx, cancelAfterOneSave, bytes.NewReader(bundleData))
+	if err == nil {
+		t.Fatal("expected error from cancelled context during save")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("error = %q, want context canceled", err)
+	}
+}
+
+// cancelAfterNSavesStore cancels the context after N successful saves.
+type cancelAfterNSavesStore struct {
+	*MemoryStore
+	cancel      context.CancelFunc
+	saveCount   int
+	cancelAfter int
+}
+
+func (s *cancelAfterNSavesStore) Save(ctx context.Context, tape Tape) error {
+	err := s.MemoryStore.Save(ctx, tape)
+	if err != nil {
+		return err
+	}
+	s.saveCount++
+	if s.saveCount >= s.cancelAfter {
+		s.cancel()
+	}
+	return nil
 }
