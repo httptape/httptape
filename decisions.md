@@ -15683,6 +15683,350 @@ Client <- error or fallback response
 
 ---
 
+### ADR-46: SECURITY.md supported-versions policy
+
+**Date**: 2026-04-23
+**Issue**: #216
+**Status**: Accepted
+
+#### Context
+
+SECURITY.md's "Supported versions" section (lines 3-12) still describes httptape
+as "pre-release" and references v0.9.0 as a future milestone. The project is at
+v0.13.1 with 8 tagged releases. The stale text could confuse security reporters
+about which versions are covered by the policy.
+
+#### Decision
+
+Replace the "Supported versions" section (lines 3-12) with a generic
+"latest minor release line" policy. The replacement uses prose plus a two-row
+table. The text refers to "the latest minor release line" generically so that
+it does not go stale each time a new minor ships.
+
+**Exact replacement text for SECURITY.md lines 3-12** (the `## Supported versions`
+heading through the end of the table):
+
+```markdown
+## Supported versions
+
+httptape is pre-1.0. Only the **latest minor release line** receives security
+fixes. Older minor lines are unsupported.
+
+| Version                        | Supported         |
+|--------------------------------|-------------------|
+| Latest minor line (e.g. 0.13.x) | Yes               |
+| Older minor lines              | No                |
+| `main` branch                  | Yes (best-effort) |
+
+When a new minor version ships, the previous minor line becomes unsupported.
+This policy will be revisited at 1.0.
+```
+
+No other sections of SECURITY.md are changed.
+
+#### Consequences
+
+- The "Supported versions" section no longer goes stale on each release.
+- The project commits to patching only the latest minor, which is sustainable
+  for a small pre-1.0 team. This is a real policy decision, not just editorial.
+- Post-1.0, the policy should be revisited to consider LTS or N-1 support.
+
+---
+
+### ADR-47: Sanitization documentation hardening (FakeFields seed, ImportBundle, Proxy L1)
+
+**Date**: 2026-04-23
+**Issue**: #217
+**Status**: Accepted
+
+#### Context
+
+The 2026-04-25 sanitization boundary audit (see `~/notes/httptape/audit-2026-04-25-sanitization.md`)
+confirmed that httptape's sanitization boundary is correctly enforced in code -- no
+critical or high security gaps exist. However, three documentation gaps were identified
+that could lead embedders to weaken sanitization guarantees through misuse:
+
+1. **FakeFields seed guidance**: The `FakeFields` godoc does not warn that an empty or
+   shared seed weakens deterministic faking. Worse, `docs/sanitization.md:143` says
+   "It does not need to be secret" which directly contradicts the audit finding that the
+   seed is moderately sensitive (anyone with the seed can predict fakes for any input).
+
+2. **ImportBundle re-sanitization policy**: `ImportBundle` does not re-sanitize on import.
+   This is the correct design (re-sanitization would corrupt already-faked values), but
+   the assumption is undocumented. Embedders importing hand-edited or untrusted bundles
+   have no warning that the imported tapes are stored as-is.
+
+3. **Proxy L1 raw-storage constraint**: L1 stores unsanitized (raw) tapes. The design
+   assumes L1 is ephemeral (in-memory), but neither the `Proxy` godoc nor `NewProxy`
+   warn that swapping L1 with a persistent store would persist raw data to disk.
+
+Additionally, during PM refinement, a factual error was identified in
+`docs/sanitization.md:143`: the sentence "It does not need to be secret -- it is used
+for determinism, not security" must be corrected.
+
+#### Decision
+
+This is a documentation-only change delivered as a single PR. All three sub-items share
+the same theme (sanitization documentation hardening from the same audit) and are small
+enough to review atomically.
+
+**No runtime guard for the Proxy L1 constraint.** The L1 store is typed as `Store`
+(interface), and adding a runtime type check (`_, ok := l1.(*MemoryStore)`) would
+be fragile -- it would not catch custom ephemeral Store implementations and would
+false-positive on wrapper types embedding `*MemoryStore`. The documentation approach is
+sufficient: the godoc, the narrative docs, and the audit all clearly state the
+constraint. A compile-time or runtime guard may be revisited in a future issue if
+embedder misuse is observed in practice, but adding one now would be speculative
+engineering with poor type-safety properties.
+
+##### Sub-item (a): FakeFields seed warning
+
+**File: `sanitizer.go` -- FakeFields godoc (insert after line 344, before the "Paths use..." paragraph)**
+
+Insert the following paragraph between the existing seed description and the paths section:
+
+```
+// The seed must be non-empty and unique to your project. Treat it as a
+// moderately sensitive value: anyone who knows the seed can predict the
+// fake output for any input. Do not use an empty string, a default
+// placeholder, or a seed shared across unrelated projects. Store it
+// alongside other project configuration (e.g. environment variables),
+// not in public source code.
+```
+
+This replaces the existing lines 342-344:
+
+```
+// The seed is a project-level secret used as the HMAC key. The same seed
+// and input value always produce the same fake output, preserving
+// cross-fixture consistency. Different seeds produce different fakes.
+```
+
+with:
+
+```
+// The seed is a project-level HMAC key. The same seed and input value
+// always produce the same fake output, preserving cross-fixture
+// consistency. Different seeds produce different fakes.
+//
+// The seed must be non-empty and unique to your project. Treat it as a
+// moderately sensitive value: anyone who knows the seed can predict the
+// fake output for any input. Do not use an empty string, a default
+// placeholder, or a seed shared across unrelated projects. Store it
+// alongside other project configuration (e.g. environment variables),
+// not in public source code.
+```
+
+**File: `faker.go` -- FakeFieldsWith godoc (lines 386-387)**
+
+Replace:
+
+```
+// The seed is a project-level secret used as the HMAC key. The fields map
+// associates JSONPath-like paths with specific Faker implementations.
+```
+
+with:
+
+```
+// The seed is a project-level HMAC key. The fields map associates
+// JSONPath-like paths with specific Faker implementations. See FakeFields
+// for seed sensitivity guidance.
+```
+
+**File: `docs/sanitization.md` -- lines 139-143 ("The seed parameter" section)**
+
+Replace:
+
+```
+### The seed parameter
+
+The first argument is a project-level seed used as the HMAC key. Different seeds produce different fakes. The same seed and input always produce the same output.
+
+Choose a seed that is unique to your project. It does not need to be secret -- it is used for determinism, not security.
+```
+
+with:
+
+```
+### The seed parameter
+
+The first argument is a project-level seed used as the HMAC key. Different seeds produce different fakes. The same seed and input always produce the same output.
+
+The seed must be non-empty and unique to your project. Treat it as a moderately sensitive value: anyone who knows the seed can predict the fake output for any input. Do not use an empty string, a default placeholder, or a seed shared across unrelated projects. Store it alongside other project configuration (e.g. environment variables), not in public source code.
+```
+
+##### Sub-item (b): ImportBundle re-sanitization policy
+
+**File: `bundle.go` -- ImportBundle godoc (insert after line 219, before the func signature)**
+
+Add the following paragraph after the existing validation paragraph (line 219) and
+before the `func ImportBundle` line:
+
+```
+// ImportBundle does not re-sanitize imported tapes. Bundles produced by
+// ExportBundle contain already-sanitized data, so re-sanitization would
+// corrupt deterministically faked values. If you import a bundle from an
+// untrusted or hand-edited source, validate its contents externally before
+// import -- ImportBundle stores tapes exactly as they appear in the bundle.
+```
+
+**File: `docs/import-export.md` -- after the "Validation" section (after line 133)**
+
+Add a new section after "Validation" and before "Size limits":
+
+```
+### Sanitization policy
+
+ImportBundle does not re-sanitize imported tapes. Bundles produced by ExportBundle contain already-sanitized data (sanitization happens at recording time, before tapes reach the store). Re-sanitization on import would corrupt deterministically faked values by double-faking them.
+
+If you import a bundle from an untrusted or hand-edited source, validate its contents externally before import. ImportBundle stores tapes exactly as they appear in the bundle.
+```
+
+##### Sub-item (c): Proxy L1 raw-storage constraint
+
+**File: `proxy.go` -- Proxy type godoc (insert after line 23, before "On success:")**
+
+Add the following paragraph after "...saving raw (unsanitized) tapes to L1
+before CachingTransport sanitizes and saves to L2." and before "On success:":
+
+```
+// L1 must be an ephemeral, in-memory store (typically *MemoryStore). Because
+// L1 holds unsanitized data, using a persistent store for L1 would bypass
+// the sanitize-on-write guarantee and persist raw secrets and PII to disk.
+```
+
+**File: `proxy.go` -- NewProxy godoc (insert after line 444, before "Both l1 and l2...")**
+
+Add the following line after the defaults list and before the panic documentation:
+
+```
+// L1 must be an ephemeral store (typically NewMemoryStore()) because it holds
+// unsanitized data. See the Proxy type documentation for details.
+//
+```
+
+**File: `docs/proxy.md` -- L1 section (lines 40-45, "### L1: In-memory cache (raw)")**
+
+Replace:
+
+```
+### L1: In-memory cache (raw)
+
+- Backed by a `MemoryStore`
+- Contains unsanitized (raw) responses -- best fidelity within a session
+- Lost when the process exits
+- Checked first during fallback (lowest latency, best data quality)
+```
+
+with:
+
+```
+### L1: In-memory cache (raw)
+
+- Backed by a `MemoryStore`
+- Contains unsanitized (raw) responses -- best fidelity within a session
+- Lost when the process exits
+- Checked first during fallback (lowest latency, best data quality)
+
+**L1 must be an ephemeral, in-memory store.** Because L1 holds unsanitized data (raw secrets, PII), using a persistent store for L1 would bypass httptape's sanitize-on-write guarantee. Always use `NewMemoryStore()` for L1.
+```
+
+#### File layout
+
+All changes are documentation edits to existing files. No new files.
+
+| File | Change |
+|---|---|
+| `sanitizer.go` | FakeFields godoc: replace seed paragraph (lines 342-344), insert sensitivity warning |
+| `faker.go` | FakeFieldsWith godoc: update seed line (lines 386-387), add cross-reference |
+| `docs/sanitization.md` | Replace "The seed parameter" section (lines 139-143) |
+| `bundle.go` | ImportBundle godoc: insert re-sanitization policy paragraph (after line 219) |
+| `docs/import-export.md` | Add "Sanitization policy" section after "Validation" |
+| `proxy.go` | Proxy type godoc: insert L1 ephemeral constraint (after line 23); NewProxy godoc: insert L1 note (after line 444) |
+| `docs/proxy.md` | Expand L1 section (lines 40-45) with ephemeral constraint callout |
+
+#### Test strategy
+
+No new tests required. This is a documentation-only change with no behavior modifications.
+The existing test suite (`go test ./...`) must continue to pass without modification.
+
+#### Consequences
+
+- Embedders who read the godoc or narrative docs will understand the seed sensitivity
+  model, the import trust assumption, and the L1 ephemeral constraint.
+- The factual error in `docs/sanitization.md:143` ("does not need to be secret") is
+  corrected, eliminating a contradiction with the audit findings.
+- No runtime behavior change. The Proxy L1 constraint remains documentation-enforced.
+  If embedder misuse is observed in practice, a follow-up issue can add a runtime
+  warning (e.g., `log.Printf` in `NewProxy` when L1 is `*FileStore`), but this ADR
+  deliberately defers that to avoid speculative type-checking against a single concrete
+  implementation.
+- The single-PR delivery keeps the review atomic and avoids three trivially small PRs
+  for the same audit theme.
+
+---
+
+### ADR-48: CLAUDE.md package structure and layer rules drift fix
+
+**Date**: 2026-04-23
+**Issue**: #214
+**Status**: Accepted
+
+#### Context
+
+The "Package structure" section of CLAUDE.md lists 28 files but the repo root
+contains 45 `.go` files plus `config.schema.json`. 19 files shipped post-spec
+without spec updates, including major features (Proxy, SSE, Health, TLS, Mock,
+templating, faker, diff, fixtures). The 2026-04-25 architecture audit flagged
+this as a rule-7 failure (HIGH priority).
+
+#### Decision
+
+Update CLAUDE.md with three scoped changes. No code changes.
+
+**1. Replace the "Package structure" code block** (lines 50-79) with the
+complete alphabetically-sorted list of all 46 files (45 `.go` +
+`config.schema.json`), each with a one-line role description. The exact list
+is provided in issue #214's spec and has been verified against `ls *.go`.
+
+**2. Update the "Layer rules" section** to account for new file categories.
+Replace the current four-bullet layer rules with:
+
+- **Core types** (`tape.go`, `sse.go:SSEEvent`): zero imports outside stdlib.
+  Pure value types with no I/O.
+- **Ports** (`store.go`, top of `matcher.go`, `faker.go:Faker`): interfaces
+  only. No implementations in the same declaration block.
+- **Adapters** (`store_file.go`, `store_memory.go`): implement port interfaces.
+  May use stdlib I/O.
+- **Services** (`recorder.go`, `server.go`, `sanitizer.go`,
+  `caching_transport.go`, `proxy.go`, `mock.go`, `diff.go`, `health.go`):
+  orchestrate core types and ports. Accept ports via constructor injection.
+- **Helpers** (`tls.go`, `fixtures.go`, `templating.go`): pure or near-pure
+  utility functions. No interfaces, no constructor injection. Called by
+  services or directly by embedders.
+
+Keep the existing explanatory paragraph about single-package hexagonal
+boundaries.
+
+**3. Add a maintenance note** after the package structure block:
+
+> **Maintenance note**: when adding a new `.go` file to the package root, add
+> it to this list in the same PR. This file list is the source of truth that
+> orients contributors and AI agents.
+
+#### Consequences
+
+- CLAUDE.md accurately reflects the on-disk package structure.
+- The maintenance note establishes a "keep current" rule to prevent future drift.
+- The `Faker` interface is now explicitly called out as a port, which matches
+  its actual role (pluggable faking strategy injected into the sanitizer).
+- `sse.go` has a dual classification: `SSEEvent` is a core value type, but the
+  file also contains I/O helpers for SSE parsing/replay (service behavior).
+  This is acceptable for a single-package library; the layer rules call out
+  the value type explicitly.
+
+---
 
 ## PM Log
 
@@ -15918,3 +16262,54 @@ Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179
 **Priority rationale:** This is the highest-priority post-launch feature. VibeWarden integration blocks on CachingTransport existing as a library primitive. The LinkGuard demo use case alone justifies the work — it turns a recurring LLM API cost into a one-time recording.
 
 **Both issues:** `READY_FOR_ARCH` status comments posted. Architect not dispatched — returned to user.
+
+### 2026-04-23 -- SECURITY.md stale version reference (#216)
+
+**Driver:** 2026-04-25 documentation audit (item 5). SECURITY.md "Supported versions" section still says "pre-release" and references v0.9.0 as a future milestone. Project is at v0.13.1 with 8 tagged releases.
+
+**Actions taken:**
+
+1. **Refined #216** -- `docs: SECURITY.md references v0.9.0 as future milestone (we're at v0.13.1)`
+   - Issue body rewritten with full PM spec: problem statement, user story, 7 acceptance criteria, 3 architect decisions, explicit out-of-scope.
+   - PM recommendation: "latest minor release line only" as the supported-versions policy. Generic wording so the section does not go stale on each new minor release.
+   - Remove "pre-release" framing entirely, not just version-bump.
+   - Rest of SECURITY.md audited and confirmed current (reporting flow, contact email, response times, scope sections).
+   - Documentation-only change, no code impact, no ADR needed.
+   - Labels: `documentation`, `priority:low`, `chore`, `audit:2026-04`.
+   - Status: `READY_FOR_ARCH`.
+
+**Open questions:** None. Straightforward doc fix.
+
+### 2026-04-23 -- CLAUDE.md package structure drift (#214)
+
+**Driver:** 2026-04-25 architecture audit (rule 7) and documentation audit (item 4). The "Package structure" section of CLAUDE.md lists 28 files but the repo contains 45 `.go` files. 19 files shipped without spec updates, including major capabilities: Proxy, SSE, Health, TLS, MockServer, Faker, Diff, Fixtures, Templating.
+
+**Actions taken:**
+
+1. **Refined #214** -- `docs: CLAUDE.md package structure missing 19 files (Proxy, SSE, Health, TLS, etc.)`
+   - Issue body rewritten with full PM spec: problem statement, user story, complete 45-file list with one-line role descriptions, 7 acceptance criteria, out-of-scope list.
+   - Three deliverables specified: (a) replace package structure block with complete alphabetically-sorted file list, (b) architect reviews layer-rules section for new ports/services/utilities, (c) add maintenance note to prevent future drift.
+   - Explicitly docs-only: no code changes in scope.
+   - Architect judgment call flagged: classify 19 new files as ports, services, or utilities in the layer-rules section.
+   - Labels: `documentation`, `priority:high`, `chore`, `audit:2026-04`, `status:ready-for-dev`.
+   - Status: `READY_FOR_ARCH`.
+
+**Open questions:** None. The file list is derived directly from `ls *.go` and godoc comments; no ambiguity remains.
+
+### 2026-04-23 -- Sanitization documentation hardening (#217)
+
+**Driver:** 2026-04-25 sanitization boundary audit. No code defects found. Three documentation gaps identified that could lead embedders to weaken sanitization guarantees through misuse.
+
+**Actions taken:**
+
+1. **Refined #217** -- `docs: sanitization documentation hardening (FakeFields seed, ImportBundle, Proxy L1)`
+   - Issue body rewritten with full PM spec: problem statement, user story, three sub-items with precise where-to-edit maps, 15 acceptance criteria.
+   - Sub-item (a): FakeFields godoc + docs/sanitization.md seed guidance. Current docs misleadingly say seed "does not need to be secret" -- audit clarifies it is moderately sensitive. Three points: non-empty, project-specific, moderately sensitive.
+   - Sub-item (b): ImportBundle re-sanitization policy. Document that no re-sanitization happens on import (correct design) and warn about untrusted bundles. Godoc + docs/import-export.md.
+   - Sub-item (c): Proxy L1 raw-storage constraint. Document that L1 must be ephemeral/in-memory because it stores unsanitized data. Godoc + docs/proxy.md.
+   - PM recommends single-PR delivery (all three are small, related, docs-only).
+   - PM recommends document-only approach for Proxy L1 constraint (no runtime guard in this issue).
+   - Labels: `documentation`, `priority:medium`, `audit:2026-04`.
+   - Status: `READY_FOR_ARCH`.
+
+**Open questions for architect:** Should `NewProxy` enforce the L1 ephemeral constraint at runtime (refuse or warn if L1 is a `*FileStore`)? PM recommends document-only for now. If architect wants enforcement, it should be a follow-up issue.
