@@ -1750,3 +1750,224 @@ func TestSSERecordingReader_ConcurrentReads(t *testing.T) {
 		t.Errorf("got %d events, want 100", len(events))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// sseTimingMode seal method coverage
+// ---------------------------------------------------------------------------
+
+func TestSSETimingMode_SealMethodsAreCallable(t *testing.T) {
+	// The sseTimingMode() methods are seal methods that prevent external
+	// implementations. They are no-op but should be covered for completeness.
+	// We exercise them indirectly through the SSETimingMode interface.
+	modes := []SSETimingMode{
+		SSETimingRealtime(),
+		SSETimingAccelerated(1.0),
+		SSETimingInstant(),
+	}
+	for _, m := range modes {
+		// Call the seal method via the interface. It's a no-op, but this
+		// proves the method exists and executes without panic.
+		m.sseTimingMode()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isSSEContentType: mime.ParseMediaType error fallback
+// ---------------------------------------------------------------------------
+
+func TestIsSSEContentType_FallbackOnMalformedMediaType(t *testing.T) {
+	// A content type that mime.ParseMediaType fails to parse but still
+	// has the right prefix should match via the fallback path.
+	tests := []struct {
+		name string
+		ct   string
+		want bool
+	}{
+		{
+			name: "malformed params but correct type prefix triggers fallback match",
+			ct:   "text/event-stream; ===invalid===",
+			want: true,
+		},
+		{
+			name: "malformed params with wrong type prefix does not match",
+			ct:   "application/json; ===invalid===",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSSEContentType(tt.ct); got != tt.want {
+				t.Errorf("isSSEContentType(%q) = %v, want %v", tt.ct, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// writeSSEEvent: error paths for each field type
+// ---------------------------------------------------------------------------
+
+// limitWriter allows the first N bytes to be written, then returns an error.
+// This lets us trigger write failures at specific points in writeSSEEvent.
+type limitWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *limitWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, w.err
+	}
+	if len(p) <= w.remaining {
+		w.remaining -= len(p)
+		return len(p), nil
+	}
+	n := w.remaining
+	w.remaining = 0
+	return n, w.err
+}
+
+func TestWriteSSEEvent_ErrorOnEventField(t *testing.T) {
+	// Fail after writing 0 bytes -- the "event:" field write should fail.
+	w := &limitWriter{remaining: 0, err: errors.New("disk full")}
+	err := writeSSEEvent(w, SSEEvent{Type: "update", Data: "hello"})
+	if err == nil {
+		t.Fatal("expected error writing event field")
+	}
+	if !strings.Contains(err.Error(), "write event field") {
+		t.Errorf("error = %q, want it to mention 'write event field'", err)
+	}
+}
+
+func TestWriteSSEEvent_ErrorOnIDField(t *testing.T) {
+	// Allow "event:" line to succeed, then fail on "id:" line.
+	eventLine := "event: update\n"
+	w := &limitWriter{remaining: len(eventLine), err: errors.New("disk full")}
+	err := writeSSEEvent(w, SSEEvent{Type: "update", ID: "42", Data: "hello"})
+	if err == nil {
+		t.Fatal("expected error writing id field")
+	}
+	if !strings.Contains(err.Error(), "write id field") {
+		t.Errorf("error = %q, want it to mention 'write id field'", err)
+	}
+}
+
+func TestWriteSSEEvent_ErrorOnRetryField(t *testing.T) {
+	// Allow "event:" and "id:" lines, then fail on "retry:".
+	written := "event: update\nid: 42\n"
+	w := &limitWriter{remaining: len(written), err: errors.New("disk full")}
+	err := writeSSEEvent(w, SSEEvent{Type: "update", ID: "42", Retry: 5000, Data: "hello"})
+	if err == nil {
+		t.Fatal("expected error writing retry field")
+	}
+	if !strings.Contains(err.Error(), "write retry field") {
+		t.Errorf("error = %q, want it to mention 'write retry field'", err)
+	}
+}
+
+func TestWriteSSEEvent_ErrorOnTerminator(t *testing.T) {
+	// Allow everything except the final blank line.
+	dataLine := "data: hello\n"
+	w := &limitWriter{remaining: len(dataLine), err: errors.New("disk full")}
+	err := writeSSEEvent(w, SSEEvent{Data: "hello"})
+	if err == nil {
+		t.Fatal("expected error writing terminator")
+	}
+	if !strings.Contains(err.Error(), "write event terminator") {
+		t.Errorf("error = %q, want it to mention 'write event terminator'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// replaySSEEvents: context cancelled between delay and write
+// ---------------------------------------------------------------------------
+
+func TestReplaySSEEvents_ContextCancelledAfterDelay(t *testing.T) {
+	// Create events where the second event has a small delay. Cancel the
+	// context during that delay window so the post-delay ctx.Err() check
+	// catches it.
+	events := []SSEEvent{
+		{OffsetMS: 0, Data: "first"},
+		{OffsetMS: 50, Data: "second"},
+	}
+
+	rec := httptest.NewRecorder()
+	flusher := http.ResponseWriter(rec).(http.Flusher)
+
+	// Cancel context right after the first event is written.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Wait enough for the first event to be written and the delay
+		// to start, but cancel before it finishes.
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	err := replaySSEEvents(ctx, rec, flusher, events, SSETimingRealtime())
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// replaySSEEvents: write error propagated
+// ---------------------------------------------------------------------------
+
+// failingResponseWriter is an http.ResponseWriter that fails on Write.
+type failingResponseWriter struct {
+	header http.Header
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+func (w *failingResponseWriter) Write(_ []byte) (int, error) {
+	return 0, errors.New("broken pipe")
+}
+func (w *failingResponseWriter) WriteHeader(_ int) {}
+
+// noopFlusher implements http.Flusher as a no-op.
+type noopFlusher struct{}
+
+func (noopFlusher) Flush() {}
+
+func TestReplaySSEEvents_ContextCancelledBetweenZeroDelayEvents(t *testing.T) {
+	// When the delay is 0, the timer select is skipped and the post-delay
+	// ctx.Err() check at line 284 is the only cancellation check point.
+	// This test cancels the context before replay starts, so the first
+	// event's post-delay check catches it immediately.
+	events := []SSEEvent{
+		{OffsetMS: 0, Data: "first"},
+		{OffsetMS: 0, Data: "second"},
+	}
+
+	rec := httptest.NewRecorder()
+	flusher := http.ResponseWriter(rec).(http.Flusher)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before replay begins
+
+	err := replaySSEEvents(ctx, rec, flusher, events, SSETimingInstant())
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestReplaySSEEvents_WriteErrorPropagated(t *testing.T) {
+	events := []SSEEvent{
+		{OffsetMS: 0, Data: "hello"},
+	}
+
+	w := &failingResponseWriter{header: http.Header{}}
+	err := replaySSEEvents(context.Background(), w, noopFlusher{}, events, SSETimingInstant())
+	if err == nil {
+		t.Fatal("expected write error")
+	}
+	if !strings.Contains(err.Error(), "broken pipe") {
+		t.Errorf("error = %q, want it to mention 'broken pipe'", err)
+	}
+}
