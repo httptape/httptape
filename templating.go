@@ -313,7 +313,11 @@ func resolveExpr(expr string, ctx *templateCtx) (string, bool) {
 		return resolveNow(args), true
 
 	case pe.name == "uuid":
-		return resolveUUID(ctx), true
+		val, err := resolveUUID(ctx)
+		if err != nil {
+			return "", false
+		}
+		return val, true
 
 	case pe.name == "randomHex":
 		val, err := resolveRandomHex(args, ctx)
@@ -407,14 +411,17 @@ func resolveNow(args map[string]string) string {
 }
 
 // resolveUUID generates a random UUID v4 string using ctx.randSource.
-func resolveUUID(ctx *templateCtx) string {
+// Returns an error if the random source fails.
+func resolveUUID(ctx *templateCtx) (string, error) {
 	var buf [16]byte
-	_, _ = io.ReadFull(ctx.randSource, buf[:])
+	if _, err := io.ReadFull(ctx.randSource, buf[:]); err != nil {
+		return "", fmt.Errorf("resolveUUID: crypto/rand read: %w", err)
+	}
 	// Set version 4 and variant RFC 4122.
 	buf[6] = (buf[6] & 0x0f) | 0x40
 	buf[8] = (buf[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
 }
 
 // resolveRandomHex generates a random hex string of the specified length.
@@ -430,7 +437,9 @@ func resolveRandomHex(args map[string]string, ctx *templateCtx) (string, error) 
 	}
 	nBytes := (length + 1) / 2
 	buf := make([]byte, nBytes)
-	_, _ = io.ReadFull(ctx.randSource, buf)
+	if _, err := io.ReadFull(ctx.randSource, buf); err != nil {
+		return "", fmt.Errorf("randomHex: crypto/rand read: %w", err)
+	}
 	return hex.EncodeToString(buf)[:length], nil
 }
 
@@ -455,10 +464,23 @@ func resolveRandomInt(args map[string]string, ctx *templateCtx) (string, error) 
 	if minVal > maxVal {
 		return "", fmt.Errorf("randomInt min (%d) must be <= max (%d)", minVal, maxVal)
 	}
+	if minVal == maxVal {
+		return strconv.FormatInt(minVal, 10), nil
+	}
 
-	rangeSize := maxVal - minVal + 1
-	n, _ := rand.Int(ctx.randSource, big.NewInt(rangeSize))
-	result := minVal + n.Int64()
+	// Use math/big arithmetic to avoid int64 overflow when the range
+	// (maxVal - minVal + 1) exceeds math.MaxInt64. For example,
+	// min=0, max=math.MaxInt64 would overflow int64 subtraction.
+	hi := new(big.Int).SetInt64(maxVal)
+	lo := new(big.Int).SetInt64(minVal)
+	rangeSize := new(big.Int).Sub(hi, lo)
+	rangeSize.Add(rangeSize, big.NewInt(1))
+
+	n, err := rand.Int(ctx.randSource, rangeSize)
+	if err != nil {
+		return "", fmt.Errorf("randomInt: crypto/rand: %w", err)
+	}
+	result := new(big.Int).Add(n, lo).Int64()
 	return strconv.FormatInt(result, 10), nil
 }
 
@@ -704,6 +726,9 @@ func resolveTemplateBytes(body []byte, ctx *templateCtx, strict bool) ([]byte, e
 //
 // Headers that contain no "{{" sequences are copied as-is (fast path per
 // header value).
+//
+// For callers outside the package, use [ResolveTemplateHeadersSimple] which
+// constructs the evaluation context from an *http.Request.
 func ResolveTemplateHeaders(h http.Header, ctx *templateCtx, strict bool) (http.Header, error) {
 	if h == nil {
 		return nil, nil
@@ -765,6 +790,8 @@ func resolveTemplateStringCtx(s string, ctx *templateCtx, strict bool) (string, 
 // ResolveTemplateBodySimple is a backward-compatible convenience wrapper that
 // resolves templates using only request data (no path params, no counters,
 // no faker). Equivalent to the pre-#196 ResolveTemplateBody behavior.
+//
+// See also [ResolveTemplateHeadersSimple] for the header equivalent.
 func ResolveTemplateBodySimple(body []byte, r *http.Request, strict bool) ([]byte, error) {
 	if !bytes.Contains(body, []byte("{{")) {
 		return body, nil
@@ -777,6 +804,25 @@ func ResolveTemplateBodySimple(body []byte, r *http.Request, strict bool) ([]byt
 		randSource: rand.Reader,
 	}
 	return ResolveTemplateBody(body, ctx, strict)
+}
+
+// ResolveTemplateHeadersSimple is a convenience wrapper that resolves
+// templates in header values using only request data (no path params,
+// no counters, no faker). It constructs the unexported evaluation context
+// internally, making it callable from outside the package.
+//
+// See also [ResolveTemplateBodySimple] for the body equivalent.
+func ResolveTemplateHeadersSimple(headers http.Header, r *http.Request, strict bool) (http.Header, error) {
+	if headers == nil {
+		return nil, nil
+	}
+	reqBody := readRequestBody(r)
+	ctx := &templateCtx{
+		req:        r,
+		reqBody:    reqBody,
+		randSource: rand.Reader,
+	}
+	return ResolveTemplateHeaders(headers, ctx, strict)
 }
 
 // readRequestBody reads the full request body and restores it so the body

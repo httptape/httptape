@@ -353,7 +353,10 @@ func TestResolveUUID(t *testing.T) {
 	src := bytes.NewReader(make([]byte, 16))
 	ctx := &templateCtx{randSource: src}
 
-	result := resolveUUID(ctx)
+	result, err := resolveUUID(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Verify UUID format: 8-4-4-4-12 hex chars separated by dashes.
 	if len(result) != 36 {
@@ -488,6 +491,51 @@ func TestResolveRandomInt(t *testing.T) {
 				}
 				return
 			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			val, err := strconv.ParseInt(result, 10, 64)
+			if err != nil {
+				t.Fatalf("cannot parse result %q as int: %v", result, err)
+			}
+			if val < tt.wantMin || val > tt.wantMax {
+				t.Errorf("result %d outside [%d, %d]", val, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestResolveRandomInt_LargeRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    map[string]string
+		wantMin int64
+		wantMax int64
+	}{
+		{
+			name:    "min=0 max=MaxInt64",
+			args:    map[string]string{"min": "0", "max": strconv.FormatInt(math.MaxInt64, 10)},
+			wantMin: 0,
+			wantMax: math.MaxInt64,
+		},
+		{
+			name:    "min=MinInt64 max=MaxInt64 (full int64 range)",
+			args:    map[string]string{"min": strconv.FormatInt(math.MinInt64, 10), "max": strconv.FormatInt(math.MaxInt64, 10)},
+			wantMin: math.MinInt64,
+			wantMax: math.MaxInt64,
+		},
+		{
+			name:    "min=max returns that value",
+			args:    map[string]string{"min": "5", "max": "5"},
+			wantMin: 5,
+			wantMax: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &templateCtx{randSource: rand.Reader}
+			result, err := resolveRandomInt(tt.args, ctx)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1128,6 +1176,41 @@ func TestResolveTemplateBodySimple(t *testing.T) {
 	want := "method=POST query=1 header=abc"
 	if string(got) != want {
 		t.Errorf("got %q, want %q", string(got), want)
+	}
+}
+
+func TestResolveTemplateHeadersSimple(t *testing.T) {
+	req := httptest.NewRequest("DELETE", "/items/99?force=true", nil)
+	req.Header.Set("X-Trace-Id", "trace-abc")
+
+	headers := http.Header{
+		"X-Method": {"{{request.method}}"},
+		"X-Echo":   {"{{request.headers.X-Trace-Id}}"},
+		"X-Static": {"no-template"},
+	}
+	got, err := ResolveTemplateHeadersSimple(headers, req, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v := got.Get("X-Method"); v != "DELETE" {
+		t.Errorf("X-Method = %q, want %q", v, "DELETE")
+	}
+	if v := got.Get("X-Echo"); v != "trace-abc" {
+		t.Errorf("X-Echo = %q, want %q", v, "trace-abc")
+	}
+	if v := got.Get("X-Static"); v != "no-template" {
+		t.Errorf("X-Static = %q, want %q", v, "no-template")
+	}
+}
+
+func TestResolveTemplateHeadersSimple_Nil(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	got, err := ResolveTemplateHeadersSimple(nil, req, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil, got %v", got)
 	}
 }
 
