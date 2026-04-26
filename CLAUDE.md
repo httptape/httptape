@@ -47,54 +47,21 @@ License: Apache 2.0
 
 ### Package structure
 
-```
-httptape/
-  tape.go              # Core Tape type and related types
-  tape_test.go
-  recorder.go          # RoundTripper wrapper for recording (includes RecorderOption)
-  recorder_test.go
-  sanitizer.go         # Redaction and deterministic faking (includes SanitizeFunc, Pipeline)
-  sanitizer_test.go
-  server.go            # Mock HTTP server (http.Handler, includes ServerOption)
-  server_test.go
-  matcher.go           # Matcher interface, Criterion, CompositeMatcher, ExactMatcher
-  matcher_test.go
-  media_type.go        # MediaType parsing, classification (IsJSON/IsText/IsBinary), content negotiation
-  media_type_test.go
-  store.go             # Storage port (interface)
-  store_file.go        # Filesystem storage adapter (includes FileStoreOption)
-  store_file_test.go
-  store_memory.go      # In-memory storage adapter (for tests)
-  store_memory_test.go
-  config.go            # Declarative JSON config for sanitization pipeline
-  config_test.go
-  config.schema.json   # JSON Schema for config file validation (IDE/CI use)
-  caching_transport.go      # CachingTransport RoundTripper (replay + record-on-miss)
-  caching_transport_test.go
-  bundle.go            # Import/export (tar.gz)
-  bundle_test.go
-  integration_test.go  # End-to-end integration tests
-  race_test.go         # Dedicated concurrency/race-condition tests
-  doc.go               # Package-level documentation
-```
+Single flat Go package. Each file represents a logical concern (recorder, server, sanitizer, store, matcher, proxy, etc.). Tests live next to the code they test (`*_test.go`); package overview lives in `doc.go`. Functional options are co-located with their type (e.g., `RecorderOption` in `recorder.go`), not in a monolithic `options.go`. The `Matcher` interface lives in `matcher.go` alongside its implementations.
 
-Note: functional options are co-located with their respective types (e.g.,
-`RecorderOption` in `recorder.go`, `ServerOption` in `server.go`) rather than
-in a monolithic `options.go` file. The `Matcher` interface lives in `matcher.go`
-alongside its implementations.
+For the current file inventory, run `ls *.go` — this document describes principles, not file census.
 
 ### Layer rules
 
-- **Core types** (`tape.go`): zero imports outside stdlib. Defines `Tape`, `RecordedReq`, `RecordedResp`.
-- **Ports** (`store.go`, top of `matcher.go`): interfaces only. No implementations.
-- **Adapters** (`store_file.go`, `store_memory.go`): implement port interfaces. May use stdlib I/O.
-- **Services** (`recorder.go`, `server.go`, `sanitizer.go`): orchestrate core types and ports. Accept ports via constructor injection.
+The library follows hexagonal architecture inside a single Go package. The categories below describe the role each file plays; examples are illustrative, not exhaustive.
 
-Since this is a single Go package (library), we don't have `internal/ports/` and `internal/adapters/` directories.
-Instead, the hexagonal boundaries are enforced by convention:
-- Interfaces are defined at the top of their respective files or in `store.go`
-- Implementations live in separate files (`store_file.go`, `store_memory.go`)
-- Core types have zero I/O — they are pure data structures
+- **Core types** (e.g., `tape.go`, `sse.go:SSEEvent`): pure value types. Zero non-stdlib imports, no I/O.
+- **Ports** (e.g., `store.go`, the `Matcher` interface in `matcher.go`, the `Faker` interface in `faker.go`): interface declarations only, no implementations in the same block.
+- **Adapters** (e.g., `store_file.go`, `store_memory.go`): implement port interfaces. May use stdlib I/O.
+- **Services** (e.g., `recorder.go`, `server.go`, `sanitizer.go`, `caching_transport.go`, `proxy.go`): orchestrate core types and ports. Accept ports via constructor injection.
+- **Helpers** (e.g., `tls.go`, `fixtures.go`, `templating.go`): pure or near-pure utility functions. No interfaces, no constructor injection.
+
+Because this is a single Go package, we don't use `internal/ports/` and `internal/adapters/` directories. Boundaries are enforced by convention: interfaces at the top of their file (or in `store.go`), implementations in separate files, core types with zero I/O.
 
 ---
 
