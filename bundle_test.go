@@ -1159,6 +1159,148 @@ func TestImportBundle_UnknownEntriesSkipped(t *testing.T) {
 	}
 }
 
+func TestImportBundle_RejectsPathTraversalInTarEntryNames(t *testing.T) {
+	tape := makeBundleTape("tape-1", "api", "GET", "http://test/1")
+	tapeJSON, _ := json.Marshal(tape)
+
+	manifest := Manifest{
+		ExportedAt:   time.Now().UTC(),
+		FixtureCount: 1,
+		Routes:       []string{"api"},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	tests := []struct {
+		name      string
+		entryName string
+		wantErr   string
+	}{
+		{
+			name:      "dot-dot traversal escaping fixtures directory",
+			entryName: "fixtures/../../../etc/passwd.json",
+			wantErr:   "path traversal",
+		},
+		{
+			name:      "dot-dot at start of path",
+			entryName: "../secrets.json",
+			wantErr:   "path traversal",
+		},
+		{
+			name:      "dot-dot in middle of path",
+			entryName: "fixtures/sub/../../../etc/shadow.json",
+			wantErr:   "path traversal",
+		},
+		{
+			name:      "absolute path",
+			entryName: "/etc/passwd",
+			wantErr:   "absolute path",
+		},
+		{
+			name:      "backslash in entry name",
+			entryName: "fixtures\\tape-1.json",
+			wantErr:   "backslash",
+		},
+		{
+			name:      "backslash with traversal",
+			entryName: "fixtures\\..\\..\\etc\\passwd.json",
+			wantErr:   "backslash",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bundle := buildTestBundleOrdered(t,
+				[]string{"manifest.json", tt.entryName},
+				[][]byte{manifestJSON, tapeJSON},
+			)
+
+			dstStore := NewMemoryStore()
+			err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestImportBundle_AllowsSafeEntryNames(t *testing.T) {
+	// Verify that legitimate entry names with ".." as a substring in filenames
+	// (not as a path component) are accepted. Also verify normal fixture names.
+	tests := []struct {
+		name      string
+		entryName string
+	}{
+		{
+			name:      "normal fixture",
+			entryName: "fixtures/tape-1.json",
+		},
+		{
+			name:      "double-dot in filename is not a path component",
+			entryName: "fixtures/tape..1.json",
+		},
+		{
+			name:      "fixture with dashes and underscores",
+			entryName: "fixtures/my_tape-name.json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tape := makeBundleTape("tape-1", "api", "GET", "http://test/1")
+			tapeJSON, _ := json.Marshal(tape)
+
+			manifest := Manifest{
+				ExportedAt:   time.Now().UTC(),
+				FixtureCount: 1,
+				Routes:       []string{"api"},
+			}
+			manifestJSON, _ := json.Marshal(manifest)
+
+			bundle := buildTestBundleOrdered(t,
+				[]string{"manifest.json", tt.entryName},
+				[][]byte{manifestJSON, tapeJSON},
+			)
+
+			dstStore := NewMemoryStore()
+			err := ImportBundle(context.Background(), dstStore, bytes.NewReader(bundle))
+			if err != nil {
+				t.Fatalf("unexpected error for safe entry name %q: %v", tt.entryName, err)
+			}
+		})
+	}
+}
+
+func TestValidateEntryName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid fixture path", "fixtures/tape-1.json", false},
+		{"valid manifest", "manifest.json", false},
+		{"double-dot in filename", "fixtures/tape..1.json", false},
+		{"triple-dot in filename", "fixtures/tape...1.json", false},
+		{"dot-dot path component", "fixtures/../../etc/passwd.json", true},
+		{"bare dot-dot", "..", true},
+		{"dot-dot at start", "../secret.json", true},
+		{"absolute path", "/etc/passwd", true},
+		{"backslash", "fixtures\\tape.json", true},
+		{"mixed slashes", "fixtures/sub\\..\\tape.json", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateEntryName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateEntryName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestExportBundle_EmptyRouteExcluded(t *testing.T) {
 	store := NewMemoryStore()
 	// Tape with empty route should not appear in manifest routes

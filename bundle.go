@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -248,6 +249,10 @@ func ImportBundle(ctx context.Context, s Store, r io.Reader) error {
 			return fmt.Errorf("httptape: import: %w", err)
 		}
 
+		if err := validateEntryName(hdr.Name); err != nil {
+			return err
+		}
+
 		lr := io.LimitReader(tr, maxEntrySize)
 
 		switch {
@@ -296,6 +301,36 @@ func ImportBundle(ctx context.Context, s Store, r io.Reader) error {
 // isFixtureEntry reports whether the tar entry name matches the fixture pattern.
 func isFixtureEntry(name string) bool {
 	return strings.HasPrefix(name, "fixtures/") && strings.HasSuffix(name, ".json")
+}
+
+// validateEntryName checks that a tar entry name does not contain path-traversal
+// patterns. This is defense in depth: ImportBundle deserializes entries into
+// in-memory Tape objects (not to the filesystem), and Store.Save implementations
+// have their own path validation. However, since bundle parsing sits at the trust
+// boundary for untrusted input, we reject suspicious names early to prevent any
+// future code path from being exploitable.
+func validateEntryName(name string) error {
+	// Reject absolute paths (leading /).
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf("httptape: import: tar entry %q has absolute path", name)
+	}
+
+	// Reject backslashes (Windows-style separators have no place in tar archives).
+	if strings.ContainsRune(name, '\\') {
+		return fmt.Errorf("httptape: import: tar entry %q contains backslash", name)
+	}
+
+	// Reject path-traversal: clean the path and check for ".." components.
+	// We use path.Clean (not filepath.Clean) because tar paths use forward
+	// slashes regardless of OS.
+	cleaned := path.Clean(name)
+	for _, segment := range strings.Split(cleaned, "/") {
+		if segment == ".." {
+			return fmt.Errorf("httptape: import: tar entry %q contains path traversal", name)
+		}
+	}
+
+	return nil
 }
 
 // validateFixture checks that a tape has the minimum required fields for
