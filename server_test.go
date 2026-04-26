@@ -1338,7 +1338,7 @@ func TestServer_Templating_BodyField(t *testing.T) {
 	}
 }
 
-func TestServer_Templating_DoesNotModifyStoredFixture(t *testing.T) {
+func TestServer_Templating_LeavesStoredFixtureUnchanged(t *testing.T) {
 	store := NewMemoryStore()
 	tape := storeTape(t, store, "GET", "/immutable", 200,
 		`{{request.method}}`, nil)

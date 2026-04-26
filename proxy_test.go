@@ -445,24 +445,22 @@ func TestProxy_RequestBodyPreservedForMatching(t *testing.T) {
 	}
 }
 
-func TestProxy_PanicsOnNilStores(t *testing.T) {
-	t.Run("nil l1", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic on nil L1 store")
-			}
-		}()
-		NewProxy(nil, NewMemoryStore())
-	})
+func TestProxy_PanicsOnNilL1Store(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on nil L1 store")
+		}
+	}()
+	NewProxy(nil, NewMemoryStore())
+}
 
-	t.Run("nil l2", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic on nil L2 store")
-			}
-		}()
-		NewProxy(NewMemoryStore(), nil)
-	})
+func TestProxy_PanicsOnNilL2Store(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on nil L2 store")
+		}
+	}()
+	NewProxy(NewMemoryStore(), nil)
 }
 
 func TestProxy_OnErrorCallback(t *testing.T) {

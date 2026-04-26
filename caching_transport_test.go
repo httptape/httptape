@@ -862,24 +862,22 @@ func TestCachingTransport_ConcurrentSafety(t *testing.T) {
 	// No panic = success for concurrent safety test.
 }
 
-func TestCachingTransport_PanicsOnNil(t *testing.T) {
-	t.Run("nil upstream", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic on nil upstream")
-			}
-		}()
-		NewCachingTransport(nil, NewMemoryStore())
-	})
+func TestCachingTransport_PanicsOnNilUpstream(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on nil upstream")
+		}
+	}()
+	NewCachingTransport(nil, NewMemoryStore())
+}
 
-	t.Run("nil store", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic on nil store")
-			}
-		}()
-		NewCachingTransport(http.DefaultTransport, nil)
-	})
+func TestCachingTransport_PanicsOnNilStore(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on nil store")
+		}
+	}()
+	NewCachingTransport(http.DefaultTransport, nil)
 }
 
 func TestCachingTransport_ImplementsRoundTripper(t *testing.T) {

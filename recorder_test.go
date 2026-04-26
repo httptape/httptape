@@ -487,7 +487,7 @@ func TestRecorder_RoundTrip_WithSanitizer(t *testing.T) {
 
 // --- Error handling tests ---
 
-func TestRecorder_RoundTrip_SyncMode_StoreError_DoesNotAffectCaller(t *testing.T) {
+func TestRecorder_RoundTrip_SyncMode_StoreErrorIsolatedFromCaller(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("all good"))

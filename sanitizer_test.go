@@ -226,7 +226,7 @@ func TestRedactHeaders_PreservesOtherHeaders(t *testing.T) {
 	}
 }
 
-func TestRedactHeaders_DoesNotMutateOriginal(t *testing.T) {
+func TestRedactHeaders_LeavesOriginalTapeUnchanged(t *testing.T) {
 	reqHeaders := http.Header{"Authorization": {"Bearer original"}}
 	respHeaders := http.Header{"Set-Cookie": {"session=original"}}
 	tape := makeTapeWithHeaders(reqHeaders, respHeaders)
@@ -592,7 +592,7 @@ func TestRedactBodyPaths_BothRequestAndResponse(t *testing.T) {
 	}
 }
 
-func TestRedactBodyPaths_DoesNotMutateOriginal(t *testing.T) {
+func TestRedactBodyPaths_LeavesOriginalTapeUnchanged(t *testing.T) {
 	body := []byte(`{"a":"b"}`)
 	original := make([]byte, len(body))
 	copy(original, body)
@@ -1194,7 +1194,7 @@ func TestFakeFields_BothRequestAndResponse(t *testing.T) {
 	}
 }
 
-func TestFakeFields_DoesNotMutateOriginal(t *testing.T) {
+func TestFakeFields_LeavesOriginalTapeUnchanged(t *testing.T) {
 	body := []byte(`{"name":"Alice"}`)
 	original := make([]byte, len(body))
 	copy(original, body)
