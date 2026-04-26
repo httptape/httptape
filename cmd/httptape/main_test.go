@@ -923,12 +923,9 @@ func TestServeWithSynthesizeLogging(t *testing.T) {
 func TestServeWithInvalidExemplarTape(t *testing.T) {
 	// Create a fixture with an invalid exemplar tape (Exemplar=true but no URLPattern).
 	dir := t.TempDir()
-	store, err := httptape.NewFileStore(httptape.WithDirectory(dir))
-	if err != nil {
-		t.Fatalf("create store: %v", err)
-	}
 
-	// Write a malformed exemplar tape directly as JSON.
+	// Write a malformed exemplar tape directly as JSON (bypasses Store validation
+	// to test the startup path's own ValidateTape call).
 	tapeJSON := `{
 		"id": "bad-exemplar",
 		"route": "",
@@ -947,7 +944,6 @@ func TestServeWithInvalidExemplarTape(t *testing.T) {
 			"body": null
 		}
 	}`
-	_ = store
 	tapePath := filepath.Join(dir, "bad-exemplar.json")
 	if err := os.WriteFile(tapePath, []byte(tapeJSON), 0644); err != nil {
 		t.Fatalf("write tape: %v", err)

@@ -251,17 +251,14 @@ func runServe(args []string) error {
 		}
 		logger.Printf("synthesis mode ENABLED -- %d exemplar tape(s) loaded", exemplarCount)
 	} else {
+		exemplarCount := 0
 		for _, t := range allTapes {
 			if t.Exemplar {
-				exemplarCount := 0
-				for _, tt := range allTapes {
-					if tt.Exemplar {
-						exemplarCount++
-					}
-				}
-				logger.Printf("WARNING: %d exemplar tape(s) found but synthesis is disabled (use --synthesize to enable)", exemplarCount)
-				break
+				exemplarCount++
 			}
+		}
+		if exemplarCount > 0 {
+			logger.Printf("WARNING: %d exemplar tape(s) found but synthesis is disabled (use --synthesize to enable)", exemplarCount)
 		}
 	}
 

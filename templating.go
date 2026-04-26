@@ -1005,9 +1005,6 @@ func resolveStringWithCoercion(s string, ctx *templateCtx, strict bool, errOut *
 				*errOut = fmt.Errorf("httptape: unresolvable template expression: {{%s}}", rawExpr)
 				return s
 			}
-			if hasCoercion {
-				return ""
-			}
 			return ""
 		}
 

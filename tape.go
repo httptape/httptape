@@ -415,9 +415,6 @@ func ValidateExemplar(t Tape) error {
 		if !hasPattern {
 			return fmt.Errorf("httptape: exemplar tape %s: url_pattern is required", t.ID)
 		}
-		if hasURL {
-			return fmt.Errorf("httptape: exemplar tape %s: url and url_pattern are mutually exclusive", t.ID)
-		}
 		if len(t.Response.SSEEvents) > 0 {
 			return fmt.Errorf("httptape: exemplar tape %s: SSE exemplars are not supported", t.ID)
 		}

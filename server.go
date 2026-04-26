@@ -504,10 +504,10 @@ func (s *Server) matchExemplar(r *http.Request, exemplars []Tape) (Tape, map[str
 			params = map[string]string{}
 		}
 
-		// Score the path match using the PathPatternCriterion's score logic.
-		// We create a temporary tape with the URL set to the request path so
-		// that the criterion's Score method can compare.
-		pathScore := 3 // PathPatternCriterion always returns 3 on match
+		// PathPatternCriterion's Score returns a flat 3 on match. Same-depth
+		// literal-vs-parameterized exemplars therefore tie and fall back to
+		// declaration order (see follow-up issue for true specificity sort).
+		pathScore := 3
 
 		// Run other criteria against the exemplar. The exemplar must pass all.
 		totalScore := pathScore
