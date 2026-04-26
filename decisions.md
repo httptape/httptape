@@ -15918,3 +15918,256 @@ Dispatch plan: #178 and #179 can be architected in parallel. #180 waits for #179
 **Priority rationale:** This is the highest-priority post-launch feature. VibeWarden integration blocks on CachingTransport existing as a library primitive. The LinkGuard demo use case alone justifies the work — it turns a recurring LLM API cost into a one-time recording.
 
 **Both issues:** `READY_FOR_ARCH` status comments posted. Architect not dispatched — returned to user.
+
+---
+
+### ADR-46: Panic discipline in option and factory functions
+
+**Date**: 2026-04-26
+**Issue**: #215
+**Status**: Accepted
+
+#### Context
+
+Three `panic()` calls violate the panic-discipline rule in CLAUDE.md (locked
+decision L-11: "No init(), no package-level mutable state, no panics"). The
+rule permits panics only as constructor guards on nil required dependencies
+(the `regexp.MustCompile` precedent). These three panics occur in option
+closures, factory functions, or post-option cross-validation — not in
+nil-required-dep guards:
+
+| Location | Function | Trigger |
+|---|---|---|
+| `server.go:93` | `WithErrorRate(rate)` — inside `ServerOption` closure | `rate < 0 \|\| rate > 1` |
+| `sse.go:101` | `SSETimingAccelerated(factor)` — factory returning `SSETimingMode` | `factor <= 0` |
+| `proxy.go:487` | Post-option validation inside `NewProxy` body | `healthEnabled && upstreamURLHint == ""` |
+
+httptape is an embeddable library. Embedders may construct options at runtime
+from user input or configuration (the CLI already does: `cmd/httptape/main.go`
+lines 153, 213, 484). A panic in an option function crashes the embedder's
+process. Pre-1.0 is the right time to fix constructor signatures — post-1.0,
+this would be a semver-breaking change.
+
+#### Decision
+
+**Option A.2: constructors return `(*T, error)` instead of `*T`.** Option
+functions keep their current `func(...) XxxOption` signatures (no change).
+Validation moves entirely into the constructor body, after all options are
+applied. Errors are accumulated with `errors.Join` (Go 1.20+) and returned
+as a single error.
+
+##### Constructor signature changes
+
+```go
+// Before
+func NewServer(store Store, opts ...ServerOption) *Server
+func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+
+// After
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
+```
+
+##### SSETimingAccelerated factory signature change
+
+`SSETimingAccelerated` is not a constructor option — it is a standalone factory
+function that returns an `SSETimingMode` value. Its result is passed *into*
+options (e.g., `WithSSETiming(SSETimingAccelerated(2.0))`). Converting it to
+return `(SSETimingMode, error)` is the correct shape: it follows the same
+"return error, don't panic" principle, and the call site can handle the error
+before constructing the option.
+
+```go
+// Before
+func SSETimingAccelerated(factor float64) SSETimingMode
+
+// After
+func SSETimingAccelerated(factor float64) (SSETimingMode, error)
+```
+
+##### Validation timing
+
+Option functions record values on the struct without validation. The
+constructor validates the fully-assembled configuration after all options have
+been applied. This matches how `NewProxy` already handles the cross-option
+health/upstream check and is the lowest-touch approach — option types remain
+plain `func(*T)` closures.
+
+##### Error accumulation
+
+Constructors collect all validation failures (not just the first) using
+`errors.Join`. This gives embedders a single `error` return that contains
+every problem, not a stop-at-first-failure experience.
+
+```go
+// Inside NewServer, after applying all options:
+var errs []error
+if s.errorRate < 0 || s.errorRate > 1 {
+    errs = append(errs, fmt.Errorf("httptape: WithErrorRate rate must be between 0.0 and 1.0, got %g", s.errorRate))
+}
+if len(errs) > 0 {
+    return nil, errors.Join(errs...)
+}
+```
+
+```go
+// Inside NewProxy, after applying all options:
+var errs []error
+if p.healthEnabled && p.upstreamURLHint == "" {
+    errs = append(errs, fmt.Errorf("httptape: WithProxyHealthEndpoint requires WithProxyUpstreamURL"))
+}
+if len(errs) > 0 {
+    return nil, errors.Join(errs...)
+}
+```
+
+##### Error type
+
+Plain `fmt.Errorf` with descriptive messages. No sentinel or typed errors.
+There is no caller need to programmatically distinguish between "bad error
+rate" and "missing upstream URL" — the messages are actionable as strings.
+If a future need arises for programmatic error inspection, a typed error can
+be introduced additively.
+
+##### Nil-guard panics are retained
+
+The existing nil-required-dependency panics stay as panics. These are
+programming errors (the caller passed `nil` for a required dependency),
+not configuration/validation errors:
+
+- `NewServer`: `store == nil` -> panic (retained)
+- `NewProxy`: `l1 == nil` or `l2 == nil` -> panic (retained)
+- `NewRecorder`: `store == nil` -> panic (retained)
+- `NewCachingTransport`: `upstream == nil` or `store == nil` -> panic (retained)
+- `NewHealthMonitor`: `upstream == ""` or `transport == nil` -> panic (retained)
+
+This matches the Go convention: `regexp.MustCompile` panics on invalid input
+that is always a programming error; `os.Open` returns an error for runtime
+failures. Nil deps are the former; bad option values are the latter.
+
+##### Scope: only affected constructors change signatures
+
+`NewServer` and `NewProxy` are the only constructors that gain an error
+return. The following constructors are NOT changed because they have no
+option-time validation beyond nil-guards:
+
+- `NewRecorder(store Store, opts ...RecorderOption) *Recorder` — unchanged
+- `NewCachingTransport(upstream, store, ...CachingOption) *CachingTransport` — unchanged
+- `NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore` — unchanged
+- `NewHealthMonitor(upstream string, transport http.RoundTripper, opts ...HealthMonitorOption) *HealthMonitor` — unchanged
+
+`NewFileStore` already returns `(*FileStore, error)` and is unaffected.
+
+Consistency argument: expanding all constructors to `(*T, error)` would be
+a larger API churn with no concrete benefit — those constructors cannot fail
+today. If future options introduce validation, the signature can be changed
+at that time (still pre-1.0). Scope discipline wins over speculative
+consistency.
+
+##### WithErrorRate validation change
+
+The `WithErrorRate` option function stops panicking inside the closure. Instead
+it simply sets `s.errorRate = rate`. The range check `[0.0, 1.0]` moves to
+`NewServer`'s post-option validation block.
+
+##### mock.go: internal caller
+
+`mock.go:158` calls `NewServer(store)` with no options. Since `Mock` always
+passes a non-nil store and zero options, `NewServer` cannot return an error.
+However, the signature change requires updating the call site. Since `Mock`
+is a convenience function that intentionally panics on failures (documented
+as constructor-panic convention), it should call `NewServer` and panic on
+error — the same way it already panics on `store.Save` failure:
+
+```go
+handler, err := NewServer(store)
+if err != nil {
+    panic("httptape: Mock failed to create server: " + err.Error())
+}
+```
+
+#### Affected files
+
+| File | Change | Type |
+|---|---|---|
+| `server.go` | `NewServer` returns `(*Server, error)`. `WithErrorRate` stops panicking, defers to constructor validation. | Breaking signature change |
+| `sse.go` | `SSETimingAccelerated` returns `(SSETimingMode, error)` instead of panicking. | Breaking signature change |
+| `proxy.go` | `NewProxy` returns `(*Proxy, error)`. Cross-option health check becomes error return. | Breaking signature change |
+| `mock.go` | `Mock` handles `NewServer` error (panic on failure, per existing convention). | Internal call site |
+| `cmd/httptape/main.go` | `NewServer` and `NewProxy` call sites gain `if err != nil` blocks. `SSETimingAccelerated` call site already pre-validates, but must handle the new error return. | CLI call site |
+| `server_test.go` | ~75 `NewServer` calls updated to handle error. Panic-expectation tests rewritten as error-expectation tests. | Test migration |
+| `proxy_test.go` | ~46 `NewProxy` calls updated to handle error. Panic-expectation test rewritten. | Test migration |
+| `sse_test.go` | ~13 `SSETimingAccelerated` calls updated. Panic tests rewritten. | Test migration |
+| `integration_test.go` | `NewServer`/`NewProxy` calls updated. | Test migration |
+| `race_test.go` | `NewServer`/`NewProxy` calls updated if present. | Test migration |
+| `doc.go` | Example code in package doc updated. | Documentation |
+
+#### Test strategy
+
+1. **Error-path tests replace panic tests.** The existing tests that expect panics
+   (`TestServer_ErrorRate_InvalidPanics`, `TestSSETimingAccelerated_PanicOnZero`,
+   `TestSSETimingAccelerated_PanicOnNegative`, `TestProxy_HealthPanicsWithoutUpstreamURL`)
+   become tests that verify a non-nil error return with a descriptive message.
+
+2. **Error accumulation test.** Add a test for `NewProxy` that enables health
+   without an upstream URL AND passes another invalid option (if one exists) to
+   verify `errors.Join` accumulates multiple errors. If no second validation
+   exists yet, a single-error test suffices.
+
+3. **Happy-path tests.** All existing happy-path tests must still pass after
+   adding `if err != nil { t.Fatal(err) }` to constructor calls. This is a
+   mechanical migration.
+
+4. **SSETimingAccelerated error tests.** Verify that `SSETimingAccelerated(0)`
+   and `SSETimingAccelerated(-1)` return non-nil errors. Verify that
+   `SSETimingAccelerated(2.0)` returns a valid mode and nil error.
+
+5. **Nil-guard panic tests remain.** Tests verifying that `NewServer(nil)`
+   panics should remain unchanged — nil-guard panics are retained.
+
+#### Migration mechanics
+
+The migration is mechanical. For every `NewServer(...)` call:
+
+```go
+// Before
+srv := NewServer(store, opts...)
+
+// After
+srv, err := NewServer(store, opts...)
+if err != nil {
+    // In tests: t.Fatal(err)
+    // In production: return fmt.Errorf("create server: %w", err)
+    // In Mock(): panic("httptape: Mock failed to create server: " + err.Error())
+}
+```
+
+Same pattern for `NewProxy(...)` and `SSETimingAccelerated(...)`.
+
+#### Alternatives considered
+
+**Option B: `Must*`-style naming.** Rename panicking functions with a `Must`
+prefix (`MustWithErrorRate`, `MustSSETimingAccelerated`) to signpost the
+panic. Rejected because: (1) `MustWithErrorRate` reads awkwardly as a
+functional-option name, (2) the proxy.go cross-option panic does not fit the
+`Must*` pattern (it is inside a constructor, not a standalone function),
+(3) it still crashes embedders who pass runtime config values, and (4) it
+requires amending the CLAUDE.md panic-discipline rule rather than simply
+conforming to it.
+
+#### Consequences
+
+- **Breaking change** to `NewServer`, `NewProxy`, and `SSETimingAccelerated`
+  signatures. Acceptable pre-1.0. The Go compiler catches every stale call
+  site — no silent breakage.
+- **Every call site gains an `if err != nil` block.** More verbose, but
+  explicitly Go-idiomatic. The CLI already validates inputs before calling
+  options, so its `if err != nil` blocks are trivial wrappers.
+- **CLAUDE.md does not need amendment.** The panic-discipline clause already
+  says "no panics except nil-guard constructor guards." This ADR conforms to
+  the existing rule by converting non-nil-guard panics to errors.
+- **Future options that need validation** on `NewServer` or `NewProxy` can
+  simply add checks to the existing validation block. No further signature
+  changes needed.
+- **No impact on `NewRecorder`, `NewCachingTransport`, `NewMemoryStore`,
+  `NewHealthMonitor`** — their signatures remain unchanged.
