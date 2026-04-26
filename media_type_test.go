@@ -419,6 +419,15 @@ func TestMatchesMediaRange(t *testing.T) {
 	}
 }
 
+func TestMediaTypeError_FormatsInputAndReason(t *testing.T) {
+	err := &mediaTypeError{input: "bad/type", reason: "missing subtype"}
+	got := err.Error()
+	want := `httptape: invalid media type "bad/type": missing subtype`
+	if got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestSpecificity(t *testing.T) {
 	tests := []struct {
 		name  string
