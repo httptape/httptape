@@ -2,14 +2,17 @@
 
 ## Supported versions
 
-httptape is pre-release. The only supported version is the current `main`
-branch. Once v0.9.0 ships, this table will be updated to list supported
-released versions explicitly.
+httptape is pre-1.0. Only the **latest minor release line** receives security
+fixes. Older minor lines are unsupported.
 
-| Version | Supported          |
-|---------|--------------------|
-| `main`  | Yes (best-effort)  |
-| `v0.x`  | Not yet released   |
+| Version                        | Supported         |
+|--------------------------------|-------------------|
+| Latest minor line (e.g. 0.13.x) | Yes               |
+| Older minor lines              | No                |
+| `main` branch                  | Yes (best-effort) |
+
+When a new minor version ships, the previous minor line becomes unsupported.
+This policy will be revisited at 1.0.
 
 ## Reporting a vulnerability
 
