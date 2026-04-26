@@ -2072,3 +2072,162 @@ func TestContentNegotiationCriterion_MultiCandidate(t *testing.T) {
 		})
 	}
 }
+
+func TestPathPatternCriterion_BasicMatch(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/42", nil)
+	tape := Tape{Request: RecordedReq{URL: "/users/99"}}
+
+	score := c.Score(req, tape)
+	if score != 3 {
+		t.Errorf("Score = %d, want 3", score)
+	}
+}
+
+func TestPathPatternCriterion_MultiSegment(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id/orders/:oid")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/1/orders/7", nil)
+	tape := Tape{Request: RecordedReq{URL: "/users/2/orders/8"}}
+
+	score := c.Score(req, tape)
+	if score != 3 {
+		t.Errorf("Score = %d, want 3", score)
+	}
+}
+
+func TestPathPatternCriterion_NoMatch(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/posts/1", nil)
+	tape := Tape{Request: RecordedReq{URL: "/users/42"}}
+
+	score := c.Score(req, tape)
+	if score != 0 {
+		t.Errorf("Score = %d, want 0 (request path mismatch)", score)
+	}
+}
+
+func TestPathPatternCriterion_ExactLiteral(t *testing.T) {
+	c, err := NewPathPatternCriterion("/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/health", nil)
+	tape := Tape{Request: RecordedReq{URL: "/api/v1/health"}}
+
+	score := c.Score(req, tape)
+	if score != 3 {
+		t.Errorf("Score = %d, want 3", score)
+	}
+}
+
+func TestPathPatternCriterion_TrailingSlash(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/users/42/", nil)
+	tape := Tape{Request: RecordedReq{URL: "/users/42"}}
+
+	score := c.Score(req, tape)
+	if score != 0 {
+		t.Errorf("Score = %d, want 0 (trailing slash mismatch)", score)
+	}
+}
+
+func TestPathPatternCriterion_EmptySegment(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// /users/ has an empty segment after /users, which :id (requiring [^/]+) won't match.
+	req := httptest.NewRequest("GET", "/users/", nil)
+	tape := Tape{Request: RecordedReq{URL: "/users/42"}}
+
+	score := c.Score(req, tape)
+	if score != 0 {
+		t.Errorf("Score = %d, want 0 (empty segment mismatch)", score)
+	}
+}
+
+func TestPathPatternCriterion_ExtractParams(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id/orders/:oid")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	params := c.ExtractParams("/users/42/orders/7")
+	if params == nil {
+		t.Fatal("expected non-nil params")
+	}
+	if params["id"] != "42" {
+		t.Errorf("id = %q, want %q", params["id"], "42")
+	}
+	if params["oid"] != "7" {
+		t.Errorf("oid = %q, want %q", params["oid"], "7")
+	}
+
+	// Non-matching path returns nil.
+	nilParams := c.ExtractParams("/other/path")
+	if nilParams != nil {
+		t.Errorf("expected nil for non-matching path, got %v", nilParams)
+	}
+}
+
+func TestNewPathPatternCriterion_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+	}{
+		{"empty pattern", ""},
+		{"no leading slash", "users/:id"},
+		{"empty param name", "/users/:"},
+		{"duplicate param name", "/users/:id/items/:id"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewPathPatternCriterion(tt.pattern)
+			if err == nil {
+				t.Errorf("expected error for pattern %q, got nil", tt.pattern)
+			}
+		})
+	}
+}
+
+func TestPathPatternCriterion_Name(t *testing.T) {
+	c, _ := NewPathPatternCriterion("/test")
+	if c.Name() != "path_pattern" {
+		t.Errorf("Name() = %q, want %q", c.Name(), "path_pattern")
+	}
+}
+
+func TestPathPatternCriterion_TapeMustMatch(t *testing.T) {
+	c, err := NewPathPatternCriterion("/users/:id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request matches, but tape URL does not match the pattern.
+	req := httptest.NewRequest("GET", "/users/42", nil)
+	tape := Tape{Request: RecordedReq{URL: "/posts/1"}}
+
+	score := c.Score(req, tape)
+	if score != 0 {
+		t.Errorf("Score = %d, want 0 (tape path does not match pattern)", score)
+	}
+}

@@ -168,6 +168,34 @@ If the incoming request has no `Accept` header, the criterion defaults to `*/*` 
 
 **Note:** Using `ContentNegotiationCriterion` alongside `HeadersCriterion{Key: "Accept", ...}` is allowed but redundant.
 
+### PathPatternCriterion
+
+```go
+c, err := httptape.NewPathPatternCriterion("/users/:id")
+```
+
+Matches Express-style URL patterns with named segments. Named segments (prefixed with `:`) match any single non-empty path segment. Captured values are available to templates via `{{pathParam.NAME}}`.
+
+Pattern examples:
+- `/users/:id` matches `/users/42` (captures `id=42`)
+- `/users/:id/orders/:oid` matches `/users/1/orders/7`
+- `/api/v1/items` matches only `/api/v1/items` (no captures)
+
+The pattern is compiled to a regex at construction time. Trailing slashes are significant: `/users/:id` does NOT match `/users/42/`.
+
+**Score: 3**
+
+**Important:** `PathPatternCriterion` should NOT be used alongside `PathCriterion` in the same `CompositeMatcher`. `PathCriterion` returns 0 for non-exact paths, which eliminates candidates that `PathPatternCriterion` would accept.
+
+After matching, extract captured parameters for template evaluation:
+
+```go
+params := criterion.ExtractParams(req.URL.Path)
+// params["id"] == "42"
+```
+
+The `Server` handles this automatically when `PathPatternCriterion` is in the matcher.
+
 ## Score weight table
 
 | Criterion | Score | Purpose |
@@ -176,6 +204,7 @@ If the incoming request has no `Accept` header, the criterion defaults to `*/*` 
 | PathCriterion | 2 | Exact URL path |
 | PathRegexCriterion | 1 | Regex URL path |
 | RouteCriterion | 1 | Route label |
+| PathPatternCriterion | 3 | Express-style path pattern |
 | HeadersCriterion | 3 | Header key-value |
 | ContentNegotiationCriterion | 3-5 | Accept/Content-Type |
 | QueryParamsCriterion | 4 | Query parameters |

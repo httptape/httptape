@@ -1,9 +1,11 @@
 package httptape
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/rand"
+	"io"
+	mathrand "math/rand"
 	"net/http"
 	"time"
 )
@@ -26,9 +28,11 @@ type Server struct {
 	errorRate        float64             // fraction of requests that return 500 (0.0-1.0)
 	randFloat        func() float64      // random number generator (injectable for testing)
 	replayHeaders    map[string]string   // headers injected into every replayed response
-	templating       bool                // if true, resolve {{request.*}} in responses
+	templating       bool                // if true, resolve {{...}} in responses
 	strictTemplating bool                // if true, unresolvable expressions produce 500
 	sseTiming        SSETimingMode       // controls SSE replay inter-event timing
+	counters         *counterState       // per-server counter state for {{counter}}
+	randSource       io.Reader           // randomness source for template helpers
 }
 
 // ServerOption configures a Server.
@@ -165,6 +169,13 @@ func withRandFloat(fn func() float64) ServerOption {
 	return func(s *Server) { s.randFloat = fn }
 }
 
+// withRandSource overrides the randomness source for template helpers.
+// This is unexported -- only used in tests to make UUID/randomHex/randomInt
+// deterministic.
+func withRandSource(r io.Reader) ServerOption {
+	return func(s *Server) { s.randSource = r }
+}
+
 // NewServer creates a new Server that replays tapes from the given store.
 //
 // By default:
@@ -210,7 +221,15 @@ func NewServer(store Store, opts ...ServerOption) (*Server, error) {
 
 	// Default random number generator for error simulation.
 	if s.randFloat == nil {
-		s.randFloat = rand.Float64
+		s.randFloat = mathrand.Float64
+	}
+
+	// Initialize counter state and random source for template helpers.
+	if s.counters == nil {
+		s.counters = &counterState{counters: make(map[string]int64)}
+	}
+	if s.randSource == nil {
+		s.randSource = rand.Reader
 	}
 
 	return s, nil
@@ -330,19 +349,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 9. Templating — resolve {{request.*}} expressions in non-SSE response
+	// 9. Templating -- resolve {{...}} expressions in non-SSE response
 	// body and headers.
 	respBody := tape.Response.Body
 	respHeaders := tape.Response.Headers
 	if s.templating {
+		reqBody := readRequestBody(r)
+
+		// Extract path params from PathPatternCriterion if present.
+		var pathParams map[string]string
+		if cm, ok := s.matcher.(*CompositeMatcher); ok {
+			for _, criterion := range cm.criteria {
+				if ppc, ok := criterion.(*PathPatternCriterion); ok {
+					pathParams = ppc.ExtractParams(r.URL.Path)
+					break
+				}
+			}
+		}
+
+		ctx := &templateCtx{
+			req:        r,
+			reqBody:    reqBody,
+			pathParams: pathParams,
+			tapeID:     tape.ID,
+			counters:   s.counters,
+			randSource: s.randSource,
+		}
+
 		var err error
-		respBody, err = ResolveTemplateBody(respBody, r, s.strictTemplating)
+		respBody, err = ResolveTemplateBody(respBody, ctx, s.strictTemplating)
 		if err != nil {
 			w.Header().Set("X-Httptape-Error", "template")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		respHeaders, err = ResolveTemplateHeaders(respHeaders, r, s.strictTemplating)
+		respHeaders, err = ResolveTemplateHeaders(respHeaders, ctx, s.strictTemplating)
 		if err != nil {
 			w.Header().Set("X-Httptape-Error", "template")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -401,4 +442,11 @@ func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request, tape Tape) {
 
 	// Replay events with the configured timing.
 	_ = replaySSEEvents(r.Context(), w, flusher, tape.Response.SSEEvents, s.sseTiming) //nolint:errcheck // SSE replay write failure is not actionable
+}
+
+// ResetCounter resets the named counter to 0. If name is empty, all counters
+// are reset. This is useful in tests that need deterministic counter values
+// across test cases.
+func (s *Server) ResetCounter(name string) {
+	s.counters.Reset(name)
 }

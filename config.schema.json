@@ -28,7 +28,7 @@
             "properties": {
               "type": {
                 "type": "string",
-                "enum": ["method", "path", "body_fuzzy", "content_negotiation"],
+                "enum": ["method", "path", "body_fuzzy", "content_negotiation", "path_pattern"],
                 "description": "Criterion type name. Must match a supported Criterion.Name() value."
               },
               "paths": {
@@ -40,6 +40,11 @@
                 },
                 "minItems": 1,
                 "description": "JSONPath-like paths for body_fuzzy criterion. Required when type is body_fuzzy."
+              },
+              "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Express-style path pattern for path_pattern criterion (e.g., /users/:id)."
               }
             },
             "additionalProperties": false,
@@ -50,7 +55,22 @@
                   "required": ["type"]
                 },
                 "then": {
-                  "required": ["type", "paths"]
+                  "required": ["type", "paths"],
+                  "properties": {
+                    "pattern": false
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": { "type": { "const": "path_pattern" } },
+                  "required": ["type"]
+                },
+                "then": {
+                  "required": ["type", "pattern"],
+                  "properties": {
+                    "paths": false
+                  }
                 }
               },
               {
@@ -60,7 +80,8 @@
                 },
                 "then": {
                   "properties": {
-                    "paths": false
+                    "paths": false,
+                    "pattern": false
                   }
                 }
               }

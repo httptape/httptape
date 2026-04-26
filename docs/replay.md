@@ -272,6 +272,7 @@ The server calls `Store.List` on every request, resulting in an O(n) scan over a
 
 ## See also
 
+- [Template Helpers](template-helpers.md) -- dynamic response generation with `{{...}}` expressions
 - [Matching](matching.md) -- control how requests are matched to tapes
 - [Storage](storage.md) -- where tapes are loaded from
 - [CLI](cli.md) -- standalone serve mode
