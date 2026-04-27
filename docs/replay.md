@@ -97,6 +97,35 @@ Adds a fixed delay before every response. The delay is applied after matching bu
 srv := httptape.NewServer(store, httptape.WithDelay(200*time.Millisecond))
 ```
 
+### WithReplayTiming
+
+```go
+func WithReplayTiming(mode ResponseTimingMode) ServerOption
+```
+
+Controls whether the server delays responses based on their recorded elapsed time (`RecordedResp.ElapsedMS`). Defaults to `ResponseTimingInstant()` (no delay, preserving pre-feature behavior).
+
+Three modes are available:
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `ResponseTimingInstant()` | No delay (default) | Unit tests, CI |
+| `ResponseTimingRecorded()` | Delay = recorded elapsed time | Realistic replay, back-pressure testing |
+| `ResponseTimingAccelerated(factor)` | Delay = elapsed * factor | Fast but proportional; factor < 1 = faster, > 1 = slower |
+
+```go
+// Replay with recorded timing -- each response takes as long as the original.
+srv, _ := httptape.NewServer(store, httptape.WithReplayTiming(httptape.ResponseTimingRecorded()))
+
+// Replay 10x faster than recorded.
+mode, _ := httptape.ResponseTimingAccelerated(0.1)
+srv, _ := httptape.NewServer(store, httptape.WithReplayTiming(mode))
+```
+
+**Backward compatibility:** Pre-feature fixtures (missing `elapsed_ms` field, or `elapsed_ms: 0`) incur no delay regardless of mode.
+
+**Additive composition with WithDelay:** `WithReplayTiming` composes additively with `WithDelay` and per-fixture `metadata.delay`. The existing delay (user-authored "simulate slow API") runs first, then the replay timing delay runs second. The total delay is their sum. For example, if `WithDelay` is 100ms and the recorded elapsed time is 200ms with `ResponseTimingRecorded()`, the total delay before the response is written is 300ms.
+
 ### WithErrorRate
 
 ```go
@@ -247,6 +276,22 @@ func TestMyAPI(t *testing.T) {
     // assert on user...
 }
 ```
+
+## Response timing
+
+Response timing allows you to replay responses with realistic delays based on the recorded `elapsed_ms` field. This is controlled by `WithReplayTiming` (for the Server) and `WithCacheReplayTiming` (for CachingTransport).
+
+See [WithReplayTiming](#withreplaytiming) above for configuration details.
+
+For CachingTransport, use `WithCacheReplayTiming`:
+
+```go
+ct := httptape.NewCachingTransport(upstream, store,
+    httptape.WithCacheReplayTiming(httptape.ResponseTimingRecorded()),
+)
+```
+
+The delay is applied before returning the `*http.Response`, so the caller of `RoundTrip` perceives the delay as if the upstream had taken that long to respond.
 
 ## Using as a standalone server
 

@@ -1958,3 +1958,347 @@ func TestServer_SynthesisEnabled_PatternWithNoParams(t *testing.T) {
 		t.Errorf("body = %s, want %s", got, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ResponseTimingMode
+// ---------------------------------------------------------------------------
+
+func TestResponseTimingInstant(t *testing.T) {
+	mode := ResponseTimingInstant()
+
+	tests := []struct {
+		name      string
+		elapsedMS int64
+		want      time.Duration
+	}{
+		{"zero elapsed", 0, 0},
+		{"positive elapsed", 500, 0},
+		{"negative elapsed", -1, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mode.responseDelay(tt.elapsedMS)
+			if got != tt.want {
+				t.Errorf("responseDelay(%d) = %v, want %v", tt.elapsedMS, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponseTimingRecorded(t *testing.T) {
+	mode := ResponseTimingRecorded()
+
+	tests := []struct {
+		name      string
+		elapsedMS int64
+		want      time.Duration
+	}{
+		{"zero elapsed returns no delay", 0, 0},
+		{"positive elapsed returns that duration", 250, 250 * time.Millisecond},
+		{"negative elapsed returns no delay", -1, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mode.responseDelay(tt.elapsedMS)
+			if got != tt.want {
+				t.Errorf("responseDelay(%d) = %v, want %v", tt.elapsedMS, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponseTimingAccelerated(t *testing.T) {
+	t.Run("factor 2 doubles elapsed time", func(t *testing.T) {
+		mode, err := ResponseTimingAccelerated(2.0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := mode.responseDelay(100)
+		if got != 200*time.Millisecond {
+			t.Errorf("responseDelay(100) with factor 2 = %v, want 200ms", got)
+		}
+	})
+
+	t.Run("factor 0.5 halves elapsed time", func(t *testing.T) {
+		mode, err := ResponseTimingAccelerated(0.5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := mode.responseDelay(100)
+		if got != 50*time.Millisecond {
+			t.Errorf("responseDelay(100) with factor 0.5 = %v, want 50ms", got)
+		}
+	})
+
+	t.Run("zero elapsed returns no delay regardless of factor", func(t *testing.T) {
+		mode, err := ResponseTimingAccelerated(2.0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := mode.responseDelay(0)
+		if got != 0 {
+			t.Errorf("responseDelay(0) = %v, want 0", got)
+		}
+	})
+
+	t.Run("negative factor returns error", func(t *testing.T) {
+		_, err := ResponseTimingAccelerated(-1.0)
+		if err == nil {
+			t.Error("expected error for negative factor")
+		}
+	})
+
+	t.Run("zero factor returns error", func(t *testing.T) {
+		_, err := ResponseTimingAccelerated(0.0)
+		if err == nil {
+			t.Error("expected error for zero factor")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// WithReplayTiming on Server
+// ---------------------------------------------------------------------------
+
+func TestServer_WithReplayTiming_Recorded(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/data",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/plain"}},
+		Body:       []byte("ok"),
+		ElapsedMS:  300,
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepCalled bool
+	var sleepDuration time.Duration
+
+	srv, err := NewServer(store,
+		WithReplayTiming(ResponseTimingRecorded()),
+		withSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepCalled = true
+			sleepDuration = d
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !sleepCalled {
+		t.Error("sleepFunc was not called for recorded timing mode")
+	}
+	if sleepDuration != 300*time.Millisecond {
+		t.Errorf("sleepDuration = %v, want 300ms", sleepDuration)
+	}
+}
+
+func TestServer_WithReplayTiming_Instant(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/data",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/plain"}},
+		Body:       []byte("ok"),
+		ElapsedMS:  300,
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepCalled bool
+
+	srv, err := NewServer(store,
+		WithReplayTiming(ResponseTimingInstant()),
+		withSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepCalled = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if sleepCalled {
+		t.Error("sleepFunc was called with instant timing mode (should not be)")
+	}
+}
+
+func TestServer_WithReplayTiming_PreFeatureFixtureNoDelay(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/data",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/plain"}},
+		Body:       []byte("ok"),
+		ElapsedMS:  0, // pre-feature fixture
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepCalled bool
+
+	srv, err := NewServer(store,
+		WithReplayTiming(ResponseTimingRecorded()),
+		withSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepCalled = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if sleepCalled {
+		t.Error("sleepFunc was called for pre-feature fixture (ElapsedMS=0)")
+	}
+}
+
+func TestServer_WithReplayTiming_AdditiveWithDelay(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/data",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/plain"}},
+		Body:       []byte("ok"),
+		ElapsedMS:  200,
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepDurations []time.Duration
+
+	srv, err := NewServer(store,
+		WithDelay(100*time.Millisecond),
+		WithReplayTiming(ResponseTimingRecorded()),
+		withSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepDurations = append(sleepDurations, d)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/data", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	// The replay timing delay should be 200ms (recorded elapsed).
+	// WithDelay uses its own timer/select, not sleepFunc. The sleepFunc
+	// only captures the replay timing delay.
+	if len(sleepDurations) != 1 {
+		t.Fatalf("sleepFunc called %d times, want 1", len(sleepDurations))
+	}
+	if sleepDurations[0] != 200*time.Millisecond {
+		t.Errorf("replay timing sleep = %v, want 200ms", sleepDurations[0])
+	}
+}
+
+func TestServer_WithReplayTiming_ContextCancelled(t *testing.T) {
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method: "GET",
+		URL:    "/api/data",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"text/plain"}},
+		Body:       []byte("ok"),
+		ElapsedMS:  1000,
+	})
+	store.Save(context.Background(), tape)
+
+	sleepCalled := false
+	srv, err := NewServer(store,
+		WithReplayTiming(ResponseTimingRecorded()),
+		withSleepFunc(func(ctx context.Context, _ time.Duration) error {
+			sleepCalled = true
+			return ctx.Err()
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a valid context for the store.List call, but cancel before
+	// the sleep runs.
+	rec := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", "/api/data", nil).WithContext(ctx)
+	cancel() // cancel after request is built but before ServeHTTP
+
+	srv.ServeHTTP(rec, req)
+
+	// When context is cancelled, store.List may fail (returning 500
+	// "store error") or the sleepFunc may return early. Either path
+	// means the normal 200 body is NOT returned.
+	if sleepCalled {
+		// If sleep was reached, it returned ctx.Err() and the server
+		// bailed out without writing the normal response body.
+		if rec.Body.String() == "ok" {
+			t.Error("expected response body != 'ok' when context was cancelled during sleep")
+		}
+	}
+	// If store.List failed due to the cancelled context, the server
+	// returns 500 "store error" -- that's also acceptable.
+}
+
+// ---------------------------------------------------------------------------
+// defaultSleepFunc
+// ---------------------------------------------------------------------------
+
+func TestDefaultSleepFunc_ZeroDuration(t *testing.T) {
+	err := defaultSleepFunc(context.Background(), 0)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDefaultSleepFunc_NegativeDuration(t *testing.T) {
+	err := defaultSleepFunc(context.Background(), -1*time.Millisecond)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDefaultSleepFunc_CancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := defaultSleepFunc(ctx, 10*time.Second)
+	if err == nil {
+		t.Error("expected error from cancelled context")
+	}
+}

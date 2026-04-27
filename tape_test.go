@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewTape(t *testing.T) {
@@ -889,5 +890,128 @@ func TestTape_MarshalJSON_RoundTrip_Exemplar(t *testing.T) {
 	}
 	if string(data) != string(data2) {
 		t.Errorf("round-trip mismatch:\n  first:  %s\n  second: %s", data, data2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ElapsedMS serialization
+// ---------------------------------------------------------------------------
+
+func TestRecordedResp_MarshalJSON_ElapsedMSOmitempty(t *testing.T) {
+	r := RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"application/json"}},
+		Body:       []byte(`{}`),
+	}
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	if strings.Contains(string(data), "elapsed_ms") {
+		t.Errorf("elapsed_ms should be omitted when zero, got: %s", data)
+	}
+}
+
+func TestRecordedResp_MarshalJSON_ElapsedMSPresent(t *testing.T) {
+	r := RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"application/json"}},
+		Body:       []byte(`{}`),
+		ElapsedMS:  142,
+	}
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	if !strings.Contains(string(data), `"elapsed_ms":142`) {
+		t.Errorf("expected elapsed_ms:142 in output, got: %s", data)
+	}
+}
+
+func TestRecordedResp_UnmarshalJSON_ElapsedMS(t *testing.T) {
+	input := `{
+		"status_code": 200,
+		"headers": {"Content-Type": ["text/plain"]},
+		"body": "hello",
+		"elapsed_ms": 350
+	}`
+
+	var r RecordedResp
+	if err := json.Unmarshal([]byte(input), &r); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if r.ElapsedMS != 350 {
+		t.Errorf("ElapsedMS = %d, want 350", r.ElapsedMS)
+	}
+}
+
+func TestRecordedResp_UnmarshalJSON_ElapsedMSAbsent(t *testing.T) {
+	input := `{
+		"status_code": 200,
+		"headers": {"Content-Type": ["text/plain"]},
+		"body": "hello"
+	}`
+
+	var r RecordedResp
+	if err := json.Unmarshal([]byte(input), &r); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if r.ElapsedMS != 0 {
+		t.Errorf("ElapsedMS = %d, want 0 for pre-feature fixture", r.ElapsedMS)
+	}
+}
+
+func TestRecordedResp_JSON_RoundTrip_WithElapsedMS(t *testing.T) {
+	original := RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": {"application/json"}},
+		Body:       []byte(`{"key":"value"}`),
+		ElapsedMS:  500,
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	var roundTripped RecordedResp
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if roundTripped.ElapsedMS != original.ElapsedMS {
+		t.Errorf("ElapsedMS = %d, want %d", roundTripped.ElapsedMS, original.ElapsedMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// elapsedMS helper
+// ---------------------------------------------------------------------------
+
+func TestElapsedMS(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowFunc := func() time.Time {
+		return start.Add(250 * time.Millisecond)
+	}
+
+	got := elapsedMS(start, nowFunc)
+	if got != 250 {
+		t.Errorf("elapsedMS = %d, want 250", got)
+	}
+}
+
+func TestElapsedMS_Zero(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowFunc := func() time.Time { return start }
+
+	got := elapsedMS(start, nowFunc)
+	if got != 0 {
+		t.Errorf("elapsedMS = %d, want 0", got)
 	}
 }

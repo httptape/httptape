@@ -184,6 +184,25 @@ Each event's `Data` field is treated as an independent JSON body, so the same pa
 
 See [Redaction](sanitization.md) for more on SSE redaction and faking.
 
+## Response elapsed time
+
+Every recorded tape automatically captures the total response time in the `elapsed_ms` field of `RecordedResp`. This measures the wall-clock time from when the request was sent to when the response body was fully received (non-SSE) or when the SSE stream completed (SSE).
+
+```json
+{
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["application/json"]},
+    "body": {"result": "ok"},
+    "elapsed_ms": 142
+  }
+}
+```
+
+Elapsed time recording is always-on -- there is no flag to disable it. The `elapsed_ms` field uses `omitempty`, so pre-feature fixtures (created before this feature existed) remain byte-identical on round-trip.
+
+The recorded elapsed time is used by the replay timing feature. See [Replay](replay.md#response-timing) for details on how to use `WithReplayTiming` and `WithCacheReplayTiming` to replay responses with realistic timing.
+
 ## Thread safety
 
 `Recorder` is safe for concurrent use. Multiple goroutines can call `RoundTrip` simultaneously. `Close` must be called exactly once when recording is complete (though calling it multiple times is safe due to `sync.Once`).

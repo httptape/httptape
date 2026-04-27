@@ -36,6 +36,11 @@ type CachingTransport struct {
 	maxBodySize    int
 	sseRecording   bool
 
+	// response timing
+	replayTiming ResponseTimingMode
+	nowFunc      func() time.Time
+	sleepFunc    func(context.Context, time.Duration) error
+
 	// stale-fallback (#164)
 	staleFallback   bool
 	upstreamTimeout time.Duration
@@ -188,6 +193,33 @@ func WithCacheUpstreamTimeout(d time.Duration) CachingOption {
 	}
 }
 
+// WithCacheReplayTiming sets the response timing mode for cache-hit
+// responses. Defaults to ResponseTimingInstant() (no delay, preserving
+// pre-feature behavior).
+//
+// Timing composition: WithCacheReplayTiming composes ADDITIVELY with any
+// delays the caller adds after receiving the response. Pre-feature
+// fixtures (ElapsedMS == 0) incur no replay timing delay regardless
+// of mode. The delay is applied in tapeToResponse before returning the
+// *http.Response, so the caller of RoundTrip perceives the delay.
+func WithCacheReplayTiming(mode ResponseTimingMode) CachingOption {
+	return func(ct *CachingTransport) {
+		ct.replayTiming = mode
+	}
+}
+
+// withCacheNowFunc overrides the clock for elapsed-time measurement.
+// Unexported -- only used in tests.
+func withCacheNowFunc(fn func() time.Time) CachingOption {
+	return func(ct *CachingTransport) { ct.nowFunc = fn }
+}
+
+// withCacheSleepFunc overrides the sleep function for testing.
+// Unexported -- only used in tests.
+func withCacheSleepFunc(fn func(context.Context, time.Duration) error) CachingOption {
+	return func(ct *CachingTransport) { ct.sleepFunc = fn }
+}
+
 // defaultCacheMaxBodySize is the default maximum request body size for cache
 // participation: 10 MiB.
 const defaultCacheMaxBodySize = 10 * 1024 * 1024
@@ -229,6 +261,9 @@ func NewCachingTransport(upstream http.RoundTripper, store Store, opts ...Cachin
 		singleFlight: true,
 		maxBodySize:  defaultCacheMaxBodySize,
 		sseRecording: true,
+		replayTiming: ResponseTimingInstant(),
+		nowFunc:      time.Now,
+		sleepFunc:    defaultSleepFunc,
 		cacheFilter: func(resp *http.Response) bool {
 			return resp.StatusCode >= 200 && resp.StatusCode < 300
 		},
@@ -290,7 +325,7 @@ func (ct *CachingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				if tape.Response.IsSSE() {
 					return ct.sseResponseFromTape(tape), nil
 				}
-				return ct.tapeToResponse(tape), nil
+				return ct.tapeToResponse(req.Context(), tape), nil
 			}
 		}
 	}
@@ -419,6 +454,7 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 		req = req.WithContext(ctx)
 	}
 
+	startTime := ct.nowFunc()
 	resp, transportErr := ct.upstream.RoundTrip(req)
 	if transportErr != nil {
 		// Upstream error path.
@@ -439,7 +475,7 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 
 	// SSE detection on miss path.
 	if ct.sseRecording && isSSEContentType(resp.Header.Get("Content-Type")) {
-		return ct.roundTripSSE(req, resp, reqBody)
+		return ct.roundTripSSE(req, resp, reqBody, startTime)
 	}
 
 	// Read response body into buffer.
@@ -472,6 +508,7 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header.Clone(),
 		Body:       respBody,
+		ElapsedMS:  elapsedMS(startTime, ct.nowFunc),
 	}
 
 	tape := NewTape(ct.route, recordedReq, recordedResp)
@@ -492,8 +529,8 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 // while a background goroutine parses SSE events. When the stream
 // completes cleanly, the tape is persisted. If the stream is truncated
 // (client disconnect), the partial tape is discarded.
-func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) (*http.Response, error) {
-	startTime := time.Now()
+func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte, startTime time.Time) (*http.Response, error) {
+	nowFunc := ct.nowFunc // capture for closure
 	respHeaders := resp.Header.Clone()
 
 	recordedReq := RecordedReq{
@@ -542,6 +579,7 @@ func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response,
 			Headers:    respHeaders,
 			Body:       nil,
 			SSEEvents:  collectedEvents,
+			ElapsedMS:  elapsedMS(startTime, nowFunc),
 		}
 
 		tape := NewTape(ct.route, recordedReq, recordedResp)
@@ -647,14 +685,23 @@ func (ct *CachingTransport) serveStaleFallback(req *http.Request) (*http.Respons
 	if tape.Response.IsSSE() {
 		resp = ct.sseResponseFromTape(tape)
 	} else {
-		resp = ct.tapeToResponse(tape)
+		resp = ct.tapeToResponse(context.Background(), tape)
 	}
 	resp.Header.Set("X-Httptape-Stale", "true")
 	return resp, nil
 }
 
 // tapeToResponse synthesizes an *http.Response from a non-SSE Tape.
-func (ct *CachingTransport) tapeToResponse(tape Tape) *http.Response {
+// The replay timing delay (opt-in via WithCacheReplayTiming) is applied
+// before returning, so the caller of RoundTrip perceives the delay.
+// This composes ADDITIVELY with any caller-side delays. Pre-feature
+// fixtures (ElapsedMS == 0) incur no delay regardless of mode.
+func (ct *CachingTransport) tapeToResponse(ctx context.Context, tape Tape) *http.Response {
+	// Apply replay timing delay before building the response.
+	if replayDelay := ct.replayTiming.responseDelay(tape.Response.ElapsedMS); replayDelay > 0 {
+		_ = ct.sleepFunc(ctx, replayDelay) //nolint:errcheck // context cancellation is non-fatal here
+	}
+
 	header := make(http.Header)
 	if tape.Response.Headers != nil {
 		header = tape.Response.Headers.Clone()
@@ -732,7 +779,7 @@ func (ct *CachingTransport) reQueryStoreForSSE(req *http.Request, reqBody []byte
 		return ct.sseResponseFromTape(tape), nil
 	}
 	if ok {
-		return ct.tapeToResponse(tape), nil
+		return ct.tapeToResponse(req.Context(), tape), nil
 	}
 
 	// Tape not found -- leader's store write may have failed.
