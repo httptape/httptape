@@ -1417,3 +1417,167 @@ func TestCachingTransport_SingleFlightStaleFallbackForWaiters(t *testing.T) {
 		}
 	}
 }
+
+// --- WithCacheLookupDisabled tests ---
+
+// spyStore wraps a MemoryStore and counts List calls. Used to verify that
+// Store.List is not called when cache lookup is disabled.
+type spyStore struct {
+	*MemoryStore
+	listCalls atomic.Int64
+}
+
+func (s *spyStore) List(ctx context.Context, filter Filter) ([]Tape, error) {
+	s.listCalls.Add(1)
+	return s.MemoryStore.List(ctx, filter)
+}
+
+func TestCachingTransport_LookupDisabledAlwaysMisses(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	// Pre-seed the store with a tape that would match.
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/api/data",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{},
+		Body:       []byte("cached-response"),
+	})
+	store.Save(context.Background(), tape)
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("from-upstream")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheLookupDisabled(),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api/data", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "from-upstream" {
+		t.Errorf("got body %q, want %q (lookup disabled should bypass cache)", string(body), "from-upstream")
+	}
+}
+
+func TestCachingTransport_LookupDisabledStillRecords(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("recorded-response")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheLookupDisabled(),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api/data", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	// Verify the response was persisted to the store.
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("store has %d tapes, want 1 (recording-only mode)", len(tapes))
+	}
+	if string(tapes[0].Response.Body) != "recorded-response" {
+		t.Errorf("stored body %q, want %q", string(tapes[0].Response.Body), "recorded-response")
+	}
+}
+
+func TestCachingTransport_LookupDisabledWithStaleFallback(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	// Pre-seed the store with a matching tape.
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/api/data",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{},
+		Body:       []byte("stale-data"),
+	})
+	store.Save(context.Background(), tape)
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("upstream down")
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheLookupDisabled(),
+		WithCacheUpstreamDownFallback(true),
+		WithCacheSingleFlight(false),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api/data", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("expected stale fallback, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("got status %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "stale-data" {
+		t.Errorf("got body %q, want %q", string(body), "stale-data")
+	}
+	if stale := resp.Header.Get("X-Httptape-Stale"); stale != "true" {
+		t.Errorf("got X-Httptape-Stale=%q, want %q", stale, "true")
+	}
+}
+
+func TestCachingTransport_LookupDisabledSkipsStoreList(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyStore{MemoryStore: NewMemoryStore()}
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, spy,
+		WithCacheLookupDisabled(),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api/data", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if calls := spy.listCalls.Load(); calls != 0 {
+		t.Errorf("Store.List was called %d times, want 0 (lookup disabled should skip store query)", calls)
+	}
+}
