@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -988,11 +989,14 @@ func itoa(i int) string {
 // --- TLS listener flag tests ---
 
 func TestTLSListenerFlags_MutualExclusion(t *testing.T) {
+	// Each case captures stderr so we can assert both the exit code AND the
+	// error message contains the expected substring. Exit code alone would
+	// miss a wrong error message paired with a correct exit code.
 	tests := []struct {
 		name   string
 		args   []string
 		want   int
-		errMsg string
+		errMsg string // substring expected in stderr
 	}{
 		{
 			name:   "auto with cert is rejected",
@@ -1028,12 +1032,47 @@ func TestTLSListenerFlags_MutualExclusion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := run(tt.args)
-			if got != tt.want {
-				t.Errorf("run(%v) = %d, want %d", tt.args, got, tt.want)
+			stderr := captureStderr(t, func() {
+				got := run(tt.args)
+				if got != tt.want {
+					t.Errorf("run(%v) = %d, want %d", tt.args, got, tt.want)
+				}
+			})
+			if !strings.Contains(stderr, tt.errMsg) {
+				t.Errorf("stderr did not contain %q\ngot: %s", tt.errMsg, stderr)
 			}
 		})
 	}
+}
+
+// captureStderr redirects os.Stderr while fn runs and returns whatever was
+// written. Used to assert error messages logged via the package-level logger
+// (which writes to os.Stderr). Restores os.Stderr on return.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	// Re-init the package logger to write to the new stderr.
+	origLogger := logger
+	logger = log.New(w, "httptape: ", 0)
+
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		_, _ = io.Copy(&sb, r)
+		done <- sb.String()
+	}()
+
+	fn()
+
+	w.Close()
+	os.Stderr = orig
+	logger = origLogger
+	return <-done
 }
 
 func TestTLSListenerFlags_MutualExclusionOnRecord(t *testing.T) {

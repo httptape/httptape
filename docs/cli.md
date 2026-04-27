@@ -32,6 +32,10 @@ httptape serve --fixtures ./fixtures [flags]
 | `--sse-timing` | (none) | SSE replay timing mode: `realtime`, `instant`, `accelerated=<factor>`. When unset, the library default (`realtime`) is used. |
 | `--synthesize` | `false` | Enable synthesis mode. When enabled, exemplar tapes (with `"exemplar": true` and a `url_pattern`) generate responses for unmatched URLs. See [Synthesis](synthesis.md). |
 | `--config` | (none) | Path to httptape config JSON. When the config includes a `matcher` section, the server uses it to build a `CompositeMatcher` instead of the default method + path matcher. Sanitization rules in the config are ignored by `serve`. See [Config](config.md). |
+| `--tls-listener-cert` | (none) | Path to PEM certificate for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-key` | (none) | Path to PEM private key for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-auto` | `false` | Generate a self-signed cert at startup. See [TLS](tls.md). |
+| `--tls-listener-san` | `localhost,127.0.0.1,::1` | Comma-separated SANs for auto-cert (requires `--tls-listener-auto`). |
 
 The server uses `DefaultMatcher` (method + path matching) unless a `--config` with a `matcher` section is provided. Fixtures are loaded from the specified directory. The server shuts down gracefully on SIGINT/SIGTERM. At startup, all loaded tapes are validated; invalid exemplar tapes cause a startup error.
 
@@ -60,6 +64,10 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 | `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
 | `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
 | `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
+| `--tls-listener-cert` | (none) | Path to PEM certificate for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-key` | (none) | Path to PEM private key for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-auto` | `false` | Generate a self-signed cert at startup. See [TLS](tls.md). |
+| `--tls-listener-san` | `localhost,127.0.0.1,::1` | Comma-separated SANs for auto-cert (requires `--tls-listener-auto`). |
 
 The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
 
@@ -98,6 +106,10 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 | `--tls-key` | (none) | Path to PEM client private key for mTLS. See [TLS](tls.md). |
 | `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
 | `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
+| `--tls-listener-cert` | (none) | Path to PEM certificate for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-key` | (none) | Path to PEM private key for inbound TLS. See [TLS](tls.md). |
+| `--tls-listener-auto` | `false` | Generate a self-signed cert at startup. See [TLS](tls.md). |
+| `--tls-listener-san` | `localhost,127.0.0.1,::1` | Comma-separated SANs for auto-cert (requires `--tls-listener-auto`). |
 
 When the upstream is reachable, requests are forwarded and responses are cached:
 
