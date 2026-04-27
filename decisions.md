@@ -16171,3 +16171,567 @@ conforming to it.
   changes needed.
 - **No impact on `NewRecorder`, `NewCachingTransport`, `NewMemoryStore`,
   `NewHealthMonitor`** — their signatures remain unchanged.
+
+### ADR-48: Response elapsed time recording and opt-in replay delay
+
+**Date**: 2026-04-23
+**Issue**: #240
+**Status**: Accepted
+
+#### Context
+
+Mock servers replay responses instantly. Tests for retry logic, timeouts,
+latency-sensitive client code, and race conditions cannot reproduce real-world
+timing because recorded fixtures carry no timing information.
+
+SSE already has per-event timing (`SSEEvent.OffsetMS` + `SSETimingMode` with
+`Realtime`/`Accelerated(factor)`/`Instant`). This issue completes the picture
+for non-SSE HTTP responses by recording the total elapsed time from request
+issue to full response receipt, and replaying it on demand via a sealed
+`ResponseTimingMode` interface that mirrors the `SSETimingMode` shape.
+
+#### Open question resolutions
+
+**OQ-1 (JSON encoding -- omit when zero or always emit?):**
+Accept PM recommendation. Use `omitempty` in the JSON alias struct and omit
+`elapsed_ms` when zero. Rationale: matches Go zero-value convention, keeps
+pre-feature fixture files byte-identical after re-serialization, and is
+consistent with other optional fields in `RecordedResp` (`Truncated`,
+`OriginalBodySize`, `SSEEvents` all use `omitempty`).
+
+**OQ-2 (Server option name):**
+Accept PM recommendation. `WithReplayTiming(mode ResponseTimingMode)` is the
+correct name. The SSE timing mode (`WithSSETiming`) controls inter-event gaps;
+the response timing mode controls the initial response delay. These are
+different enough to warrant distinct names.
+
+**OQ-3 (CachingTransport option name):**
+Accept PM recommendation. `WithCacheReplayTiming(mode ResponseTimingMode)` for
+consistency with the `WithCache*` prefix convention.
+
+**OQ-4 (Where to apply delay + interaction with existing delays):**
+The three delay sources compose additively in this order:
+
+1. `WithDelay` (global fixed delay) + `metadata.delay` (per-fixture override) --
+   these are mutually exclusive per the existing logic (`metadata.delay` overrides
+   `WithDelay`), producing a single `effectiveDelay`.
+2. `WithReplayTiming` (recorded elapsed delay) -- applied AFTER the
+   `effectiveDelay` block, but BEFORE writing the response.
+
+Rationale: `WithDelay`/`metadata.delay` are user-authored artificial delays
+(e.g., "simulate slow API"). `WithReplayTiming` is a replay-fidelity delay
+derived from the recorded data. Additive composition means a user can say
+"add 100ms artificial delay AND replay at recorded speed." This is the most
+flexible behavior and avoids any breaking change to existing `WithDelay`
+semantics.
+
+For Server: the replay timing sleep is inserted after the existing
+`effectiveDelay` block (step 9) and before the SSE check (step 10). For
+CachingTransport: the sleep is applied in `tapeToResponse` before returning
+the `*http.Response`, so the caller of `RoundTrip` perceives the delay. For
+the SSE server path, SSE already has its own `SSETimingMode` for inter-event
+timing, and the overall response timing delay should apply before entering
+the SSE streaming phase (i.e., the delay represents TTFR -- time-to-first-
+response -- not inter-event timing).
+
+**OQ-5 (Sleep mechanism):**
+Accept PM recommendation. Use `time.NewTimer` + context cancellation via
+`select` on `timer.C` and `ctx.Done()`. This matches the existing
+`effectiveDelay` pattern in `server.go` and the `replaySSEEvents` pattern in
+`sse.go`. The CachingTransport path uses `req.Context()` from the RoundTrip
+request.
+
+**OQ-6 (Factor > 1 allowed?):**
+Accept PM recommendation. Allow factor > 1. The SSE precedent
+(`SSETimingAccelerated`) only validates `factor > 0` and does not cap at 1.0.
+A factor > 1 means "slower than recorded," which is useful for stress-testing
+timeout paths. The naming "Accelerated" is slightly misleading for factor > 1,
+but changing SSE's convention is out of scope and consistency wins.
+
+**OQ-7 (Naming: `Recorded` vs `Realtime`):**
+Use `Recorded`. The semantics differ enough from SSE's `Realtime` to justify a
+different name. SSE's `Realtime` replays inter-event gaps (multiple delays in
+a stream); this feature replays a single total elapsed time for the entire
+response. `Recorded` communicates "replay at the speed that was recorded" more
+clearly to users. The naming discrepancy is documented.
+
+**OQ-8 (Clock injection strategy):**
+Use function fields: `sleepFunc func(context.Context, time.Duration) error` on
+Server and CachingTransport, and `nowFunc func() time.Time` on the recording
+paths (Recorder, CachingTransport, l1RecordingTransport). These follow the
+established precedent: `randFloat func() float64` on Server for error-rate
+testing, `randFloat func() float64` on Recorder for sampling.
+
+The `sleepFunc` takes a `context.Context` so the default implementation can do
+the timer + context cancellation pattern, and tests can return immediately or
+return `ctx.Err()`.
+
+For recording, `nowFunc` is sufficient since we just need `time.Now()` and
+`time.Since(start)` (which is `nowFunc().Sub(start)`).
+
+These are unexported function fields set via unexported test-only option
+functions (same pattern as `withRandFloat`). Production code uses the defaults
+(`time.Sleep`/`time.Now`) and tests inject fakes.
+
+#### Decision
+
+##### Core type change
+
+Add `ElapsedMS int64` to `RecordedResp`:
+
+```go
+type RecordedResp struct {
+    StatusCode       int        `json:"status_code"`
+    Headers          http.Header `json:"headers"`
+    Body             []byte     `json:"-"`
+    Truncated        bool       `json:"truncated,omitempty"`
+    OriginalBodySize int64      `json:"original_body_size,omitempty"`
+    SSEEvents        []SSEEvent `json:"sse_events,omitempty"`
+    ElapsedMS        int64      `json:"elapsed_ms,omitempty"`
+}
+```
+
+The `elapsed_ms` field is omitted from JSON when zero (omitempty). This
+preserves byte-identical serialization for pre-feature fixtures and is
+consistent with other optional fields.
+
+##### JSON marshaling
+
+Both `RecordedResp.MarshalJSON` and `UnmarshalJSON` use explicit alias structs.
+The new `ElapsedMS` field must be added to both aliases:
+
+```go
+// In MarshalJSON:
+type alias struct {
+    StatusCode       int        `json:"status_code"`
+    Headers          http.Header `json:"headers"`
+    Body             any        `json:"body"`
+    Truncated        bool       `json:"truncated,omitempty"`
+    OriginalBodySize int64      `json:"original_body_size,omitempty"`
+    SSEEvents        []SSEEvent `json:"sse_events,omitempty"`
+    ElapsedMS        int64      `json:"elapsed_ms,omitempty"`
+}
+
+// In UnmarshalJSON:
+type alias struct {
+    StatusCode       int             `json:"status_code"`
+    Headers          http.Header     `json:"headers"`
+    Body             json.RawMessage `json:"body"`
+    Truncated        bool            `json:"truncated,omitempty"`
+    OriginalBodySize int64           `json:"original_body_size,omitempty"`
+    SSEEvents        []SSEEvent      `json:"sse_events,omitempty"`
+    ElapsedMS        int64           `json:"elapsed_ms,omitempty"`
+}
+```
+
+And the field must be copied in/out of the alias in both methods.
+
+##### Recording helper
+
+A single unexported helper function used by all recording paths:
+
+```go
+// elapsedMS returns the elapsed time in milliseconds between start and the
+// current time. Used by all recording paths to populate RecordedResp.ElapsedMS.
+func elapsedMS(start time.Time) int64 {
+    return time.Since(start).Milliseconds()
+}
+```
+
+This helper is trivial but centralizes the computation so all 6 recording
+sites produce consistent values. The `nowFunc` injection for testing is
+handled at the call site level: each recording struct gains a `nowFunc`
+field, and the start time is captured via `nowFunc()` before the upstream
+call. The elapsed time is computed as `nowFunc().Sub(start).Milliseconds()`.
+
+Revised helper that supports injected clocks:
+
+```go
+// elapsedMS returns the elapsed time in milliseconds between start and now.
+func elapsedMS(start, now time.Time) int64 {
+    d := now.Sub(start)
+    if d < 0 {
+        return 0
+    }
+    return d.Milliseconds()
+}
+```
+
+This is a pure function with no I/O -- it lives in `tape.go` alongside the
+core types. Each recording site calls it with `elapsedMS(start, r.nowFunc())`.
+
+##### Recording paths inventory (6 sites)
+
+All 6 paths must instrument `ElapsedMS`. For each, the pattern is:
+
+1. Capture `start := r.nowFunc()` before the upstream `RoundTrip` call
+2. After the response body is fully read, compute
+   `elapsedMS(start, r.nowFunc())` and set it on `RecordedResp`
+
+| # | File | Function | Path type |
+|---|---|---|---|
+| 1 | `recorder.go` | `Recorder.RoundTrip` | Non-SSE |
+| 2 | `recorder.go` | `Recorder.roundTripSSE` | SSE (in `onDone` callback) |
+| 3 | `caching_transport.go` | `CachingTransport.roundTripUpstream` | Non-SSE |
+| 4 | `caching_transport.go` | `CachingTransport.roundTripSSE` | SSE (in `onDone` callback) |
+| 5 | `proxy.go` | `l1RecordingTransport.RoundTrip` | Non-SSE |
+| 6 | `proxy.go` | `l1RecordingTransport.roundTripSSE` | SSE (in `onDone` callback) |
+
+For SSE paths (2, 4, 6): the `startTime := time.Now()` already exists (used
+for `SSEEvent.OffsetMS`). The elapsed time is captured in the `onDone`
+callback when the stream finishes, using the same start time. This means
+`ElapsedMS` on an SSE tape represents the total stream duration, which is
+the correct semantic.
+
+For non-SSE paths (1, 3, 5): a `start` time is captured before `RoundTrip`
+and the elapsed time is captured after the response body is fully read.
+
+Each struct gains an unexported `nowFunc func() time.Time` field:
+- `Recorder.nowFunc` (default: `time.Now`)
+- `CachingTransport.nowFunc` (default: `time.Now`)
+- `l1RecordingTransport.nowFunc` (default: `time.Now`, propagated from
+  Proxy construction)
+
+Test-only unexported options:
+- `withRecorderNowFunc(fn func() time.Time) RecorderOption`
+- `withCacheNowFunc(fn func() time.Time) CachingOption`
+
+For `l1RecordingTransport`: the `nowFunc` is set from the Proxy during
+construction (same pattern as `onError`, `route`, etc.).
+
+##### ResponseTimingMode interface (sealed)
+
+```go
+// ResponseTimingMode controls how response elapsed time is applied during
+// replay. It is a sealed interface implemented by three unexported types.
+type ResponseTimingMode interface {
+    // responseDelay returns the duration to wait before replaying the
+    // response, given the recorded elapsed time in milliseconds.
+    responseDelay(elapsedMS int64) time.Duration
+    responseTimingMode() // seal
+}
+```
+
+Three unexported implementations:
+
+```go
+// responseTimingInstant skips all delay (default behavior).
+type responseTimingInstant struct{}
+
+func (responseTimingInstant) responseTimingMode()                          {}
+func (responseTimingInstant) responseDelay(_ int64) time.Duration         { return 0 }
+
+// responseTimingRecorded replays at the full recorded elapsed time.
+type responseTimingRecorded struct{}
+
+func (responseTimingRecorded) responseTimingMode()                         {}
+func (responseTimingRecorded) responseDelay(ms int64) time.Duration       { return time.Duration(ms) * time.Millisecond }
+
+// responseTimingAccelerated scales the recorded elapsed time by a factor.
+type responseTimingAccelerated struct {
+    factor float64
+}
+
+func (responseTimingAccelerated) responseTimingMode()                      {}
+func (a responseTimingAccelerated) responseDelay(ms int64) time.Duration  {
+    return time.Duration(float64(ms)/a.factor) * time.Millisecond
+}
+```
+
+Three exported constructors:
+
+```go
+// ResponseTimingInstant returns a ResponseTimingMode that skips all delay.
+// This is the default behavior: responses are replayed immediately.
+func ResponseTimingInstant() ResponseTimingMode {
+    return responseTimingInstant{}
+}
+
+// ResponseTimingRecorded returns a ResponseTimingMode that replays responses
+// after the full recorded elapsed time (RecordedResp.ElapsedMS).
+func ResponseTimingRecorded() ResponseTimingMode {
+    return responseTimingRecorded{}
+}
+
+// ResponseTimingAccelerated returns a ResponseTimingMode that scales the
+// recorded elapsed time by the given factor. Factor must be > 0; returns
+// an error otherwise. A factor < 1 slows replay down; a factor > 1 speeds
+// it up. For example, factor 0.1 replays at 10% of real speed (10x slower),
+// and factor 10 replays at 10x real speed.
+//
+// Note: the Accelerated name follows the SSETimingAccelerated precedent.
+// The factor semantics are identical: the recorded delay is divided by the
+// factor, so factor > 1 means faster, factor < 1 means slower.
+func ResponseTimingAccelerated(factor float64) (ResponseTimingMode, error) {
+    if factor <= 0 {
+        return nil, fmt.Errorf("httptape: ResponseTimingAccelerated factor must be > 0, got %g", factor)
+    }
+    return responseTimingAccelerated{factor: factor}, nil
+}
+```
+
+**Design note**: `ResponseTimingMode` and `SSETimingMode` remain separate
+interfaces. They model different domains: `SSETimingMode.delay` takes a
+slice of events and an index (inter-event gaps); `ResponseTimingMode.responseDelay`
+takes a single `int64` (total elapsed). A shared parent interface would
+add coupling without utility.
+
+##### Zero-value safety
+
+When `ElapsedMS` is 0 (pre-feature fixtures or unknown timing), all three
+modes return a zero `time.Duration`, which means no sleep. This is
+implemented naturally: `responseTimingRecorded.responseDelay(0)` returns 0,
+`responseTimingAccelerated.responseDelay(0)` returns 0. No special-casing
+needed.
+
+##### Server replay option
+
+```go
+// WithReplayTiming sets the response timing mode for non-SSE tape replay.
+// Defaults to ResponseTimingInstant (no delay). When set, the server
+// sleeps for the computed duration after the fixed/per-fixture delay
+// (WithDelay / metadata.delay) and before writing the response.
+//
+// Pre-feature fixtures (ElapsedMS == 0) produce no delay regardless of mode.
+func WithReplayTiming(mode ResponseTimingMode) ServerOption {
+    return func(s *Server) { s.replayTiming = mode }
+}
+```
+
+New field on `Server`:
+```go
+replayTiming ResponseTimingMode // controls response elapsed time replay
+```
+
+Default in `NewServer`: `ResponseTimingInstant()`.
+
+Server integration point (after the existing `effectiveDelay` block, before
+the SSE check):
+
+```go
+// 9b. Replay timing delay (recorded elapsed time).
+if replayDelay := s.replayTiming.responseDelay(tape.Response.ElapsedMS); replayDelay > 0 {
+    if err := s.sleepFunc(r.Context(), replayDelay); err != nil {
+        return // client disconnected
+    }
+}
+```
+
+For SSE tapes: the replay timing delay is also applied before entering
+`serveSSE`. This represents the "time to first response header" from the
+original recording. SSE inter-event timing is handled separately by
+`SSETimingMode`.
+
+##### CachingTransport replay option
+
+```go
+// WithCacheReplayTiming sets the response timing mode for cache-hit replay.
+// Defaults to ResponseTimingInstant (no delay). When set, RoundTrip sleeps
+// for the computed duration before returning the cached response.
+//
+// Pre-feature fixtures (ElapsedMS == 0) produce no delay regardless of mode.
+func WithCacheReplayTiming(mode ResponseTimingMode) CachingOption {
+    return func(ct *CachingTransport) { ct.replayTiming = mode }
+}
+```
+
+New field on `CachingTransport`:
+```go
+replayTiming ResponseTimingMode // controls cache-hit response timing
+```
+
+Default in `NewCachingTransport`: `ResponseTimingInstant()`.
+
+CachingTransport integration point: in the cache hit path of `RoundTrip`,
+before returning `tapeToResponse(tape)`:
+
+```go
+if tape.Response.IsSSE() {
+    if d := ct.replayTiming.responseDelay(tape.Response.ElapsedMS); d > 0 {
+        if err := ct.sleepFunc(req.Context(), d); err != nil {
+            return nil, err
+        }
+    }
+    return ct.sseResponseFromTape(tape), nil
+}
+if d := ct.replayTiming.responseDelay(tape.Response.ElapsedMS); d > 0 {
+    if err := ct.sleepFunc(req.Context(), d); err != nil {
+        return nil, err
+    }
+}
+return ct.tapeToResponse(tape), nil
+```
+
+##### Sleep function fields
+
+Both Server and CachingTransport gain an unexported `sleepFunc` field:
+
+```go
+// On Server:
+sleepFunc func(ctx context.Context, d time.Duration) error
+
+// On CachingTransport:
+sleepFunc func(ctx context.Context, d time.Duration) error
+```
+
+Default implementation (set in constructors):
+
+```go
+func defaultSleepFunc(ctx context.Context, d time.Duration) error {
+    timer := time.NewTimer(d)
+    defer timer.Stop()
+    select {
+    case <-timer.C:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+```
+
+`defaultSleepFunc` is a package-level unexported function in `tape.go` (or
+a dedicated helper file) since it is shared by Server and CachingTransport.
+
+Test-only unexported options:
+
+```go
+// withServerSleepFunc overrides the sleep function for testing.
+func withServerSleepFunc(fn func(context.Context, time.Duration) error) ServerOption {
+    return func(s *Server) { s.sleepFunc = fn }
+}
+
+// withCacheSleepFunc overrides the sleep function for testing.
+func withCacheSleepFunc(fn func(context.Context, time.Duration) error) CachingOption {
+    return func(ct *CachingTransport) { ct.sleepFunc = fn }
+}
+```
+
+#### File layout
+
+| File | Change |
+|---|---|
+| `tape.go` | Add `ElapsedMS int64` to `RecordedResp`. Add `ElapsedMS` to both MarshalJSON/UnmarshalJSON alias structs. Add `elapsedMS(start, now time.Time) int64` helper. Add `defaultSleepFunc`. |
+| `recorder.go` | Add `nowFunc` field to `Recorder`. Capture `start` before upstream call. Set `ElapsedMS` on all `RecordedResp` constructions. Add `withRecorderNowFunc` test option. |
+| `caching_transport.go` | Add `nowFunc` and `sleepFunc` and `replayTiming` fields to `CachingTransport`. Capture `start` before upstream call. Set `ElapsedMS` on `RecordedResp`. Apply replay timing on cache hit. Add `WithCacheReplayTiming` option. Add `withCacheNowFunc` and `withCacheSleepFunc` test options. |
+| `proxy.go` | Add `nowFunc` field to `l1RecordingTransport`. Propagate from Proxy. Capture `start` before upstream call. Set `ElapsedMS` on `RecordedResp`. |
+| `server.go` | Add `replayTiming` and `sleepFunc` fields to `Server`. Add `WithReplayTiming` option. Apply replay timing after `effectiveDelay` block. Add `withServerSleepFunc` test option. |
+| `tape_test.go` | Test `elapsedMS` helper. Test JSON round-trip with `ElapsedMS`. |
+| `recorder_test.go` | Test that recording captures `ElapsedMS > 0`. Test `nowFunc` injection. |
+| `caching_transport_test.go` | Test recording captures `ElapsedMS`. Test cache-hit replay with each timing mode. Test `sleepFunc` injection. |
+| `proxy_test.go` | Test L1 recording captures `ElapsedMS`. |
+| `server_test.go` | Test `WithReplayTiming` with `Recorded`, `Accelerated`, `Instant`. Test interaction with `WithDelay`. Test pre-feature fixtures (ElapsedMS=0). Test context cancellation during replay delay. |
+| `CHANGELOG.md` | Add entry under `[Unreleased]`. |
+| `docs/recording.md` | Document `ElapsedMS` field in recording output. |
+| `docs/replay.md` | New "Response timing" section documenting `ResponseTimingMode` and options. |
+
+#### Sequence: Server replay flow
+
+1. Request arrives at `Server.ServeHTTP`
+2. CORS / error simulation / tape matching (existing steps 1-8)
+3. Step 9: `effectiveDelay` block -- existing fixed/per-fixture delay. If
+   `WithDelay` or `metadata.delay` set, sleep (context-cancellable)
+4. **Step 9b (NEW)**: replay timing delay. Compute
+   `replayTiming.responseDelay(tape.Response.ElapsedMS)`. If > 0, call
+   `sleepFunc(ctx, delay)`. If context cancelled, return without writing.
+5. Step 10: SSE check -- if SSE tape, enter `serveSSE` (SSE inter-event
+   timing handled by `SSETimingMode`)
+6. Steps 11-12: templating, header injection, write response
+
+#### Sequence: CachingTransport replay flow
+
+1. Request arrives at `CachingTransport.RoundTrip`
+2. Buffer body, compute hash, cache lookup (existing steps 1-4)
+3. Cache hit found (step 5):
+   a. **NEW**: compute `replayTiming.responseDelay(tape.Response.ElapsedMS)`.
+      If > 0, call `sleepFunc(req.Context(), delay)`. If context cancelled,
+      return `nil, ctx.Err()`.
+   b. Return `tapeToResponse(tape)` or `sseResponseFromTape(tape)`
+4. Cache miss: forward to upstream (existing step 6) -- no replay delay
+   involved
+
+#### Error cases
+
+| Error case | Handling |
+|---|---|
+| `ResponseTimingAccelerated(0)` or negative factor | Returns `(nil, error)` -- constructor rejects |
+| `ElapsedMS` is 0 on a tape (pre-feature) | All modes return 0 delay -- no sleep |
+| Context cancelled during replay delay | `sleepFunc` returns `ctx.Err()`. Server: return without writing. CachingTransport: return `nil, ctx.Err()`. |
+| `ElapsedMS` is negative (corrupt fixture) | `responseTimingRecorded.responseDelay` would return a negative duration, which the sleep function should treat as 0 (no sleep). Add a guard: `if ms <= 0 { return 0 }` |
+| Stale fallback + replay timing on CachingTransport | Stale fallback responses also go through `tapeToResponse` which checks the replay timing. This is correct: a stale cached response with known elapsed time should still respect the timing mode. |
+
+#### Test strategy
+
+1. **Recording tests** (in `recorder_test.go`, `caching_transport_test.go`,
+   `proxy_test.go`):
+   - Use an `httptest.Server` that sleeps a known amount (e.g., 50ms)
+   - Verify `tape.Response.ElapsedMS >= 50` (tolerance-based)
+   - OR inject a fake `nowFunc` that returns controlled times and verify
+     `ElapsedMS` exactly matches the expected value (preferred: no flakiness)
+
+2. **Replay timing tests** (in `server_test.go`):
+   - Inject a fake `sleepFunc` that records the duration it was called with
+   - Create a fixture with `ElapsedMS = 500`
+   - With `ResponseTimingRecorded()`: verify `sleepFunc` called with 500ms
+   - With `ResponseTimingAccelerated(10)`: verify `sleepFunc` called with 50ms
+   - With `ResponseTimingInstant()`: verify `sleepFunc` never called
+   - With `ElapsedMS = 0`: verify `sleepFunc` never called regardless of mode
+   - With `WithDelay(100ms)` + `WithReplayTiming(ResponseTimingRecorded())`:
+     verify BOTH delays applied (effectiveDelay first, then replay timing)
+
+3. **CachingTransport replay tests** (in `caching_transport_test.go`):
+   - Same pattern: inject `sleepFunc`, verify durations for each mode
+   - Test context cancellation during sleep
+
+4. **JSON round-trip tests** (in `tape_test.go`):
+   - Serialize `RecordedResp{ElapsedMS: 42}` -> JSON contains `"elapsed_ms": 42`
+   - Serialize `RecordedResp{ElapsedMS: 0}` -> JSON does NOT contain `elapsed_ms`
+   - Deserialize JSON with `"elapsed_ms": 100` -> `ElapsedMS == 100`
+   - Deserialize JSON without `elapsed_ms` -> `ElapsedMS == 0` (backward compat)
+
+5. **ResponseTimingMode unit tests** (in a new test block in `server_test.go`
+   or `tape_test.go`):
+   - `ResponseTimingInstant().responseDelay(any)` returns 0
+   - `ResponseTimingRecorded().responseDelay(500)` returns 500ms
+   - `ResponseTimingRecorded().responseDelay(0)` returns 0
+   - `ResponseTimingAccelerated(10).responseDelay(1000)` returns 100ms
+   - `ResponseTimingAccelerated(0.5).responseDelay(1000)` returns 2000ms
+   - `ResponseTimingAccelerated(0)` returns error
+   - `ResponseTimingAccelerated(-1)` returns error
+
+6. **Race tests** (in `race_test.go`):
+   - Concurrent requests to Server with `WithReplayTiming(ResponseTimingRecorded())`
+     must be race-clean under `-race`
+
+#### File placement for ResponseTimingMode
+
+The `ResponseTimingMode` interface and its implementations live in `server.go`
+alongside `WithReplayTiming` and the other server options. This follows the
+pattern where `SSETimingMode` lives in `sse.go` alongside its related types.
+Since `ResponseTimingMode` is also used by CachingTransport, `server.go` is
+the authoritative definition and `caching_transport.go` references it. The
+type does not need its own file -- it is ~40 lines of code and is a replay
+concern.
+
+Alternative considered: putting `ResponseTimingMode` in `tape.go` since it
+operates on `RecordedResp.ElapsedMS`. Rejected because `SSETimingMode` (the
+precedent) is not in `tape.go` -- it is in `sse.go` with the SSE replay
+logic. `ResponseTimingMode` is a replay concept, not a core type.
+
+#### Consequences
+
+- **Additive schema change**: `RecordedResp.ElapsedMS` is a new field. Existing
+  fixtures without it deserialize to zero, which means no delay. Fully backward
+  compatible.
+- **No breaking API changes**: all new types and options are additive. Defaults
+  preserve existing behavior (`Instant` mode, recording always on).
+- **6 recording sites instrumented**: single helper keeps the computation
+  consistent. Test injection via `nowFunc` on each recording struct avoids
+  clock-dependent test flakiness.
+- **Replay timing is composable with existing delays**: `WithDelay` +
+  `WithReplayTiming` work together additively. Documented ordering prevents
+  user confusion.
+- **SSE tapes get ElapsedMS too**: even though SSE inter-event timing is
+  separate, the overall response elapsed time (TTFR + stream duration) is
+  still captured. This is consistent and may be useful for future TTFR replay.
+- **No new dependencies**: stdlib only. `time.NewTimer`, `context.Context`,
+  `time.Duration` -- all stdlib.
