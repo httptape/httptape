@@ -8,12 +8,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -518,5 +521,278 @@ func TestWithRecorderTLSConfig_CustomTransport(t *testing.T) {
 	}
 	if transport.MaxIdleConns != 42 {
 		t.Fatal("expected existing transport settings to be preserved")
+	}
+}
+
+// --- GenerateSelfSignedCert tests ---
+
+func TestGenerateSelfSignedCert_DefaultSANs(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parsed, err := x509.ParseCertificate(sc.TLSCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	if len(parsed.DNSNames) != 1 || parsed.DNSNames[0] != "localhost" {
+		t.Errorf("DNSNames = %v, want [localhost]", parsed.DNSNames)
+	}
+
+	wantIPs := []string{"127.0.0.1", "::1"}
+	if len(parsed.IPAddresses) != len(wantIPs) {
+		t.Fatalf("IPAddresses count = %d, want %d", len(parsed.IPAddresses), len(wantIPs))
+	}
+	for i, wantIP := range wantIPs {
+		if !parsed.IPAddresses[i].Equal(net.ParseIP(wantIP)) {
+			t.Errorf("IPAddresses[%d] = %v, want %s", i, parsed.IPAddresses[i], wantIP)
+		}
+	}
+}
+
+func TestGenerateSelfSignedCert_CustomHosts(t *testing.T) {
+	sc, err := GenerateSelfSignedCert("myhost.local", "10.0.0.1", "fe80::1")
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parsed, err := x509.ParseCertificate(sc.TLSCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	if len(parsed.DNSNames) != 1 || parsed.DNSNames[0] != "myhost.local" {
+		t.Errorf("DNSNames = %v, want [myhost.local]", parsed.DNSNames)
+	}
+
+	if len(parsed.IPAddresses) != 2 {
+		t.Fatalf("IPAddresses count = %d, want 2", len(parsed.IPAddresses))
+	}
+	if !parsed.IPAddresses[0].Equal(net.ParseIP("10.0.0.1")) {
+		t.Errorf("IPAddresses[0] = %v, want 10.0.0.1", parsed.IPAddresses[0])
+	}
+	if !parsed.IPAddresses[1].Equal(net.ParseIP("fe80::1")) {
+		t.Errorf("IPAddresses[1] = %v, want fe80::1", parsed.IPAddresses[1])
+	}
+}
+
+func TestGenerateSelfSignedCert_CertificateValidity(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parsed, err := x509.ParseCertificate(sc.TLSCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	now := time.Now()
+
+	// NotBefore should be approximately 1 hour in the past.
+	expectedNotBefore := now.Add(-1 * time.Hour)
+	if parsed.NotBefore.After(expectedNotBefore.Add(5 * time.Second)) {
+		t.Errorf("NotBefore = %v, want approximately %v", parsed.NotBefore, expectedNotBefore)
+	}
+	if parsed.NotBefore.Before(expectedNotBefore.Add(-5 * time.Second)) {
+		t.Errorf("NotBefore = %v, want approximately %v", parsed.NotBefore, expectedNotBefore)
+	}
+
+	// NotAfter should be approximately 24 hours from now.
+	expectedNotAfter := now.Add(24 * time.Hour)
+	if parsed.NotAfter.After(expectedNotAfter.Add(5 * time.Second)) {
+		t.Errorf("NotAfter = %v, want approximately %v", parsed.NotAfter, expectedNotAfter)
+	}
+	if parsed.NotAfter.Before(expectedNotAfter.Add(-5 * time.Second)) {
+		t.Errorf("NotAfter = %v, want approximately %v", parsed.NotAfter, expectedNotAfter)
+	}
+}
+
+func TestGenerateSelfSignedCert_ECDSAKeyType(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parsed, err := x509.ParseCertificate(sc.TLSCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	ecKey, ok := parsed.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("public key type = %T, want *ecdsa.PublicKey", parsed.PublicKey)
+	}
+	if ecKey.Curve != elliptic.P256() {
+		t.Errorf("curve = %v, want P-256", ecKey.Curve.Params().Name)
+	}
+}
+
+func TestGenerateSelfSignedCert_FingerprintFormat(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parts := strings.Split(sc.Fingerprint, ":")
+	if len(parts) != 32 {
+		t.Fatalf("fingerprint has %d parts, want 32 (SHA-256)", len(parts))
+	}
+	for i, p := range parts {
+		if len(p) != 2 {
+			t.Errorf("fingerprint part %d = %q, want 2 hex chars", i, p)
+		}
+		if p != strings.ToUpper(p) {
+			t.Errorf("fingerprint part %d = %q, want uppercase", i, p)
+		}
+	}
+}
+
+func TestGenerateSelfSignedCert_CertPEMIsValid(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	block, rest := pem.Decode(sc.CertPEM)
+	if block == nil {
+		t.Fatal("CertPEM did not decode as PEM")
+	}
+	if block.Type != "CERTIFICATE" {
+		t.Errorf("PEM type = %q, want CERTIFICATE", block.Type)
+	}
+	if len(rest) != 0 {
+		t.Error("unexpected trailing data after PEM block")
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(sc.CertPEM) {
+		t.Fatal("CertPEM could not be added to x509.CertPool")
+	}
+}
+
+func TestGenerateSelfSignedCert_TLSHandshakeSucceeds(t *testing.T) {
+	sc, err := GenerateSelfSignedCert("localhost", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	tlsLn := tls.NewListener(ln, &tls.Config{
+		Certificates: []tls.Certificate{sc.TLSCertificate},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "pong")
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(tlsLn)
+	defer srv.Close()
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(sc.CertPEM)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+	}
+
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/ping", ln.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "pong" {
+		t.Errorf("body = %q, want %q", string(body), "pong")
+	}
+}
+
+func TestGenerateSelfSignedCert_UntrustedClientRejects(t *testing.T) {
+	sc, err := GenerateSelfSignedCert("localhost", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	tlsLn := tls.NewListener(ln, &tls.Config{
+		Certificates: []tls.Certificate{sc.TLSCertificate},
+	})
+
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})}
+	go srv.Serve(tlsLn)
+	defer srv.Close()
+
+	// Client without custom RootCAs should reject the self-signed cert.
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{},
+		},
+	}
+
+	_, err = client.Get(fmt.Sprintf("https://127.0.0.1:%d/ping", ln.Addr().(*net.TCPAddr).Port))
+	if err == nil {
+		t.Fatal("expected TLS handshake error when client does not trust self-signed cert")
+	}
+}
+
+func TestGenerateSelfSignedCert_ServerAuthExtKeyUsage(t *testing.T) {
+	sc, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() error: %v", err)
+	}
+
+	parsed, err := x509.ParseCertificate(sc.TLSCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	found := false
+	for _, usage := range parsed.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageServerAuth {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("certificate missing ExtKeyUsageServerAuth")
+	}
+}
+
+func TestGenerateSelfSignedCert_UniqueSerialNumbers(t *testing.T) {
+	sc1, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() #1 error: %v", err)
+	}
+	sc2, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert() #2 error: %v", err)
+	}
+
+	p1, _ := x509.ParseCertificate(sc1.TLSCertificate.Certificate[0])
+	p2, _ := x509.ParseCertificate(sc2.TLSCertificate.Certificate[0])
+
+	if p1.SerialNumber.Cmp(p2.SerialNumber) == 0 {
+		t.Error("two generated certificates have the same serial number")
 	}
 }

@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -162,6 +163,84 @@ func parseSSETiming(s string) (httptape.SSETimingMode, error) {
 	}
 }
 
+// tlsListenerFlags holds the parsed --tls-listener-* flags common to
+// the serve, record, and proxy commands.
+type tlsListenerFlags struct {
+	cert string
+	key  string
+	auto bool
+	san  string
+}
+
+// registerTLSListenerFlags adds the four --tls-listener-* flags to a FlagSet.
+func registerTLSListenerFlags(fs *flag.FlagSet) *tlsListenerFlags {
+	f := &tlsListenerFlags{}
+	fs.StringVar(&f.cert, "tls-listener-cert", "", "Path to PEM certificate for inbound TLS")
+	fs.StringVar(&f.key, "tls-listener-key", "", "Path to PEM private key for inbound TLS")
+	fs.BoolVar(&f.auto, "tls-listener-auto", false, "Generate a self-signed cert at startup")
+	fs.StringVar(&f.san, "tls-listener-san", "localhost,127.0.0.1,::1",
+		"Comma-separated SANs for auto-cert (requires --tls-listener-auto)")
+	return f
+}
+
+// validate checks mutual-exclusion constraints and returns a *tls.Config for
+// the listener, or nil if no inbound TLS is configured.
+func (f *tlsListenerFlags) validate() (*tls.Config, error) {
+	hasCert := f.cert != ""
+	hasKey := f.key != ""
+
+	// Mutual exclusion: --tls-listener-auto vs explicit cert/key.
+	if f.auto && (hasCert || hasKey) {
+		return nil, fmt.Errorf("--tls-listener-auto is mutually exclusive with --tls-listener-cert/--tls-listener-key")
+	}
+
+	// --tls-listener-san requires --tls-listener-auto.
+	if !f.auto && f.san != "localhost,127.0.0.1,::1" {
+		return nil, fmt.Errorf("--tls-listener-san requires --tls-listener-auto")
+	}
+
+	// Cert and key must be provided together.
+	if hasCert && !hasKey {
+		return nil, fmt.Errorf("--tls-listener-cert requires --tls-listener-key")
+	}
+	if hasKey && !hasCert {
+		return nil, fmt.Errorf("--tls-listener-key requires --tls-listener-cert")
+	}
+
+	// Auto-generate self-signed cert.
+	if f.auto {
+		var hosts []string
+		for _, h := range strings.Split(f.san, ",") {
+			h = strings.TrimSpace(h)
+			if h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		sc, err := httptape.GenerateSelfSignedCert(hosts...)
+		if err != nil {
+			return nil, fmt.Errorf("generate self-signed cert: %w", err)
+		}
+		logger.Printf("TLS auto-cert generated (fingerprint: %s)", sc.Fingerprint)
+		return &tls.Config{
+			Certificates: []tls.Certificate{sc.TLSCertificate},
+		}, nil
+	}
+
+	// Explicit cert/key files.
+	if hasCert && hasKey {
+		cert, err := tls.LoadX509KeyPair(f.cert, f.key)
+		if err != nil {
+			return nil, fmt.Errorf("load listener certificate: %w", err)
+		}
+		return &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}, nil
+	}
+
+	// No inbound TLS configured.
+	return nil, nil
+}
+
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("httptape serve", flag.ContinueOnError)
 	fixtures := fs.String("fixtures", "", "Path to fixture directory (required)")
@@ -175,6 +254,7 @@ func runServe(args []string) error {
 	fs.Var(&replayHeaders, "replay-header", "Header to inject into responses (Key=Value, repeatable)")
 	sseTiming := fs.String("sse-timing", "", "SSE replay timing mode: realtime, instant, accelerated=<factor>")
 	synthesize := fs.Bool("synthesize", false, "Enable synthesis mode (exemplar tapes generate responses for unmatched URLs)")
+	tlsFlags := registerTLSListenerFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -267,10 +347,16 @@ func runServe(args []string) error {
 		return fmt.Errorf("create server: %w", err)
 	}
 
+	listenerTLS, err := tlsFlags.validate()
+	if err != nil {
+		return &usageError{err}
+	}
+
 	addr := fmt.Sprintf(":%d", *port)
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: server,
+		Addr:      addr,
+		Handler:   server,
+		TLSConfig: listenerTLS,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -287,9 +373,19 @@ func runServe(args []string) error {
 		}
 	}()
 
-	logger.Printf("serve mode: listening on %s, fixtures=%s", addr, *fixtures)
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-		return fmt.Errorf("server error: %w", err)
+	scheme := "http"
+	if listenerTLS != nil {
+		scheme = "https"
+	}
+	logger.Printf("serve mode: listening on %s://%s, fixtures=%s", scheme, addr, *fixtures)
+	if listenerTLS != nil {
+		if err := httpServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
+	} else {
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
 	}
 
 	logger.Println("shutdown complete")
@@ -307,6 +403,7 @@ func runRecord(args []string) error {
 	tlsKey := fs.String("tls-key", "", "Path to PEM client private key for mTLS")
 	tlsCA := fs.String("tls-ca", "", "Path to PEM CA certificate(s) for upstream verification")
 	tlsInsecure := fs.Bool("tls-insecure", false, "Skip TLS verification (dev only)")
+	tlsFlags := registerTLSListenerFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -388,10 +485,16 @@ func runRecord(args []string) error {
 		})
 	}
 
+	listenerTLS, err := tlsFlags.validate()
+	if err != nil {
+		return &usageError{err}
+	}
+
 	addr := fmt.Sprintf(":%d", *port)
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:      addr,
+		Handler:   handler,
+		TLSConfig: listenerTLS,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -413,9 +516,19 @@ func runRecord(args []string) error {
 		}
 	}()
 
-	logger.Printf("record mode: listening on %s, upstream=%s, fixtures=%s", addr, *upstream, *fixtures)
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-		return fmt.Errorf("server error: %w", err)
+	scheme := "http"
+	if listenerTLS != nil {
+		scheme = "https"
+	}
+	logger.Printf("record mode: listening on %s://%s, upstream=%s, fixtures=%s", scheme, addr, *upstream, *fixtures)
+	if listenerTLS != nil {
+		if err := httpServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
+	} else {
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
 	}
 
 	logger.Println("shutdown complete")
@@ -440,6 +553,7 @@ func runProxy(args []string) error {
 		"Active upstream probe cadence. 0 = disabled. When --health-endpoint is set "+
 			"and this is unset, defaults to 2s.")
 	sseTiming := fs.String("sse-timing", "", "SSE replay timing mode: realtime, instant, accelerated=<factor>")
+	tlsListenerFlags := registerTLSListenerFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return &usageError{err}
@@ -564,10 +678,16 @@ func runProxy(args []string) error {
 		})
 	}
 
+	listenerTLS, err := tlsListenerFlags.validate()
+	if err != nil {
+		return &usageError{err}
+	}
+
 	addr := fmt.Sprintf(":%d", *port)
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:      addr,
+		Handler:   handler,
+		TLSConfig: listenerTLS,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -596,9 +716,19 @@ func runProxy(args []string) error {
 		}
 	}()
 
-	logger.Printf("proxy mode: listening on %s, upstream=%s, fixtures=%s", addr, *upstream, *fixtures)
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-		return fmt.Errorf("server error: %w", err)
+	scheme := "http"
+	if listenerTLS != nil {
+		scheme = "https"
+	}
+	logger.Printf("proxy mode: listening on %s://%s, upstream=%s, fixtures=%s", scheme, addr, *upstream, *fixtures)
+	if listenerTLS != nil {
+		if err := httpServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
+	} else {
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
 	}
 
 	logger.Println("shutdown complete")

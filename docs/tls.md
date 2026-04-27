@@ -1,15 +1,107 @@
 # TLS / mTLS Configuration
 
+httptape supports TLS configuration for both **outbound** connections
+(httptape to upstream) and **inbound** connections (clients to httptape).
+
+## Inbound TLS (listener)
+
+httptape can listen on HTTPS instead of plain HTTP. This is useful when
+clients require TLS (e.g., mobile SDKs that reject plain HTTP, or
+browser-based dev tools with mixed-content restrictions).
+
+Two modes are available:
+
+| Mode | Use case | Flags |
+|------|----------|-------|
+| **Self-signed** | Quick local dev/CI -- no cert files needed | `--tls-listener-auto` |
+| **Explicit cert** | Bring your own PEM cert/key pair | `--tls-listener-cert` + `--tls-listener-key` |
+
+These flags are available on the `serve`, `record`, and `proxy` commands.
+The existing `--tls-*` flags (outbound) are unrelated and continue to work.
+
+### Self-signed (auto-generate)
+
+```bash
+httptape serve \
+  --fixtures ./fixtures \
+  --tls-listener-auto
+```
+
+At startup, httptape generates an ECDSA P-256 self-signed certificate
+(24h validity, 1h clock-skew window) covering the default SANs
+`localhost`, `127.0.0.1`, and `::1`. The SHA-256 fingerprint is printed
+to stderr.
+
+To customize the SANs:
+
+```bash
+httptape serve \
+  --fixtures ./fixtures \
+  --tls-listener-auto \
+  --tls-listener-san "myhost.local,10.0.0.1"
+```
+
+!!! warning "For development and tests only"
+    Self-signed certificates are not trusted by default. Clients must
+    either skip verification or programmatically trust the certificate.
+    Never use self-signed certificates in production.
+
+### Explicit certificate
+
+```bash
+httptape serve \
+  --fixtures ./fixtures \
+  --tls-listener-cert /path/to/server.crt \
+  --tls-listener-key  /path/to/server.key
+```
+
+### Mutual exclusion
+
+`--tls-listener-auto` is mutually exclusive with
+`--tls-listener-cert`/`--tls-listener-key`. Using both produces a
+usage error. `--tls-listener-san` requires `--tls-listener-auto`.
+
+### Go library usage (GenerateSelfSignedCert)
+
+The `GenerateSelfSignedCert` function generates a self-signed certificate
+for programmatic use in tests:
+
+```go
+import "github.com/VibeWarden/httptape"
+
+sc, err := httptape.GenerateSelfSignedCert("localhost", "127.0.0.1")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Use sc.TLSCertificate in a tls.Config for the listener.
+srv := &http.Server{
+    Handler: myHandler,
+    TLSConfig: &tls.Config{
+        Certificates: []tls.Certificate{sc.TLSCertificate},
+    },
+}
+
+// Trust the cert in test clients via sc.CertPEM.
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(sc.CertPEM)
+client := &http.Client{
+    Transport: &http.Transport{
+        TLSClientConfig: &tls.Config{RootCAs: pool},
+    },
+}
+```
+
+With no arguments, `GenerateSelfSignedCert()` covers `localhost`,
+`127.0.0.1`, and `::1`.
+
+## Outbound TLS (upstream)
+
 httptape supports custom TLS configuration for **outbound** connections
 (httptape to upstream). This enables recording and proxying through backends
 that use self-signed certificates, internal CAs, or mutual TLS (mTLS).
 
-!!! note "Inbound connections are not affected"
-    The TLS flags configure only the connection **from httptape to the upstream**.
-    httptape itself listens on plain HTTP. Place a reverse proxy (nginx, Caddy)
-    in front of httptape if you need TLS on the inbound side.
-
-## Four levels of TLS
+## Four levels of outbound TLS
 
 | Level | Use case | Configuration |
 |-------|----------|---------------|
