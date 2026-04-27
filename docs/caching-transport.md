@@ -159,6 +159,20 @@ httptape.WithCacheSSERecording(false) // disable
 
 Controls whether SSE (Server-Sent Events) stream recording is enabled. When enabled, SSE responses on the miss path are tee'd to the caller while events are accumulated and persisted as a tape. See [SSE recording](#sse-recording) below.
 
+### WithCacheLookupDisabled
+
+```go
+httptape.WithCacheLookupDisabled()
+```
+
+Disables the cache hit path entirely. Every request is treated as a miss: forwarded to upstream, recorded via the sanitization pipeline (if configured), and returned. Single-flight dedup, SSE tee, and sanitization remain active.
+
+The configured Matcher is still used by stale fallback (`WithCacheUpstreamDownFallback`), so the two options compose: disable the hit path but still serve stale tapes when upstream is down.
+
+Useful when the embedder owns its own hit-path logic (e.g., Proxy uses an L1 store consulted before this transport runs) and wants CachingTransport's other cross-cutting concerns without the cache lookup it would otherwise perform.
+
+Unlike using a never-matching Matcher, this option skips `Store.List` entirely on the hot path, avoiding unnecessary I/O.
+
 ### WithCacheUpstreamDownFallback
 
 ```go

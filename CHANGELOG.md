@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`WithCacheLookupDisabled()`**: CachingOption that disables the cache
+  hit path entirely. Every request is forwarded to upstream and recorded.
+  Single-flight dedup, SSE tee, sanitization, and stale fallback remain
+  active. Replaces the internal `neverMatcher` workaround used by Proxy. (#208)
+
 - **Template helpers**: `{{now}}`, `{{uuid}}`, `{{randomHex}}`, `{{randomInt}}`,
   `{{counter}}`, and `{{faker.*}}` template expressions in response bodies and
   headers. Helpers support keyword arguments (e.g., `{{now format=unix}}`). (#196)

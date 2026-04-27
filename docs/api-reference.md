@@ -141,6 +141,7 @@ Panics if `upstream` or `store` is nil.
 | WithCacheRoute | `WithCacheRoute(route string)` | `""` |
 | WithCacheOnError | `WithCacheOnError(fn func(error))` | no-op |
 | WithCacheSSERecording | `WithCacheSSERecording(enabled bool)` | `true` |
+| WithCacheLookupDisabled | `WithCacheLookupDisabled()` | `false` |
 | WithCacheUpstreamDownFallback | `WithCacheUpstreamDownFallback(enabled bool)` | `false` |
 | WithCacheUpstreamTimeout | `WithCacheUpstreamTimeout(d time.Duration)` | `0` (no timeout) |
 

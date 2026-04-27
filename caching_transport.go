@@ -31,9 +31,10 @@ type CachingTransport struct {
 	onError     func(error)
 	cacheFilter func(*http.Response) bool
 
-	singleFlight bool
-	maxBodySize  int
-	sseRecording bool
+	singleFlight   bool
+	lookupDisabled bool
+	maxBodySize    int
+	sseRecording   bool
 
 	// stale-fallback (#164)
 	staleFallback   bool
@@ -143,6 +144,25 @@ func WithCacheSSERecording(enabled bool) CachingOption {
 	}
 }
 
+// WithCacheLookupDisabled disables the cache hit path entirely.
+// Every request is treated as a miss: forwarded to upstream, recorded
+// via the sanitization pipeline (if configured), and returned.
+// Single-flight dedup, SSE tee, and sanitization remain active.
+//
+// The configured Matcher is still used by stale fallback
+// (WithCacheUpstreamDownFallback), so the two options compose:
+// disable the hit path but still serve stale tapes when upstream is down.
+//
+// Useful when the embedder owns its own hit-path logic (e.g., Proxy
+// uses an L1 store consulted before this transport runs) and wants
+// CachingTransport's other cross-cutting concerns without the cache
+// lookup it would otherwise perform.
+func WithCacheLookupDisabled() CachingOption {
+	return func(ct *CachingTransport) {
+		ct.lookupDisabled = true
+	}
+}
+
 // WithCacheUpstreamDownFallback enables stale-response fallback when
 // upstream is unreachable or returns a transport error on a cache miss.
 // When enabled, CachingTransport searches the store for the best-matching
@@ -249,31 +269,33 @@ func (ct *CachingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 	}
 
-	// 4. Cache lookup.
-	tapes, listErr := ct.store.List(req.Context(), Filter{Route: ct.route})
-	if listErr != nil {
-		// Store failure on lookup: proceed as miss.
-		ct.onErrorSafe(fmt.Errorf("httptape: caching transport store list: %w", listErr))
-		tapes = nil
-	}
+	// 4. Cache lookup (skipped when lookupDisabled is true).
+	if !ct.lookupDisabled {
+		tapes, listErr := ct.store.List(req.Context(), Filter{Route: ct.route})
+		if listErr != nil {
+			// Store failure on lookup: proceed as miss.
+			ct.onErrorSafe(fmt.Errorf("httptape: caching transport store list: %w", listErr))
+			tapes = nil
+		}
 
-	// Restore body for matcher consumption.
-	if reqBody != nil {
-		req.Body = io.NopCloser(bytes.NewReader(reqBody))
-	}
+		// Restore body for matcher consumption.
+		if reqBody != nil {
+			req.Body = io.NopCloser(bytes.NewReader(reqBody))
+		}
 
-	if tapes != nil {
-		tape, ok := ct.matcher.Match(req, tapes)
-		if ok {
-			// 5. HIT: synthesize response from tape.
-			if tape.Response.IsSSE() {
-				return ct.sseResponseFromTape(tape), nil
+		if tapes != nil {
+			tape, ok := ct.matcher.Match(req, tapes)
+			if ok {
+				// 5. HIT: synthesize response from tape.
+				if tape.Response.IsSSE() {
+					return ct.sseResponseFromTape(tape), nil
+				}
+				return ct.tapeToResponse(tape), nil
 			}
-			return ct.tapeToResponse(tape), nil
 		}
 	}
 
-	// Restore body again before upstream call.
+	// Restore body before upstream call.
 	if reqBody != nil {
 		req.Body = io.NopCloser(bytes.NewReader(reqBody))
 	}

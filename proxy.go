@@ -97,16 +97,6 @@ type Proxy struct {
 	upstreamURLHint string
 }
 
-// neverMatcher is a Matcher that never matches any request. It is used
-// by Proxy's internal CachingTransport to ensure every request is treated
-// as a cache miss and forwarded to upstream. Proxy handles its own
-// L1/L2 cache lookup in the fallback path with the user-configured matcher.
-type neverMatcher struct{}
-
-func (neverMatcher) Match(_ *http.Request, _ []Tape) (Tape, bool) {
-	return Tape{}, false
-}
-
 // l1RecordingTransport wraps an http.RoundTripper to intercept upstream
 // responses and save raw (unsanitized) tapes to the L1 store. This is
 // used by Proxy to inject L1 recording into CachingTransport's miss path
@@ -157,8 +147,12 @@ func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if req.GetBody != nil {
 		body, gbErr := req.GetBody()
 		if gbErr == nil {
-			reqBody, _ = io.ReadAll(body)
+			var readErr error
+			reqBody, readErr = io.ReadAll(body)
 			body.Close()
+			if readErr != nil {
+				t.onErrorSafe(fmt.Errorf("httptape: l1 recording read request body: %w", readErr))
+			}
 		}
 	}
 
@@ -541,10 +535,11 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error) {
 	// CachingTransport handles: upstream forwarding (via l1RecordingTransport),
 	// sanitization, L2 recording, SSE tee recording, single-flight dedup.
 	//
-	// neverMatcher ensures CachingTransport always treats requests as cache
-	// misses. Proxy handles its own L1/L2 lookup in the fallback path using
-	// the user-configured matcher. This preserves the original Proxy semantics
-	// where the upstream is always consulted first (caches are fallback-only).
+	// WithCacheLookupDisabled ensures CachingTransport skips the cache hit
+	// path entirely (no Store.List, no Matcher.Match). Proxy handles its own
+	// L1/L2 lookup in the fallback path using the user-configured matcher.
+	// This preserves the original Proxy semantics where the upstream is always
+	// consulted first (caches are fallback-only).
 	//
 	// The cacheFilter prevents CachingTransport from recording responses that
 	// would trigger Proxy's fallback. In the original Proxy, fallback-triggering
@@ -556,7 +551,7 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error) {
 	}
 
 	p.ct = NewCachingTransport(l1RT, p.l2,
-		WithCacheMatcher(neverMatcher{}),
+		WithCacheLookupDisabled(),
 		WithCacheSanitizer(p.sanitizer),
 		WithCacheRoute(p.route),
 		WithCacheOnError(p.onError),
@@ -606,8 +601,8 @@ func (p *Proxy) Close() error {
 // RoundTrip implements http.RoundTripper. The request flow is:
 //
 //  1. Capture request body (needed for fallback matching).
-//  2. Forward to CachingTransport.RoundTrip. CachingTransport always
-//     treats the request as a cache miss (neverMatcher) and forwards to
+//  2. Forward to CachingTransport.RoundTrip. CachingTransport has cache
+//     lookup disabled (WithCacheLookupDisabled) so it always forwards to
 //     upstream via l1RecordingTransport (saves raw to L1), then sanitizes
 //     and saves to L2.
 //  3. On success: check isFallback. If true (e.g., 5xx fallback), enter
@@ -630,10 +625,10 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	// 2. Forward to CachingTransport. CachingTransport uses a neverMatcher
-	// so it always treats the request as a cache miss and forwards to
-	// upstream via l1RecordingTransport (which saves raw to L1).
-	// CachingTransport then sanitizes and saves to L2.
+	// 2. Forward to CachingTransport. CachingTransport has cache lookup
+	// disabled so it always forwards to upstream via l1RecordingTransport
+	// (which saves raw to L1). CachingTransport then sanitizes and saves
+	// to L2.
 	resp, transportErr := p.ct.RoundTrip(req)
 
 	// 3. Decide: success or fallback?
