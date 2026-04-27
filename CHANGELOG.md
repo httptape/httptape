@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`RecordedResp.ElapsedMS`**: records total response time in milliseconds
+  for every HTTP interaction (non-SSE and SSE). Always-on, no opt-out.
+  Pre-feature fixtures (missing or zero `elapsed_ms`) are backward
+  compatible. (#240)
+
+- **`ResponseTimingMode`** sealed interface with three constructors for
+  opt-in replay delay based on recorded elapsed time:
+  - `ResponseTimingInstant()` -- no delay (default, preserves pre-feature behavior)
+  - `ResponseTimingRecorded()` -- replay with recorded elapsed time
+  - `ResponseTimingAccelerated(factor)` -- scale recorded elapsed time by factor
+
+- **`WithReplayTiming(mode)`**: ServerOption that applies replay timing
+  delay. Composes additively with `WithDelay` / `metadata.delay`.
+  Pre-feature fixtures incur no delay regardless of mode. (#240)
+
+- **`WithCacheReplayTiming(mode)`**: CachingOption that applies replay
+  timing delay on cache-hit responses. (#240)
+
 - **`WithCacheLookupDisabled()`**: CachingOption that disables the cache
   hit path entirely. Every request is forwarded to upstream and recorded.
   Single-flight dedup, SSE tee, sanitization, and stale fallback remain

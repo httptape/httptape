@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1823,5 +1824,103 @@ func TestRecorder_MalformedJSON(t *testing.T) {
 	}
 	if !bytes.Equal(tapes[0].Request.Body, malformed) {
 		t.Error("malformed JSON request body was unexpectedly modified")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ElapsedMS recording
+// ---------------------------------------------------------------------------
+
+func TestRecorder_ElapsedMS_NonSSE(t *testing.T) {
+	store := NewMemoryStore()
+
+	callCount := 0
+	fakeNow := func() time.Time {
+		callCount++
+		// First call: start time. Second call: after response body read.
+		if callCount == 1 {
+			return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		return time.Date(2026, 1, 1, 0, 0, 0, 150*int(time.Millisecond), time.UTC)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("hello"))
+	}))
+	defer upstream.Close()
+
+	rec := NewRecorder(store,
+		WithAsync(false),
+		withRecorderNowFunc(fakeNow),
+	)
+	defer rec.Close()
+
+	client := &http.Client{Transport: rec}
+	resp, err := client.Get(upstream.URL + "/api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if tapes[0].Response.ElapsedMS != 150 {
+		t.Errorf("ElapsedMS = %d, want 150", tapes[0].Response.ElapsedMS)
+	}
+}
+
+func TestRecorder_ElapsedMS_SSE(t *testing.T) {
+	store := NewMemoryStore()
+
+	// The nowFunc is called twice: once for startTime (callCount=1) and once
+	// in elapsedMS at onDone time (callCount=2). We use a monotonic sequence.
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var callCount atomic.Int64
+	fakeNow := func() time.Time {
+		n := callCount.Add(1)
+		if n == 1 {
+			return baseTime
+		}
+		return baseTime.Add(500 * time.Millisecond)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: hello\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: world\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	rec := NewRecorder(store,
+		WithAsync(false),
+		withRecorderNowFunc(fakeNow),
+	)
+	defer rec.Close()
+
+	client := &http.Client{Transport: rec}
+	resp, err := client.Get(upstream.URL + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Must consume the body for the SSE recording to complete.
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if !tapes[0].Response.IsSSE() {
+		t.Fatal("expected SSE tape")
+	}
+	if tapes[0].Response.ElapsedMS != 500 {
+		t.Errorf("ElapsedMS = %d, want 500", tapes[0].Response.ElapsedMS)
 	}
 }

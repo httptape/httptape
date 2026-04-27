@@ -46,6 +46,7 @@ type Recorder struct {
 	maxBodySize   int               // max body size in bytes; 0 = no limit
 	skipRedirects bool              // when true, skip recording 3xx responses
 	sseRecording  bool              // true = detect and record SSE streams (default true)
+	nowFunc       func() time.Time  // clock for elapsed-time measurement; injectable for testing
 
 	// async internals
 	sendMu    sync.Mutex    // coordinates closed-check-then-send with close-channel
@@ -190,6 +191,13 @@ func WithRecorderTLSConfig(cfg *tls.Config) RecorderOption {
 	}
 }
 
+// withRecorderNowFunc overrides the clock for elapsed-time measurement.
+// This is unexported -- only used in tests to make elapsed-time
+// deterministic without real sleeping.
+func withRecorderNowFunc(fn func() time.Time) RecorderOption {
+	return func(r *Recorder) { r.nowFunc = fn }
+}
+
 // NewRecorder creates a new Recorder wrapping the given store.
 // If transport is nil, http.DefaultTransport is used.
 //
@@ -215,6 +223,7 @@ func NewRecorder(store Store, opts ...RecorderOption) *Recorder {
 		randFloat:    rand.Float64,
 		bufSize:      1024,
 		sseRecording: true,
+		nowFunc:      time.Now,
 	}
 
 	for _, opt := range opts {
@@ -274,6 +283,7 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Execute the actual HTTP call.
+	startTime := r.nowFunc()
 	resp, err := r.transport.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -287,7 +297,7 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// SSE detection: if the response is text/event-stream and SSE recording
 	// is enabled, use the streaming recording path instead of buffering.
 	if r.sseRecording && isSSEContentType(resp.Header.Get("Content-Type")) {
-		return r.roundTripSSE(req, resp, reqBody)
+		return r.roundTripSSE(req, resp, reqBody, startTime)
 	}
 
 	// Capture response body.
@@ -343,6 +353,7 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		Body:             respBody,
 		Truncated:        respTruncated,
 		OriginalBodySize: respOrigSize,
+		ElapsedMS:        elapsedMS(startTime, r.nowFunc),
 	}
 
 	tape := NewTape(r.route, recordedReq, recordedResp)
@@ -360,8 +371,8 @@ func (r *Recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 // in an sseRecordingReader that delivers bytes to the caller unchanged while
 // parsing SSE events in a background goroutine. Tape persistence is deferred
 // until the caller finishes consuming the body (Close or EOF).
-func (r *Recorder) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) (*http.Response, error) {
-	startTime := time.Now()
+func (r *Recorder) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte, startTime time.Time) (*http.Response, error) {
+	nowFunc := r.nowFunc // capture for closure
 	respHeaders := resp.Header.Clone()
 
 	var mu sync.Mutex
@@ -416,6 +427,7 @@ func (r *Recorder) roundTripSSE(req *http.Request, resp *http.Response, reqBody 
 			Body:       nil,
 			SSEEvents:  collectedEvents,
 			Truncated:  truncated,
+			ElapsedMS:  elapsedMS(startTime, nowFunc),
 		}
 
 		tape := NewTape(r.route, recordedReq, recordedResp)

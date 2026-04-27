@@ -1581,3 +1581,202 @@ func TestCachingTransport_LookupDisabledSkipsStoreList(t *testing.T) {
 		t.Errorf("Store.List was called %d times, want 0 (lookup disabled should skip store query)", calls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ElapsedMS recording on cache miss (non-SSE)
+// ---------------------------------------------------------------------------
+
+func TestCachingTransport_ElapsedMS_NonSSE(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore()
+	callCount := 0
+	fakeNow := func() time.Time {
+		callCount++
+		if callCount == 1 {
+			return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		return time.Date(2026, 1, 1, 0, 0, 0, 200*int(time.Millisecond), time.UTC)
+	}
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheSingleFlight(false),
+		withCacheNowFunc(fakeNow),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if tapes[0].Response.ElapsedMS != 200 {
+		t.Errorf("ElapsedMS = %d, want 200", tapes[0].Response.ElapsedMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ElapsedMS recording on cache miss (SSE)
+// ---------------------------------------------------------------------------
+
+func TestCachingTransport_ElapsedMS_SSE(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore()
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var callCount atomic.Int64
+	fakeNow := func() time.Time {
+		n := callCount.Add(1)
+		if n == 1 {
+			return baseTime
+		}
+		return baseTime.Add(750 * time.Millisecond)
+	}
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		body := "data: event1\n\ndata: event2\n\n"
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheSingleFlight(false),
+		withCacheNowFunc(fakeNow),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Consume body to trigger SSE recording completion.
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tapes, _ := store.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 tape, got %d", len(tapes))
+	}
+	if !tapes[0].Response.IsSSE() {
+		t.Fatal("expected SSE tape")
+	}
+	if tapes[0].Response.ElapsedMS != 750 {
+		t.Errorf("ElapsedMS = %d, want 750", tapes[0].Response.ElapsedMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WithCacheReplayTiming on cache hit
+// ---------------------------------------------------------------------------
+
+func TestCachingTransport_WithCacheReplayTiming_Recorded(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/api",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{},
+		Body:       []byte("cached"),
+		ElapsedMS:  300,
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepCalled bool
+	var sleepDuration time.Duration
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		t.Error("upstream should not be called on cache hit")
+		return nil, fmt.Errorf("unreachable")
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheReplayTiming(ResponseTimingRecorded()),
+		withCacheSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepCalled = true
+			sleepDuration = d
+			return nil
+		}),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(body) != "cached" {
+		t.Errorf("body = %q, want %q", string(body), "cached")
+	}
+	if !sleepCalled {
+		t.Error("sleepFunc was not called for recorded timing")
+	}
+	if sleepDuration != 300*time.Millisecond {
+		t.Errorf("sleepDuration = %v, want 300ms", sleepDuration)
+	}
+}
+
+func TestCachingTransport_WithCacheReplayTiming_PreFeatureNoDelay(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore()
+	tape := NewTape("", RecordedReq{
+		Method:   "GET",
+		URL:      "http://example.com/api",
+		Headers:  http.Header{},
+		BodyHash: "",
+	}, RecordedResp{
+		StatusCode: 200,
+		Headers:    http.Header{},
+		Body:       []byte("cached"),
+		ElapsedMS:  0, // pre-feature
+	})
+	store.Save(context.Background(), tape)
+
+	var sleepCalled bool
+
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unreachable")
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheReplayTiming(ResponseTimingRecorded()),
+		withCacheSleepFunc(func(_ context.Context, d time.Duration) error {
+			sleepCalled = true
+			return nil
+		}),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if sleepCalled {
+		t.Error("sleepFunc was called for pre-feature fixture (ElapsedMS=0)")
+	}
+}

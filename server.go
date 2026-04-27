@@ -1,6 +1,7 @@
 package httptape
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -20,20 +21,22 @@ import (
 type Server struct {
 	store            Store
 	matcher          Matcher
-	fallbackStatus   int                 // HTTP status when no tape matches
-	fallbackBody     []byte              // response body when no tape matches
-	onNoMatch        func(*http.Request) // optional callback when no tape matches
-	cors             bool                // if true, add CORS headers to all responses
-	delay            time.Duration       // fixed delay before every response; zero means no delay
-	errorRate        float64             // fraction of requests that return 500 (0.0-1.0)
-	randFloat        func() float64      // random number generator (injectable for testing)
-	replayHeaders    map[string]string   // headers injected into every replayed response
-	templating       bool                // if true, resolve {{...}} in responses
-	strictTemplating bool                // if true, unresolvable expressions produce 500
-	sseTiming        SSETimingMode       // controls SSE replay inter-event timing
-	counters         *counterState       // per-server counter state for {{counter}}
-	randSource       io.Reader           // randomness source for template helpers
-	synthesis        bool                // if true, exemplar tapes are consulted on miss
+	fallbackStatus   int                                        // HTTP status when no tape matches
+	fallbackBody     []byte                                     // response body when no tape matches
+	onNoMatch        func(*http.Request)                        // optional callback when no tape matches
+	cors             bool                                       // if true, add CORS headers to all responses
+	delay            time.Duration                              // fixed delay before every response; zero means no delay
+	errorRate        float64                                    // fraction of requests that return 500 (0.0-1.0)
+	randFloat        func() float64                             // random number generator (injectable for testing)
+	replayHeaders    map[string]string                          // headers injected into every replayed response
+	templating       bool                                       // if true, resolve {{...}} in responses
+	strictTemplating bool                                       // if true, unresolvable expressions produce 500
+	sseTiming        SSETimingMode                              // controls SSE replay inter-event timing
+	replayTiming     ResponseTimingMode                         // controls response elapsed-time replay delay
+	sleepFunc        func(context.Context, time.Duration) error // injectable sleep for testing
+	counters         *counterState                              // per-server counter state for {{counter}}
+	randSource       io.Reader                                  // randomness source for template helpers
+	synthesis        bool                                       // if true, exemplar tapes are consulted on miss
 }
 
 // ServerOption configures a Server.
@@ -193,6 +196,117 @@ func withRandSource(r io.Reader) ServerOption {
 	return func(s *Server) { s.randSource = r }
 }
 
+// ResponseTimingMode controls how the recorded response elapsed time is
+// applied during replay. It is a sealed interface implemented by three
+// unexported types, mirroring SSETimingMode.
+type ResponseTimingMode interface {
+	// responseDelay returns the duration to sleep before sending the
+	// response, given the recorded elapsed time in milliseconds.
+	// Returns zero for unknown elapsed time (elapsedMS <= 0).
+	responseDelay(elapsedMS int64) time.Duration
+	responseTimingMode() // seal
+}
+
+// responseTimingInstant replays responses immediately with no delay.
+// This is the default and preserves pre-feature behavior.
+type responseTimingInstant struct{}
+
+func (responseTimingInstant) responseTimingMode() {}
+func (responseTimingInstant) responseDelay(_ int64) time.Duration {
+	return 0
+}
+
+// responseTimingRecorded replays responses with the original recorded
+// elapsed time as a delay.
+type responseTimingRecorded struct{}
+
+func (responseTimingRecorded) responseTimingMode() {}
+func (responseTimingRecorded) responseDelay(elapsedMS int64) time.Duration {
+	if elapsedMS <= 0 {
+		return 0
+	}
+	return time.Duration(elapsedMS) * time.Millisecond
+}
+
+// responseTimingAccelerated divides the recorded elapsed time by the
+// given factor. Factor > 1 means slower than recorded; factor < 1 means
+// faster than recorded.
+type responseTimingAccelerated struct {
+	factor float64
+}
+
+func (responseTimingAccelerated) responseTimingMode() {}
+func (a responseTimingAccelerated) responseDelay(elapsedMS int64) time.Duration {
+	if elapsedMS <= 0 {
+		return 0
+	}
+	return time.Duration(float64(elapsedMS)*a.factor) * time.Millisecond
+}
+
+// ResponseTimingInstant returns a ResponseTimingMode that replays responses
+// immediately with no delay. This is the default mode and preserves
+// pre-feature behavior.
+func ResponseTimingInstant() ResponseTimingMode {
+	return responseTimingInstant{}
+}
+
+// ResponseTimingRecorded returns a ResponseTimingMode that replays responses
+// with the original recorded elapsed time as a delay. Pre-feature fixtures
+// (ElapsedMS == 0) are replayed instantly regardless of this setting.
+func ResponseTimingRecorded() ResponseTimingMode {
+	return responseTimingRecorded{}
+}
+
+// ResponseTimingAccelerated returns a ResponseTimingMode that scales the
+// recorded elapsed time by the given factor. A factor > 1 makes responses
+// slower than recorded; a factor < 1 makes them faster. Factor must be > 0;
+// returns an error otherwise.
+func ResponseTimingAccelerated(factor float64) (ResponseTimingMode, error) {
+	if factor <= 0 {
+		return nil, fmt.Errorf("httptape: ResponseTimingAccelerated factor must be > 0, got %g", factor)
+	}
+	return responseTimingAccelerated{factor: factor}, nil
+}
+
+// WithReplayTiming sets the response timing mode for replayed responses.
+// Defaults to ResponseTimingInstant() (no delay, preserving pre-feature
+// behavior).
+//
+// Timing composition: WithReplayTiming composes ADDITIVELY with
+// WithDelay / metadata.delay. The existing effectiveDelay (user-authored
+// "simulate slow API" delay) runs first, then the replay timing delay
+// runs second, before the response is written. This means if WithDelay
+// is 100ms and the recorded elapsed time is 200ms with
+// ResponseTimingRecorded(), the total delay is 300ms. Pre-feature
+// fixtures (ElapsedMS == 0) incur no replay timing delay regardless
+// of mode.
+func WithReplayTiming(mode ResponseTimingMode) ServerOption {
+	return func(s *Server) { s.replayTiming = mode }
+}
+
+// withSleepFunc overrides the sleep function for testing. This is
+// unexported -- only used in tests to avoid real sleeping.
+func withSleepFunc(fn func(context.Context, time.Duration) error) ServerOption {
+	return func(s *Server) { s.sleepFunc = fn }
+}
+
+// defaultSleepFunc sleeps for the given duration, respecting context
+// cancellation. Returns nil on successful sleep, or the context error
+// if the context is cancelled during the sleep.
+func defaultSleepFunc(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // NewServer creates a new Server that replays tapes from the given store.
 //
 // By default:
@@ -222,6 +336,8 @@ func NewServer(store Store, opts ...ServerOption) (*Server, error) {
 		fallbackBody:   []byte("httptape: no matching tape found"),
 		templating:     true,
 		sseTiming:      SSETimingRealtime(),
+		replayTiming:   ResponseTimingInstant(),
+		sleepFunc:      defaultSleepFunc,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -374,6 +490,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// delay elapsed, proceed to write response
 		case <-r.Context().Done():
 			// client disconnected during delay, bail out
+			return
+		}
+	}
+
+	// 9b. Replay timing delay (opt-in via WithReplayTiming). This composes
+	// ADDITIVELY with the effectiveDelay above: WithDelay / metadata.delay
+	// is a user-authored "simulate slow API" delay, while WithReplayTiming
+	// is replay-fidelity. Both run sequentially so the total delay is their
+	// sum. Pre-feature fixtures (ElapsedMS == 0) incur no replay timing
+	// delay regardless of mode.
+	if replayDelay := s.replayTiming.responseDelay(tape.Response.ElapsedMS); replayDelay > 0 {
+		if err := s.sleepFunc(r.Context(), replayDelay); err != nil {
+			// Context cancelled during replay timing delay.
 			return
 		}
 	}

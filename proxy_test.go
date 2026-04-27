@@ -1135,6 +1135,7 @@ func TestL1RecordingTransport_ResponseBodyReadError(t *testing.T) {
 		l1:      l1,
 		route:   "test",
 		onError: func(err error) { capturedErr = err },
+		nowFunc: time.Now,
 		isFallback: func(err error, _ *http.Response) bool {
 			return err != nil
 		},
@@ -1181,6 +1182,7 @@ func TestL1RecordingTransport_SaveError(t *testing.T) {
 		l1:      l1,
 		route:   "test",
 		onError: func(err error) { capturedErr = err },
+		nowFunc: time.Now,
 		isFallback: func(err error, _ *http.Response) bool {
 			return err != nil
 		},
@@ -1685,6 +1687,7 @@ func TestL1RecordingTransport_SSETruncation(t *testing.T) {
 			capturedErrors = append(capturedErrors, err.Error())
 			mu.Unlock()
 		},
+		nowFunc: time.Now,
 		isFallback: func(err error, _ *http.Response) bool {
 			return err != nil
 		},
@@ -1753,6 +1756,7 @@ func TestL1RecordingTransport_SSESaveError(t *testing.T) {
 			capturedErrors = append(capturedErrors, err.Error())
 			mu.Unlock()
 		},
+		nowFunc: time.Now,
 		isFallback: func(err error, _ *http.Response) bool {
 			return err != nil
 		},
@@ -1843,5 +1847,145 @@ func TestProxy_SSEResponseFromTape_WithTiming(t *testing.T) {
 	// The 80ms inter-event delay should be applied (within tolerance).
 	if elapsed < 50*time.Millisecond {
 		t.Errorf("elapsed %v, expected >= 50ms for 80ms timing delay", elapsed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: ElapsedMS is recorded (non-SSE)
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_ElapsedMS_NonSSE(t *testing.T) {
+	l1 := NewMemoryStore()
+
+	callCount := 0
+	fakeNow := func() time.Time {
+		callCount++
+		if callCount == 1 {
+			return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		return time.Date(2026, 1, 1, 0, 0, 0, 120*int(time.Millisecond), time.UTC)
+	}
+
+	transport := successTransport(200, "ok")
+
+	l1rt := &l1RecordingTransport{
+		inner:   transport,
+		l1:      l1,
+		route:   "test",
+		nowFunc: fakeNow,
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tapes, _ := l1.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 L1 tape, got %d", len(tapes))
+	}
+	if tapes[0].Response.ElapsedMS != 120 {
+		t.Errorf("ElapsedMS = %d, want 120", tapes[0].Response.ElapsedMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// l1RecordingTransport: ElapsedMS is recorded (SSE)
+// ---------------------------------------------------------------------------
+
+func TestL1RecordingTransport_ElapsedMS_SSE(t *testing.T) {
+	l1 := NewMemoryStore()
+
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var callCount atomic.Int64
+	fakeNow := func() time.Time {
+		n := callCount.Add(1)
+		if n == 1 {
+			return baseTime
+		}
+		return baseTime.Add(400 * time.Millisecond)
+	}
+
+	body := "data: hello\n\ndata: world\n\n"
+	transport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	l1rt := &l1RecordingTransport{
+		inner:   transport,
+		l1:      l1,
+		route:   "test",
+		nowFunc: fakeNow,
+		isFallback: func(err error, _ *http.Response) bool {
+			return err != nil
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := l1rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	tapes, _ := l1.List(context.Background(), Filter{})
+	if len(tapes) != 1 {
+		t.Fatalf("expected 1 L1 tape, got %d", len(tapes))
+	}
+	if !tapes[0].Response.IsSSE() {
+		t.Fatal("expected SSE tape")
+	}
+	if tapes[0].Response.ElapsedMS != 400 {
+		t.Errorf("ElapsedMS = %d, want 400", tapes[0].Response.ElapsedMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proxy: ElapsedMS is recorded in both L1 and L2
+// ---------------------------------------------------------------------------
+
+func TestProxy_ElapsedMS_Recorded(t *testing.T) {
+	l1 := NewMemoryStore()
+	l2 := NewMemoryStore()
+
+	proxy, err := NewProxy(l1, l2,
+		WithProxyTransport(successTransport(200, "ok")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+	resp, err := proxy.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	l1Tapes, _ := l1.List(context.Background(), Filter{})
+	l2Tapes, _ := l2.List(context.Background(), Filter{})
+	if len(l1Tapes) != 1 || len(l2Tapes) != 1 {
+		t.Fatalf("expected 1 tape in each store, got L1=%d, L2=%d", len(l1Tapes), len(l2Tapes))
+	}
+
+	// Both tapes should have a positive ElapsedMS (actual HTTP round-trip
+	// happened, so elapsed > 0 unless the machine is impossibly fast).
+	if l1Tapes[0].Response.ElapsedMS < 0 {
+		t.Errorf("L1 ElapsedMS = %d, want >= 0", l1Tapes[0].Response.ElapsedMS)
+	}
+	if l2Tapes[0].Response.ElapsedMS < 0 {
+		t.Errorf("L2 ElapsedMS = %d, want >= 0", l2Tapes[0].Response.ElapsedMS)
 	}
 }

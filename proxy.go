@@ -121,6 +121,7 @@ type l1RecordingTransport struct {
 	onError    func(error)
 	health     *HealthMonitor
 	isFallback func(err error, resp *http.Response) bool
+	nowFunc    func() time.Time // clock for elapsed-time measurement; injectable for testing
 }
 
 // RoundTrip forwards the request to the real upstream and saves the raw
@@ -130,6 +131,7 @@ type l1RecordingTransport struct {
 // its own SSE tee recording reader for L2. Returns the upstream response
 // (possibly with a wrapped body for SSE).
 func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	startTime := t.nowFunc()
 	resp, err := t.inner.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -159,7 +161,7 @@ func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, err
 	// SSE responses: wrap body with an sseRecordingReader for L1 recording.
 	// CachingTransport will wrap the returned body again for L2 recording.
 	if isSSEContentType(resp.Header.Get("Content-Type")) {
-		return t.roundTripSSE(req, resp, reqBody), nil
+		return t.roundTripSSE(req, resp, reqBody, startTime), nil
 	}
 
 	// Non-SSE: read response body, build raw tape, save to L1, restore body.
@@ -188,6 +190,7 @@ func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, err
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header.Clone(),
 		Body:       respBody,
+		ElapsedMS:  elapsedMS(startTime, t.nowFunc),
 	}
 
 	rawTape := NewTape(t.route, recordedReq, recordedResp)
@@ -205,8 +208,8 @@ func (t *l1RecordingTransport) RoundTrip(req *http.Request) (*http.Response, err
 // roundTripSSE handles SSE responses in the L1 recording path. The body
 // is wrapped in an sseRecordingReader that accumulates events and saves a
 // raw tape to L1 when the stream completes.
-func (t *l1RecordingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte) *http.Response {
-	startTime := time.Now()
+func (t *l1RecordingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte, startTime time.Time) *http.Response {
+	nowFunc := t.nowFunc // capture for closure
 	respHeaders := resp.Header.Clone()
 
 	recordedReq := RecordedReq{
@@ -243,6 +246,7 @@ func (t *l1RecordingTransport) roundTripSSE(req *http.Request, resp *http.Respon
 			Body:       nil,
 			SSEEvents:  collectedEvents,
 			Truncated:  truncated,
+			ElapsedMS:  elapsedMS(startTime, nowFunc),
 		}
 
 		rawTape := NewTape(t.route, recordedReq, recordedResp)
@@ -529,6 +533,7 @@ func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error) {
 		onError:    p.onError,
 		health:     p.health,
 		isFallback: p.isFallback,
+		nowFunc:    time.Now,
 	}
 
 	// Construct CachingTransport with l1RecordingTransport as upstream.

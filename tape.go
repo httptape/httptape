@@ -126,6 +126,13 @@ type RecordedResp struct {
 	// When nil or empty (including for tapes created before SSE support was
 	// added), the tape is treated as a regular HTTP response.
 	SSEEvents []SSEEvent `json:"sse_events,omitempty"`
+
+	// ElapsedMS is the total response time in milliseconds, measured from
+	// when the request was sent to when the response body was fully received
+	// (non-SSE) or when the SSE stream completed (SSE). Zero means unknown
+	// (pre-feature fixtures or measurement failure). Always recorded; replay
+	// delay is opt-in via WithReplayTiming / WithCacheReplayTiming.
+	ElapsedMS int64 `json:"elapsed_ms,omitempty"`
 }
 
 // IsSSE reports whether this response represents an SSE stream.
@@ -216,6 +223,7 @@ func (r RecordedResp) MarshalJSON() ([]byte, error) {
 		Truncated        bool        `json:"truncated,omitempty"`
 		OriginalBodySize int64       `json:"original_body_size,omitempty"`
 		SSEEvents        []SSEEvent  `json:"sse_events,omitempty"`
+		ElapsedMS        int64       `json:"elapsed_ms,omitempty"`
 	}
 
 	a := alias{
@@ -225,6 +233,7 @@ func (r RecordedResp) MarshalJSON() ([]byte, error) {
 		Truncated:        r.Truncated,
 		OriginalBodySize: r.OriginalBodySize,
 		SSEEvents:        r.SSEEvents,
+		ElapsedMS:        r.ElapsedMS,
 	}
 
 	a.Body = marshalBody(r.Body, r.Headers)
@@ -242,6 +251,7 @@ func (r *RecordedResp) UnmarshalJSON(data []byte) error {
 		Truncated        bool            `json:"truncated,omitempty"`
 		OriginalBodySize int64           `json:"original_body_size,omitempty"`
 		SSEEvents        []SSEEvent      `json:"sse_events,omitempty"`
+		ElapsedMS        int64           `json:"elapsed_ms,omitempty"`
 	}
 
 	var a alias
@@ -254,6 +264,7 @@ func (r *RecordedResp) UnmarshalJSON(data []byte) error {
 	r.Truncated = a.Truncated
 	r.OriginalBodySize = a.OriginalBodySize
 	r.SSEEvents = a.SSEEvents
+	r.ElapsedMS = a.ElapsedMS
 
 	body, err := unmarshalBody(a.Body, a.Headers)
 	if err != nil {
@@ -435,6 +446,14 @@ func BodyHashFromBytes(b []byte) string {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// elapsedMS returns the elapsed milliseconds since start using the provided
+// now function. This helper is used by all 6 recording sites (Recorder,
+// CachingTransport, l1RecordingTransport -- each non-SSE and SSE paths)
+// to populate RecordedResp.ElapsedMS.
+func elapsedMS(start time.Time, now func() time.Time) int64 {
+	return now().Sub(start).Milliseconds()
 }
 
 // newUUID generates a UUID v4 string using crypto/rand.
