@@ -16171,3 +16171,386 @@ conforming to it.
   changes needed.
 - **No impact on `NewRecorder`, `NewCachingTransport`, `NewMemoryStore`,
   `NewHealthMonitor`** — their signatures remain unchanged.
+
+---
+
+### ADR-47: Inbound TLS listener (self-signed cert or user-provided)
+
+**Date**: 2026-04-23
+**Issue**: #197
+**Status**: Accepted
+
+#### Context
+
+httptape currently listens on plain HTTP only. Outbound TLS (httptape to
+upstream) is well-supported via `BuildTLSConfig` and the `--tls-cert`,
+`--tls-key`, `--tls-ca`, `--tls-insecure` CLI flags. But for test scenarios
+where the client SDK under test hardcodes HTTPS (e.g., LLM SDK clients that
+default to `https://api.openai.com`), inbound plaintext breaks the test flow.
+
+The current workaround is "put a reverse proxy in front" which works in CI
+but is annoying for embedded Go tests and quick local runs.
+
+This ADR covers two capabilities:
+
+1. A library function that generates an ephemeral self-signed TLS certificate
+   (zero-config TLS for local dev and tests).
+2. CLI flags for all three listener commands (`serve`, `record`, `proxy`) to
+   enable TLS on the inbound listener, either with a user-provided cert/key
+   pair or with an auto-generated self-signed cert.
+
+##### Key architectural constraint
+
+`Server` is an `http.Handler`. It does not own a listener. Per CLAUDE.md
+layer rules, core types and services have zero I/O. The TLS listener is
+therefore the responsibility of the **caller** (the CLI, or a Go embedder
+using `net/http/httptest.NewUnstartedServer` + `StartTLS`). The library's
+role is limited to providing a helper function that generates a `tls.Config`
+from a self-signed cert.
+
+This design keeps the hexagonal boundary clean: the library produces a
+`*tls.Config`, the CLI calls `httpServer.ServeTLS()` or
+`httpServer.ListenAndServeTLS()`, and Go embedders use `httptest.NewTLSServer`
+or equivalent. No `ServerOption` is needed.
+
+#### Decision
+
+##### No new ServerOption types
+
+The PM spec proposed `WithTLSListenerCert` and `WithTLSListenerAutoCert`
+ServerOptions. This ADR rejects that approach. `Server` is an `http.Handler`.
+Adding TLS listener state to it would violate the hexagonal boundary (core
+service owns I/O) and couple the handler to a specific listener strategy.
+
+Instead, TLS is configured at the listener layer:
+
+- **CLI**: flags on the CLI command, calling `ServeTLS` or
+  `ListenAndServeTLS` on the `http.Server`.
+- **Go library embedders**: use `GenerateSelfSignedCert` to get a
+  `tls.Certificate`, then configure their own `tls.Config` and pass it to
+  `httptest.NewUnstartedServer` or `net/http.Server.TLSConfig`.
+
+This matches how Go's standard library works: `http.Handler` knows nothing
+about TLS; `http.Server` owns the listener.
+
+##### New library function: `GenerateSelfSignedCert`
+
+```go
+// SelfSignedCert holds an ephemeral self-signed TLS certificate and its
+// metadata. The certificate is generated in-memory and never touches disk.
+type SelfSignedCert struct {
+    // TLSCertificate is the parsed TLS certificate suitable for use in
+    // tls.Config.Certificates.
+    TLSCertificate tls.Certificate
+
+    // CertPEM is the PEM-encoded X.509 certificate. Useful for writing to
+    // a file, logging, or configuring client trust.
+    CertPEM []byte
+
+    // Fingerprint is the SHA-256 fingerprint of the DER-encoded certificate,
+    // hex-encoded with colon separators (e.g., "AB:CD:EF:..."). Useful for
+    // pinning and log identification.
+    Fingerprint string
+}
+
+// GenerateSelfSignedCert creates an ephemeral self-signed TLS certificate
+// suitable for inbound HTTPS listeners in tests and local development.
+//
+// The certificate is valid for the given hosts (DNS names and/or IP addresses).
+// If hosts is empty, the certificate covers "localhost" and "127.0.0.1".
+//
+// The generated certificate:
+//   - Uses ECDSA P-256 for fast generation and small key size.
+//   - Is valid for 24 hours from the current time.
+//   - Includes both DNS SANs and IP SANs based on the provided hosts.
+//   - Is generated in-memory and never touches disk.
+//
+// Returns an error if key generation or certificate creation fails.
+func GenerateSelfSignedCert(hosts ...string) (*SelfSignedCert, error)
+```
+
+##### Key algorithm: ECDSA P-256
+
+ECDSA P-256 is chosen over RSA and Ed25519:
+
+- **vs RSA 2048**: P-256 key generation is significantly faster (~1ms vs
+  ~50ms), keys are smaller (256-bit vs 2048-bit), and the cert is for test
+  use where RSA compatibility with legacy clients is irrelevant.
+- **vs Ed25519**: Ed25519 is modern and fast, but Go's `crypto/tls` did not
+  support Ed25519 certificates until Go 1.15, and some clients may not
+  support it. ECDSA P-256 is universally supported. Additionally, the
+  existing test helper in `tls_test.go` already uses ECDSA P-256
+  (`generateTestCA`, `generateTestLeaf`), so this is consistent.
+
+##### Certificate validity: 24 hours
+
+The generated cert is valid for 24 hours from the current time. This is
+long enough for any test run or local dev session, short enough that
+accidentally trusting the cert has minimal blast radius. The `NotBefore`
+is set to 1 hour in the past to accommodate minor clock skew.
+
+##### Default SANs
+
+When `hosts` is empty, the cert includes:
+
+- DNS SAN: `localhost`
+- IP SAN: `127.0.0.1`
+- IP SAN: `::1`
+
+When `hosts` is provided, each entry is classified as either a DNS name or
+an IP address (using `net.ParseIP`). No DNS SAN/IP SAN for `localhost` or
+loopback addresses is added automatically when explicit hosts are provided
+-- the caller has full control.
+
+##### No mTLS support (inbound)
+
+Inbound client cert verification (mTLS) is explicitly out of scope for this
+issue. The PM spec calls this out as a follow-up issue. The design is
+forward-compatible: a future `--tls-listener-ca` flag and
+`BuildInboundTLSConfig` helper could add `ClientAuth` and `ClientCAs` to
+the `tls.Config` without changing any code from this issue.
+
+##### CLI flags (all listener commands)
+
+The TLS listener flags apply to all three commands that start an HTTP
+listener: `serve`, `record`, and `proxy`. The PM spec only mentions `serve`,
+but `record` and `proxy` also listen on a port and face the same scheme-
+mismatch problem.
+
+```
+--tls-listener-cert <path>   Path to PEM certificate for inbound TLS
+--tls-listener-key  <path>   Path to PEM private key for inbound TLS
+--tls-listener-auto          Generate a self-signed cert at startup
+--tls-listener-san  <hosts>  Comma-separated SANs for auto-cert (default: localhost,127.0.0.1)
+```
+
+Mutual exclusion rules:
+- `--tls-listener-cert` + `--tls-listener-key` must be provided together
+  (same validation pattern as `--tls-cert` + `--tls-key` for outbound).
+- `--tls-listener-auto` is mutually exclusive with `--tls-listener-cert` /
+  `--tls-listener-key`.
+- `--tls-listener-san` is only valid with `--tls-listener-auto`.
+
+##### Listening port behavior
+
+When TLS is enabled, the default port remains **8081**. The port does not
+change to 8443. Rationale:
+
+- Users already pass `--port` to override. Silently switching the default
+  port based on TLS enablement would be surprising.
+- The `--port` flag already exists and works. Adding 8443 as a second
+  default creates ambiguity and dual-listen complexity.
+- Test code that constructs URLs from `--port` should not need conditional
+  logic based on whether TLS is enabled.
+
+If a user wants port 8443, they pass `--port 8443` explicitly.
+
+##### CLI behavior: startup logging
+
+When TLS is enabled, the CLI logs:
+- The listening address and scheme (`https://`)
+- For auto-cert mode: the SHA-256 fingerprint and the PEM-encoded
+  certificate to stderr, so tests can programmatically parse and trust it.
+
+Example log output (auto-cert):
+
+```
+httptape: serve mode: listening on https://:8081, fixtures=./fixtures
+httptape: auto-generated self-signed certificate
+httptape: fingerprint: SHA256:AB:CD:EF:01:23:...
+httptape: certificate PEM:
+-----BEGIN CERTIFICATE-----
+MIIBkTCB+wIJAL...
+-----END CERTIFICATE-----
+```
+
+##### CLI behavior: `ListenAndServe` vs `ListenAndServeTLS`
+
+When TLS flags are present, the CLI calls `httpServer.ListenAndServeTLS`
+(for user-provided cert/key) or configures `httpServer.TLSConfig` and
+calls `httpServer.ListenAndServeTLS("", "")` (for auto-cert, where the
+cert is already in the TLS config).
+
+When TLS flags are absent, behavior is unchanged: `httpServer.ListenAndServe`.
+
+#### Types
+
+```go
+// SelfSignedCert holds an ephemeral self-signed TLS certificate and its
+// metadata. The certificate is generated in-memory and never touches disk.
+type SelfSignedCert struct {
+    TLSCertificate tls.Certificate
+    CertPEM        []byte
+    Fingerprint    string
+}
+```
+
+No new interfaces. No new option types.
+
+#### Functions and methods
+
+```go
+// GenerateSelfSignedCert creates an ephemeral self-signed TLS certificate.
+// hosts are DNS names or IP addresses for the SANs. If empty, defaults to
+// localhost + 127.0.0.1 + ::1.
+func GenerateSelfSignedCert(hosts ...string) (*SelfSignedCert, error)
+```
+
+No new `ServerOption`, `RecorderOption`, or `ProxyOption` functions.
+
+#### File layout
+
+| File | Change | Type |
+|---|---|---|
+| `tls.go` | Add `SelfSignedCert` type and `GenerateSelfSignedCert` function | New code in existing file |
+| `tls_test.go` | Add tests for `GenerateSelfSignedCert` | New tests in existing file |
+| `cmd/httptape/main.go` | Add `--tls-listener-cert`, `--tls-listener-key`, `--tls-listener-auto`, `--tls-listener-san` flags to `runServe`, `runRecord`, `runProxy`. Switch to `ListenAndServeTLS` when TLS is configured. | CLI wiring |
+| `docs/tls.md` | Add "Inbound TLS" section documenting both user-provided and auto-cert modes | Documentation |
+| `docs/cli.md` | Add the four new flags to the serve/record/proxy command reference | Documentation |
+
+No new files are created. All changes are additive to existing files.
+
+#### Sequence
+
+**User-provided cert/key (CLI)**:
+
+```
+1. User invokes: httptape serve --fixtures ./f --tls-listener-cert c.pem --tls-listener-key k.pem
+2. CLI parses flags, validates mutual exclusion rules
+3. CLI creates http.Server{Addr: ":8081", Handler: server}
+4. CLI calls httpServer.ListenAndServeTLS("c.pem", "k.pem")
+5. CLI logs: "serve mode: listening on https://:8081, fixtures=./f"
+6. Incoming HTTPS requests are handled by server.ServeHTTP (unchanged)
+```
+
+**Auto-generated cert (CLI)**:
+
+```
+1. User invokes: httptape serve --fixtures ./f --tls-listener-auto
+2. CLI parses flags, validates mutual exclusion rules
+3. CLI calls httptape.GenerateSelfSignedCert("localhost", "127.0.0.1")
+4. CLI logs fingerprint and PEM certificate to stderr
+5. CLI creates http.Server{
+       Addr:    ":8081",
+       Handler: server,
+       TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert.TLSCertificate}},
+   }
+6. CLI calls httpServer.ListenAndServeTLS("", "")
+7. Incoming HTTPS requests are handled by server.ServeHTTP (unchanged)
+```
+
+**Go library embedder (programmatic)**:
+
+```
+1. Embedder calls cert, err := httptape.GenerateSelfSignedCert()
+2. Embedder creates httptest.NewUnstartedServer(handler)
+3. Embedder sets ts.TLS = &tls.Config{Certificates: []tls.Certificate{cert.TLSCertificate}}
+4. Embedder calls ts.StartTLS()
+5. Embedder creates http.Client with cert trusted in RootCAs:
+       pool := x509.NewCertPool()
+       pool.AppendCertsFromPEM(cert.CertPEM)
+       client := &http.Client{Transport: &http.Transport{
+           TLSClientConfig: &tls.Config{RootCAs: pool},
+       }}
+6. Client makes HTTPS requests to ts.URL
+```
+
+#### Error cases
+
+| Failure mode | How handled |
+|---|---|
+| `--tls-listener-cert` without `--tls-listener-key` (or vice versa) | CLI returns `usageError` before starting listener |
+| `--tls-listener-auto` combined with `--tls-listener-cert` | CLI returns `usageError` before starting listener |
+| `--tls-listener-san` without `--tls-listener-auto` | CLI returns `usageError` before starting listener |
+| PEM file does not exist or is unreadable | `ListenAndServeTLS` returns error, CLI logs and exits with exitRuntime |
+| PEM file contains invalid certificate | `ListenAndServeTLS` returns error, CLI logs and exits with exitRuntime |
+| ECDSA key generation fails in `GenerateSelfSignedCert` | Returns wrapped error |
+| `x509.CreateCertificate` fails in `GenerateSelfSignedCert` | Returns wrapped error |
+
+#### Test strategy
+
+**Unit tests for `GenerateSelfSignedCert` (in `tls_test.go`):**
+
+1. **Default hosts produces valid cert** -- call with no args, verify cert
+   has DNS SAN `localhost`, IP SANs `127.0.0.1` and `::1`, is self-signed,
+   has 24h validity, uses ECDSA P-256.
+
+2. **Custom hosts are classified correctly** -- call with
+   `"myhost.local", "10.0.0.1"`, verify `myhost.local` is a DNS SAN and
+   `10.0.0.1` is an IP SAN.
+
+3. **Fingerprint is non-empty and formatted** -- verify fingerprint matches
+   `XX:XX:XX:...` pattern (colon-separated hex pairs).
+
+4. **CertPEM is valid PEM** -- verify `pem.Decode(cert.CertPEM)` succeeds
+   and the block type is `"CERTIFICATE"`.
+
+5. **TLSCertificate is usable** -- create an `httptest.NewUnstartedServer`,
+   set its TLS config with the generated cert, start TLS, make a request
+   with a client that trusts the cert via `CertPEM`, verify success.
+
+6. **Generated cert is trusted by a client that adds it to RootCAs** --
+   end-to-end with `http.Client` and `x509.NewCertPool`.
+
+**Integration test (in `tls_test.go`):**
+
+7. **Round-trip through httptape Server with auto-cert** -- create a
+   `Server` with `NewServer`, wrap in `httptest.NewUnstartedServer`, apply
+   `GenerateSelfSignedCert`, start TLS, make HTTPS request, verify replay
+   works end-to-end.
+
+**CLI flag validation tests (in `cmd/httptape/main_test.go` or manually):**
+
+8. **Mutual exclusion of `--tls-listener-auto` and `--tls-listener-cert`**
+9. **`--tls-listener-cert` requires `--tls-listener-key`**
+10. **`--tls-listener-san` requires `--tls-listener-auto`**
+
+Test patterns:
+- Table-driven where practical.
+- Use `httptest.NewUnstartedServer` + `StartTLS` for TLS listener tests.
+- Use `x509.NewCertPool` + `AppendCertsFromPEM` for client-side trust.
+- No external dependencies.
+
+#### Alternatives considered
+
+**A. TLS as ServerOption.** Adding `WithTLSListenerCert` and
+`WithTLSListenerAutoCert` to `Server`. Rejected because `Server` is an
+`http.Handler` and should not own listener concerns. This would violate the
+hexagonal architecture boundary and make `Server` harder to embed in
+contexts that manage their own listeners (e.g., `httptest`, Caddy, custom
+`net.Listener`).
+
+**B. Ed25519 keys.** Faster than ECDSA, but not universally supported by
+all TLS clients. ECDSA P-256 is the safe default for test certificates and
+is consistent with the existing test helpers in `tls_test.go`.
+
+**C. RSA 2048 keys.** Most compatible, but significantly slower to generate
+(~50ms vs ~1ms for P-256). For ephemeral test certs, the speed difference
+matters. No compatibility benefit for the test use case.
+
+**D. Port auto-switch to 8443.** Rejected as surprising behavior. Users
+already have `--port`. No need for a magic default change based on TLS
+enablement.
+
+**E. Dual-listen (HTTP + HTTPS).** Explicitly rejected as the PM spec
+notes: "dual-listen is a can of worms." One port, one protocol. If users
+want both, they run two instances.
+
+#### Consequences
+
+- **Additive change.** No breaking changes to any existing API. `Server`,
+  `Recorder`, `Proxy` types are unmodified. New function and type in
+  `tls.go`, new CLI flags.
+- **All three listener commands gain TLS support.** `serve`, `record`, and
+  `proxy` all get the same four flags, avoiding a consistency gap.
+- **Go embedders get a first-class primitive** (`GenerateSelfSignedCert`)
+  for zero-config TLS in tests. This is more useful than CLI-only support
+  because most httptape users are Go developers writing tests.
+- **No new dependencies.** All crypto is from `crypto/ecdsa`,
+  `crypto/elliptic`, `crypto/rand`, `crypto/sha256`, `crypto/tls`,
+  `crypto/x509`, `encoding/pem`, `math/big`, `net`, `time` -- all stdlib.
+- **mTLS is deferred.** Inbound client cert verification is explicitly out
+  of scope. The design is forward-compatible with a future
+  `--tls-listener-ca` flag.
+- **No runtime cert rotation.** The cert is generated once at startup. No
+  hot-reload. This matches the ephemeral nature of test fixtures.
