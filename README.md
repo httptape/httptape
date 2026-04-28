@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/VibeWarden/httptape/main/assets/logo.png" alt="httptape logo" width="300">
+  <img src="https://raw.githubusercontent.com/httptape/httptape/main/assets/logo.png" alt="httptape logo" width="300">
 </p>
 
 <h3 align="center">Record, Redact, Replay</h3>
@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://pkg.go.dev/github.com/VibeWarden/httptape"><img src="https://pkg.go.dev/badge/github.com/VibeWarden/httptape.svg" alt="Go Reference"></a>
-  <a href="https://github.com/VibeWarden/httptape/actions/workflows/test.yml"><img src="https://github.com/VibeWarden/httptape/actions/workflows/test.yml/badge.svg?branch=main" alt="Tests"></a>
-  <a href="https://scorecard.dev/viewer/?uri=github.com/VibeWarden/httptape"><img src="https://api.scorecard.dev/projects/github.com/VibeWarden/httptape/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://pkg.go.dev/github.com/httptape/httptape"><img src="https://pkg.go.dev/badge/github.com/httptape/httptape.svg" alt="Go Reference"></a>
+  <a href="https://github.com/httptape/httptape/actions/workflows/test.yml"><img src="https://github.com/httptape/httptape/actions/workflows/test.yml/badge.svg?branch=main" alt="Tests"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/httptape/httptape"><img src="https://api.scorecard.dev/projects/github.com/httptape/httptape/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
   <a href="https://hub.docker.com/r/tibtof/httptape"><img src="https://img.shields.io/docker/image-size/tibtof/httptape/latest?label=docker" alt="Docker Image Size"></a>
 </p>
@@ -134,12 +134,12 @@ See [Recording](https://vibewarden.dev/docs/httptape/recording/) and [Replay](ht
 
 **Go library:**
 ```bash
-go get github.com/VibeWarden/httptape
+go get github.com/httptape/httptape
 ```
 
 **CLI:**
 ```bash
-go install github.com/VibeWarden/httptape/cmd/httptape@latest
+go install github.com/httptape/httptape/cmd/httptape@latest
 ```
 
 **Docker** (~3 MB, multi-arch):
@@ -309,10 +309,10 @@ release:
 
 ```bash
 docker pull tibtof/httptape           # Docker Hub
-docker pull ghcr.io/vibewarden/httptape   # GHCR
+docker pull ghcr.io/httptape/httptape   # GHCR
 ```
 
-Examples below use `tibtof/httptape`; substitute `ghcr.io/vibewarden/httptape`
+Examples below use `tibtof/httptape`; substitute `ghcr.io/httptape/httptape`
 freely.
 
 ```bash
@@ -333,7 +333,7 @@ docker run -v ./cache:/fixtures -v ./config.json:/config/config.json -p 8081:808
 ## Testcontainers
 
 ```go
-import httptapetest "github.com/VibeWarden/httptape/testcontainers"
+import httptapetest "github.com/httptape/httptape/testcontainers"
 
 container, err := httptapetest.RunContainer(ctx,
     httptapetest.WithFixturesDir("./testdata/fixtures"),

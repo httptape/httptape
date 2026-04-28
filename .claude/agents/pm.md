@@ -21,12 +21,12 @@ coming back to ask questions.
    - Out of scope (explicit list of what this story does NOT cover)
    - Open questions (if any — flag these, do not guess)
 
-3. **Create GitHub issues** — use `gh` CLI to create issues in `VibeWarden/httptape`
+3. **Create GitHub issues** — use `gh` CLI to create issues in `httptape/httptape`
    with the correct milestone label and body. Use this format:
 
    ```bash
    gh issue create \
-     --repo VibeWarden/httptape \
+     --repo httptape/httptape \
      --title "..." \
      --body "..." \
      --label "milestone:..."
@@ -34,7 +34,7 @@ coming back to ask questions.
 
 4. **Set status** — after creating or updating an issue, add a comment:
    ```bash
-   gh issue comment <number> --repo VibeWarden/httptape --body "Status: READY_FOR_ARCH"
+   gh issue comment <number> --repo httptape/httptape --body "Status: READY_FOR_ARCH"
    ```
 
 ## Spec quality rules

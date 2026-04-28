@@ -35,19 +35,19 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
 === "Go library"
 
     ```bash
-    go get github.com/VibeWarden/httptape
+    go get github.com/httptape/httptape
     ```
 
 === "CLI"
 
     ```bash
-    go install github.com/VibeWarden/httptape/cmd/httptape@latest
+    go install github.com/httptape/httptape/cmd/httptape@latest
     ```
 
 === "Docker"
 
     ```bash
-    docker pull ghcr.io/vibewarden/httptape:latest
+    docker pull ghcr.io/httptape/httptape:latest
     ```
 
 Requires Go 1.26 or later for the library/CLI. Docker works with any platform.
@@ -62,7 +62,7 @@ import (
     "net/http"
     "net/http/httptest"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -117,4 +117,4 @@ httptape proxy --upstream https://api.github.com --fixtures ./cache
 
 ## License
 
-[Apache 2.0](https://github.com/VibeWarden/httptape/blob/main/LICENSE)
+[Apache 2.0](https://github.com/httptape/httptape/blob/main/LICENSE)

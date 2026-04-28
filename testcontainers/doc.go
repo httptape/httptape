@@ -1,7 +1,7 @@
 // Package httptape provides a Testcontainers module for running an httptape
 // Docker container in integration tests.
 //
-// This module wraps the ghcr.io/vibewarden/httptape Docker image and exposes
+// This module wraps the ghcr.io/httptape/httptape Docker image and exposes
 // a functional-options API consistent with the main httptape library. It
 // enables Go developers to spin up an isolated httptape container directly
 // from go test, without manual Docker orchestration.

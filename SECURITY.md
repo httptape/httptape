@@ -17,7 +17,7 @@ This policy will be revisited at 1.0.
 ## Reporting a vulnerability
 
 **Preferred**: open a GitHub Private Vulnerability Report at
-<https://github.com/VibeWarden/httptape/security/advisories/new>.
+<https://github.com/httptape/httptape/security/advisories/new>.
 This keeps the report private until a fix is ready and lets us coordinate a
 CVE if applicable.
 

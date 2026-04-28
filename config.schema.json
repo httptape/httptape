@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/VibeWarden/httptape/config.schema.json",
+  "$id": "https://github.com/httptape/httptape/config.schema.json",
   "title": "httptape config",
   "description": "Declarative configuration for httptape's sanitization pipeline and matcher composition. Maps to the Go API: RedactHeaders, RedactBodyPaths, FakeFields, CompositeMatcher.",
   "type": "object",

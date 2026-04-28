@@ -1,6 +1,6 @@
 # Test your Spring AI agents deterministically
 
-Working example of [httptape](https://github.com/VibeWarden/httptape) used to test a **Spring AI streaming chat completion** and a classic REST integration — both served from pre-recorded fixtures via [Testcontainers](https://testcontainers.com/), with zero real API calls.
+Working example of [httptape](https://github.com/httptape/httptape) used to test a **Spring AI streaming chat completion** and a classic REST integration — both served from pre-recorded fixtures via [Testcontainers](https://testcontainers.com/), with zero real API calls.
 
 ## What this demo shows
 

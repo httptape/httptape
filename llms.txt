@@ -178,7 +178,7 @@ to v0.12 format (Content-Type-driven body shape). Idempotent. Skips non-tape fil
 ## Docker
 
 ```
-docker pull ghcr.io/vibewarden/httptape:latest
+docker pull ghcr.io/httptape/httptape:latest
 # ~3 MB scratch image, runs as non-root (65534)
 ```
 
@@ -234,7 +234,7 @@ func FakeSSEEventData(seed string, paths ...string) SanitizeFunc
 
 ## Links
 
-- Repo: https://github.com/VibeWarden/httptape
+- Repo: https://github.com/httptape/httptape
 - Docs: https://vibewarden.dev/docs/httptape
-- Go pkg: https://pkg.go.dev/github.com/VibeWarden/httptape
-- Docker: ghcr.io/vibewarden/httptape
+- Go pkg: https://pkg.go.dev/github.com/httptape/httptape
+- Docker: ghcr.io/httptape/httptape

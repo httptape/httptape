@@ -1,6 +1,6 @@
 # Test your Koog AI agents deterministically
 
-Working example of [httptape](https://github.com/VibeWarden/httptape) used to test a **Koog single-tool AI agent** with a weather REST integration -- both served from pre-recorded fixtures via [Testcontainers](https://testcontainers.com/), with zero real API calls.
+Working example of [httptape](https://github.com/httptape/httptape) used to test a **Koog single-tool AI agent** with a weather REST integration -- both served from pre-recorded fixtures via [Testcontainers](https://testcontainers.com/), with zero real API calls.
 
 ## What this demo shows
 
@@ -37,7 +37,7 @@ This demo exercises the matcher composition stack from #178, #179, and #180:
 
 ## httptape version requirement
 
-This demo requires **httptape v0.13.0** or later. v0.13.0 adds `CachingTransport` as a library primitive. v0.12.0 introduced Content-Type-driven body shape in fixtures (PR [#191](https://github.com/VibeWarden/httptape/pull/191)) and includes `--config` support for declarative matcher composition (first shipped in v0.11.0, PR [#184](https://github.com/VibeWarden/httptape/pull/184)). Earlier releases cannot read the migrated fixture format or the matcher config.
+This demo requires **httptape v0.13.0** or later. v0.13.0 adds `CachingTransport` as a library primitive. v0.12.0 introduced Content-Type-driven body shape in fixtures (PR [#191](https://github.com/httptape/httptape/pull/191)) and includes `--config` support for declarative matcher composition (first shipped in v0.11.0, PR [#184](https://github.com/httptape/httptape/pull/184)). Earlier releases cannot read the migrated fixture format or the matcher config.
 
 ## Prerequisites
 
@@ -134,7 +134,7 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 | httptape-jvm SDK | 0.1.0-SNAPSHOT (Testcontainers + Kotest extension) |
 | Testcontainers | 2.0.4 (via SDK transitive dependency) |
 | Gradle | 9.4.1 (wrapper committed) |
-| httptape | v0.13.1 (ghcr.io/vibewarden/httptape:0.13.1, SDK default) |
+| httptape | v0.13.1 (ghcr.io/httptape/httptape:0.13.1, SDK default) |
 
 ## Why not...?
 

@@ -1,6 +1,6 @@
 # Frontend-first development with httptape proxy mode
 
-Working example of [httptape](https://github.com/VibeWarden/httptape) used as a fallback proxy in front of a backend API. The frontend never breaks, even when the backend goes down — it transparently falls back to cached data, and the UI reflects the current source **live, without any user action**.
+Working example of [httptape](https://github.com/httptape/httptape) used as a fallback proxy in front of a backend API. The frontend never breaks, even when the backend goes down — it transparently falls back to cached data, and the UI reflects the current source **live, without any user action**.
 
 ## Architecture
 
@@ -85,11 +85,11 @@ httptape's `RedactSSEEventData` and `FakeSSEEventData` sanitization functions op
 docker compose up
 ```
 
-Pulls `ghcr.io/vibewarden/httptape:0.13.0` (v0.13.0 adds CachingTransport; v0.12.0 introduced Content-Type-driven body shape, ContentNegotiationCriterion, and the `migrate-fixtures` CLI subcommand). Also builds the React frontend. No local Go build needed.
+Pulls `ghcr.io/httptape/httptape:0.13.0` (v0.13.0 adds CachingTransport; v0.12.0 introduced Content-Type-driven body shape, ContentNegotiationCriterion, and the `migrate-fixtures` CLI subcommand). Also builds the React frontend. No local Go build needed.
 
 Open [http://localhost:3000](http://localhost:3000).
 
-> Pinned to `0.13.0` for reproducibility. To track latest, change the image to `ghcr.io/vibewarden/httptape:latest`.
+> Pinned to `0.13.0` for reproducibility. To track latest, change the image to `ghcr.io/httptape/httptape:latest`.
 
 ## Try it
 

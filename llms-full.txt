@@ -194,7 +194,7 @@ to v0.12 format (Content-Type-driven body shape). Idempotent. Skips non-tape fil
 ## Docker
 
 ```
-docker pull ghcr.io/vibewarden/httptape:latest
+docker pull ghcr.io/httptape/httptape:latest
 # ~3 MB scratch image, runs as non-root (65534)
 ```
 
@@ -250,10 +250,10 @@ func FakeSSEEventData(seed string, paths ...string) SanitizeFunc
 
 ## Links
 
-- Repo: https://github.com/VibeWarden/httptape
+- Repo: https://github.com/httptape/httptape
 - Docs: https://vibewarden.dev/docs/httptape
-- Go pkg: https://pkg.go.dev/github.com/VibeWarden/httptape
-- Docker: ghcr.io/vibewarden/httptape
+- Go pkg: https://pkg.go.dev/github.com/httptape/httptape
+- Docker: ghcr.io/httptape/httptape
 # httptape
 
 **Record, Redact, Replay** -- HTTP traffic recording, redaction, and replay.
@@ -291,19 +291,19 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
 === "Go library"
 
     ```bash
-    go get github.com/VibeWarden/httptape
+    go get github.com/httptape/httptape
     ```
 
 === "CLI"
 
     ```bash
-    go install github.com/VibeWarden/httptape/cmd/httptape@latest
+    go install github.com/httptape/httptape/cmd/httptape@latest
     ```
 
 === "Docker"
 
     ```bash
-    docker pull ghcr.io/vibewarden/httptape:latest
+    docker pull ghcr.io/httptape/httptape:latest
     ```
 
 Requires Go 1.26 or later for the library/CLI. Docker works with any platform.
@@ -318,7 +318,7 @@ import (
     "net/http"
     "net/http/httptest"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -373,7 +373,7 @@ httptape proxy --upstream https://api.github.com --fixtures ./cache
 
 ## License
 
-[Apache 2.0](https://github.com/VibeWarden/httptape/blob/main/LICENSE)
+[Apache 2.0](https://github.com/httptape/httptape/blob/main/LICENSE)
 # Getting Started
 
 Record, Redact, and Replay HTTP traffic in 5 minutes.
@@ -382,7 +382,7 @@ Record, Redact, and Replay HTTP traffic in 5 minutes.
 
 - Go 1.26 or later (for the Go library)
 - Or: Docker (for CLI/Docker usage with any language)
-- `go get github.com/VibeWarden/httptape`
+- `go get github.com/httptape/httptape`
 
 ## Step 1: Record HTTP traffic
 
@@ -395,7 +395,7 @@ import (
     "fmt"
     "net/http"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -438,7 +438,7 @@ import (
     "net/http"
     "net/http/httptest"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -473,7 +473,7 @@ import (
     "net/http"
     "strings"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -520,7 +520,7 @@ import (
     "net/http/httptest"
     "testing"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func TestUserAPI(t *testing.T) {
@@ -1785,7 +1785,7 @@ docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   proxy --upstream https://api.example.com \
         --fixtures /fixtures \
         --config /config/config.json \
@@ -1797,7 +1797,7 @@ docker run --rm \
 ```yaml
 services:
   api-proxy:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - proxy
       - --upstream
@@ -3124,7 +3124,7 @@ A typical setup with a React/Vue/Svelte dev server calling httptape as the API b
 # docker-compose.yml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
     ports:
       - "3001:3001"
@@ -3387,7 +3387,7 @@ Docker Compose for this setup:
 ```yaml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
     ports:
       - "3001:3001"
@@ -3457,7 +3457,7 @@ services:
 - [Matching](matching.md) -- customizing request-to-tape matching
 # Using httptape with Other Languages
 
-httptape ships as a Docker image (`ghcr.io/vibewarden/httptape:latest`), so any language with Docker or Testcontainers support can use it as a mock server. This guide shows how to start an httptape container, mount fixture files, make requests, and clean up in several popular languages.
+httptape ships as a Docker image (`ghcr.io/httptape/httptape:latest`), so any language with Docker or Testcontainers support can use it as a mock server. This guide shows how to start an httptape container, mount fixture files, make requests, and clean up in several popular languages.
 
 All examples assume you have a directory of recorded fixtures at `./testdata/fixtures` relative to the project root. The container exposes port **8081** by default.
 
@@ -3488,7 +3488,7 @@ class HttptapeTest {
 
     @BeforeAll
     static void startContainer() {
-        httptape = new GenericContainer<>("ghcr.io/vibewarden/httptape:latest")
+        httptape = new GenericContainer<>("ghcr.io/httptape/httptape:latest")
             .withCommand("serve", "--fixtures", "/fixtures")
             .withExposedPorts(8081)
             .withFileSystemBind("./testdata/fixtures", "/fixtures")
@@ -3547,7 +3547,7 @@ class HttptapeTest {
         @BeforeAll
         @JvmStatic
         fun startContainer() {
-            httptape = GenericContainer("ghcr.io/vibewarden/httptape:latest")
+            httptape = GenericContainer("ghcr.io/httptape/httptape:latest")
                 .withCommand("serve", "--fixtures", "/fixtures")
                 .withExposedPorts(8081)
                 .withFileSystemBind("./testdata/fixtures", "/fixtures")
@@ -3591,7 +3591,7 @@ from testcontainers.core.waiting_utils import wait_for_logs
 
 
 def test_replay_fixture():
-    with DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+    with DockerContainer("ghcr.io/httptape/httptape:latest") \
         .with_command("serve --fixtures /fixtures") \
         .with_exposed_ports(8081) \
         .with_volume_mapping("./testdata/fixtures", "/fixtures") as container:
@@ -3616,7 +3616,7 @@ from testcontainers.core.waiting_utils import wait_for_logs
 
 @pytest.fixture(scope="module")
 def httptape_url():
-    container = DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+    container = DockerContainer("ghcr.io/httptape/httptape:latest") \
         .with_command("serve --fixtures /fixtures") \
         .with_exposed_ports(8081) \
         .with_volume_mapping("./testdata/fixtures", "/fixtures")
@@ -3655,7 +3655,7 @@ describe("httptape replay", () => {
 
   before(async () => {
     container = await new GenericContainer(
-      "ghcr.io/vibewarden/httptape:latest"
+      "ghcr.io/httptape/httptape:latest"
     )
       .withCommand(["serve", "--fixtures", "/fixtures"])
       .withExposedPorts(8081)
@@ -3695,7 +3695,7 @@ describe("httptape replay", () => {
 
   beforeAll(async () => {
     container = await new GenericContainer(
-      "ghcr.io/vibewarden/httptape:latest"
+      "ghcr.io/httptape/httptape:latest"
     )
       .withCommand(["serve", "--fixtures", "/fixtures"])
       .withExposedPorts(8081)
@@ -3734,7 +3734,7 @@ docker run -d \
   --name httptape-mock \
   -p 8081:8081 \
   -v "$PWD/testdata/fixtures:/fixtures" \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures
 ```
 
@@ -3752,7 +3752,7 @@ docker run -d \
   --name httptape-mock \
   -p 8081:8081 \
   -v "$PWD/testdata/fixtures:/fixtures" \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures \
   --replay-header "Authorization=Bearer test-token" \
   --replay-header "X-Request-Id=integration-test-001"
@@ -3770,7 +3770,7 @@ docker stop httptape-mock && docker rm httptape-mock
 # docker-compose.test.yml
 services:
   httptape:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures"]
     ports:
       - "8081:8081"
@@ -4070,13 +4070,13 @@ Additional rules for `matcher`:
 
 ## JSON Schema
 
-A JSON Schema is available at [`config.schema.json`](https://github.com/VibeWarden/httptape/blob/main/config.schema.json) for IDE autocompletion and CI validation.
+A JSON Schema is available at [`config.schema.json`](https://github.com/httptape/httptape/blob/main/config.schema.json) for IDE autocompletion and CI validation.
 
 Reference it in your config file:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/VibeWarden/httptape/main/config.schema.json",
+  "$schema": "https://raw.githubusercontent.com/httptape/httptape/main/config.schema.json",
   "version": "1",
   "rules": [...]
 }
@@ -4191,7 +4191,7 @@ httptape includes a standalone CLI binary for HTTP traffic recording, redaction,
 ## Install
 
 ```bash
-go install github.com/VibeWarden/httptape/cmd/httptape@latest
+go install github.com/httptape/httptape/cmd/httptape@latest
 ```
 
 Or use the [Docker image](docker.md).
@@ -4446,7 +4446,7 @@ httptape is available as a minimal Docker image built from scratch (no OS, no sh
 ## Pull
 
 ```bash
-docker pull ghcr.io/vibewarden/httptape:latest
+docker pull ghcr.io/httptape/httptape:latest
 ```
 
 ## Serve mode
@@ -4457,7 +4457,7 @@ Replay recorded fixtures:
 docker run --rm \
   -v ./fixtures:/fixtures:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures --port 8081
 ```
 
@@ -4472,7 +4472,7 @@ docker run --rm \
   -v ./fixtures:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   record --upstream https://api.example.com \
          --fixtures /fixtures \
          --config /config/config.json \
@@ -4490,7 +4490,7 @@ docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   proxy --upstream https://api.example.com \
         --fixtures /fixtures \
         --config /config/config.json \
@@ -4526,7 +4526,7 @@ Both are declared as `VOLUME` in the Dockerfile and pre-exist in the image.
 ```yaml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "8081"]
     ports:
       - "8081:8081"
@@ -4546,7 +4546,7 @@ services:
 ```yaml
 services:
   recorder:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - record
       - --upstream
@@ -4569,7 +4569,7 @@ services:
 ```yaml
 services:
   api-proxy:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - proxy
       - --upstream
@@ -4603,13 +4603,13 @@ services:
 ```yaml
 services:
   recorder:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["record", "--upstream", "https://api.example.com", "--fixtures", "/fixtures", "--port", "8081"]
     volumes:
       - fixture-data:/fixtures
 
   exporter:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["export", "--fixtures", "/fixtures", "--output", "/output/bundle.tar.gz"]
     volumes:
       - fixture-data:/fixtures:ro
@@ -4632,7 +4632,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mock-api:
-        image: ghcr.io/vibewarden/httptape:latest
+        image: ghcr.io/httptape/httptape:latest
         options: >-
           -v ${{ github.workspace }}/fixtures:/fixtures:ro
         ports:
@@ -4669,7 +4669,7 @@ httptape provides a Go [Testcontainers](https://golang.testcontainers.org/) modu
 ## Install
 
 ```bash
-go get github.com/VibeWarden/httptape/testcontainers
+go get github.com/httptape/httptape/testcontainers
 ```
 
 This module has external dependencies (testcontainers-go, Docker client libraries) unlike the core httptape library which is stdlib-only.
@@ -4677,7 +4677,7 @@ This module has external dependencies (testcontainers-go, Docker client librarie
 ## Import
 
 ```go
-import httptapecontainer "github.com/VibeWarden/httptape/testcontainers"
+import httptapecontainer "github.com/httptape/httptape/testcontainers"
 ```
 
 The package name is `httptape` (under the `testcontainers` directory), so most users alias it to avoid collision with the main `httptape` package.
@@ -4777,10 +4777,10 @@ Bind-mounts a host JSON config file to `/config/config.json`. Mutually exclusive
 ### WithImage
 
 ```go
-httptapecontainer.WithImage("ghcr.io/vibewarden/httptape:v1.0.0")
+httptapecontainer.WithImage("ghcr.io/httptape/httptape:v1.0.0")
 ```
 
-Overrides the Docker image. Defaults to `ghcr.io/vibewarden/httptape:latest`.
+Overrides the Docker image. Defaults to `ghcr.io/httptape/httptape:latest`.
 
 ### WithPort
 
@@ -4929,7 +4929,7 @@ httptape record \
 The `BuildTLSConfig` function converts file paths into a `*tls.Config`:
 
 ```go
-import "github.com/VibeWarden/httptape"
+import "github.com/httptape/httptape"
 
 // Custom CA only
 tlsCfg, err := httptape.BuildTLSConfig("", "", "/path/to/ca.pem", false)

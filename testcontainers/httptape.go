@@ -13,7 +13,7 @@ import (
 
 const (
 	// DefaultImage is the default Docker image used for the httptape container.
-	DefaultImage = "ghcr.io/vibewarden/httptape:latest"
+	DefaultImage = "ghcr.io/httptape/httptape:latest"
 
 	// DefaultPort is the default exposed port inside the container.
 	DefaultPort = "8081/tcp"

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VibeWarden/httptape"
+	"github.com/httptape/httptape"
 )
 
 func TestSubcommandDispatch(t *testing.T) {

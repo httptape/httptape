@@ -5,7 +5,7 @@ httptape provides a Go [Testcontainers](https://golang.testcontainers.org/) modu
 ## Install
 
 ```bash
-go get github.com/VibeWarden/httptape/testcontainers
+go get github.com/httptape/httptape/testcontainers
 ```
 
 This module has external dependencies (testcontainers-go, Docker client libraries) unlike the core httptape library which is stdlib-only.
@@ -13,7 +13,7 @@ This module has external dependencies (testcontainers-go, Docker client librarie
 ## Import
 
 ```go
-import httptapecontainer "github.com/VibeWarden/httptape/testcontainers"
+import httptapecontainer "github.com/httptape/httptape/testcontainers"
 ```
 
 The package name is `httptape` (under the `testcontainers` directory), so most users alias it to avoid collision with the main `httptape` package.
@@ -113,10 +113,10 @@ Bind-mounts a host JSON config file to `/config/config.json`. Mutually exclusive
 ### WithImage
 
 ```go
-httptapecontainer.WithImage("ghcr.io/vibewarden/httptape:v1.0.0")
+httptapecontainer.WithImage("ghcr.io/httptape/httptape:v1.0.0")
 ```
 
-Overrides the Docker image. Defaults to `ghcr.io/vibewarden/httptape:latest`.
+Overrides the Docker image. Defaults to `ghcr.io/httptape/httptape:latest`.
 
 ### WithPort
 

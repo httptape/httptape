@@ -1,4 +1,4 @@
-module github.com/VibeWarden/httptape/testcontainers
+module github.com/httptape/httptape/testcontainers
 
 go 1.26.1
 

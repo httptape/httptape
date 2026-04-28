@@ -11,7 +11,7 @@ import (
     "net/http"
     "testing"
 
-    httptape "github.com/VibeWarden/httptape/testcontainers"
+    httptape "github.com/httptape/httptape/testcontainers"
 )
 
 func TestAPI(t *testing.T) {
@@ -43,7 +43,7 @@ func TestAPI(t *testing.T) {
 | `WithMode`          | Set the mode: `"serve"` (default) or `"record"`.         |
 | `WithTarget`        | Set the upstream URL for record mode.                     |
 | `WithPort`          | Override the exposed port (default `"8081/tcp"`).         |
-| `WithImage`         | Override the Docker image (default `ghcr.io/vibewarden/httptape:latest`). |
+| `WithImage`         | Override the Docker image (default `ghcr.io/httptape/httptape:latest`). |
 
 `WithConfig` and `WithConfigFile` are mutually exclusive.
 

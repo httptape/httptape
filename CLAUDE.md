@@ -114,7 +114,7 @@ PM Agent → Architect Agent → Dev Agent → Reviewer Agent → (your PR revie
 
 ## GitHub conventions
 
-- Org: `VibeWarden`
+- Org: `httptape`
 - Repo: `httptape`
 - Branch naming: `feat/<issue-number>-<short-slug>`, `fix/<issue-number>-<short-slug>`
 - Commit style: conventional commits (`feat:`, `fix:`, `chore:`, `docs:`, `test:`)

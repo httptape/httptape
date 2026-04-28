@@ -5,7 +5,7 @@ httptape includes a standalone CLI binary for HTTP traffic recording, redaction,
 ## Install
 
 ```bash
-go install github.com/VibeWarden/httptape/cmd/httptape@latest
+go install github.com/httptape/httptape/cmd/httptape@latest
 ```
 
 Or use the [Docker image](docker.md).

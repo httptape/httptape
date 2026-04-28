@@ -14,13 +14,13 @@ agent can implement without ambiguity.
 1. **Read context first** — always read:
    - `CLAUDE.md` (locked decisions, architecture principles, package structure)
    - `decisions.md` (previous ADRs — never contradict a closed decision)
-   - The GitHub issue assigned to you (`gh issue view <number> --repo VibeWarden/httptape --comments`)
+   - The GitHub issue assigned to you (`gh issue view <number> --repo httptape/httptape --comments`)
    - Relevant existing code (`Glob`, `Grep` to understand current state)
 
 2. **Validate the spec** — if the PM spec is missing information or contradicts locked
    decisions, post a short comment on the issue and set status back to `NEEDS_CLARIFICATION`:
    ```bash
-   gh issue comment <number> --repo VibeWarden/httptape \
+   gh issue comment <number> --repo httptape/httptape \
      --body "Status: NEEDS_CLARIFICATION\n\nBlocking questions:\n- <question>"
    ```
    Do not design around incomplete specs.
@@ -77,7 +77,7 @@ agent can implement without ambiguity.
 
 6. **Post a short comment to the GitHub issue** — keep this brief:
    ```bash
-   gh issue comment <number> --repo VibeWarden/httptape --body "Status: READY_FOR_DEV
+   gh issue comment <number> --repo httptape/httptape --body "Status: READY_FOR_DEV
 
    Design: ADR-<N> in decisions.md
 

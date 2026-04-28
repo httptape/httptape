@@ -159,7 +159,7 @@ docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   proxy --upstream https://api.example.com \
         --fixtures /fixtures \
         --config /config/config.json \
@@ -171,7 +171,7 @@ docker run --rm \
 ```yaml
 services:
   api-proxy:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - proxy
       - --upstream

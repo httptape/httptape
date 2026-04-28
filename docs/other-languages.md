@@ -1,6 +1,6 @@
 # Using httptape with Other Languages
 
-httptape ships as a Docker image (`ghcr.io/vibewarden/httptape:latest`), so any language with Docker or Testcontainers support can use it as a mock server. This guide shows how to start an httptape container, mount fixture files, make requests, and clean up in several popular languages.
+httptape ships as a Docker image (`ghcr.io/httptape/httptape:latest`), so any language with Docker or Testcontainers support can use it as a mock server. This guide shows how to start an httptape container, mount fixture files, make requests, and clean up in several popular languages.
 
 All examples assume you have a directory of recorded fixtures at `./testdata/fixtures` relative to the project root. The container exposes port **8081** by default.
 
@@ -31,7 +31,7 @@ class HttptapeTest {
 
     @BeforeAll
     static void startContainer() {
-        httptape = new GenericContainer<>("ghcr.io/vibewarden/httptape:latest")
+        httptape = new GenericContainer<>("ghcr.io/httptape/httptape:latest")
             .withCommand("serve", "--fixtures", "/fixtures")
             .withExposedPorts(8081)
             .withFileSystemBind("./testdata/fixtures", "/fixtures")
@@ -90,7 +90,7 @@ class HttptapeTest {
         @BeforeAll
         @JvmStatic
         fun startContainer() {
-            httptape = GenericContainer("ghcr.io/vibewarden/httptape:latest")
+            httptape = GenericContainer("ghcr.io/httptape/httptape:latest")
                 .withCommand("serve", "--fixtures", "/fixtures")
                 .withExposedPorts(8081)
                 .withFileSystemBind("./testdata/fixtures", "/fixtures")
@@ -134,7 +134,7 @@ from testcontainers.core.waiting_utils import wait_for_logs
 
 
 def test_replay_fixture():
-    with DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+    with DockerContainer("ghcr.io/httptape/httptape:latest") \
         .with_command("serve --fixtures /fixtures") \
         .with_exposed_ports(8081) \
         .with_volume_mapping("./testdata/fixtures", "/fixtures") as container:
@@ -159,7 +159,7 @@ from testcontainers.core.waiting_utils import wait_for_logs
 
 @pytest.fixture(scope="module")
 def httptape_url():
-    container = DockerContainer("ghcr.io/vibewarden/httptape:latest") \
+    container = DockerContainer("ghcr.io/httptape/httptape:latest") \
         .with_command("serve --fixtures /fixtures") \
         .with_exposed_ports(8081) \
         .with_volume_mapping("./testdata/fixtures", "/fixtures")
@@ -198,7 +198,7 @@ describe("httptape replay", () => {
 
   before(async () => {
     container = await new GenericContainer(
-      "ghcr.io/vibewarden/httptape:latest"
+      "ghcr.io/httptape/httptape:latest"
     )
       .withCommand(["serve", "--fixtures", "/fixtures"])
       .withExposedPorts(8081)
@@ -238,7 +238,7 @@ describe("httptape replay", () => {
 
   beforeAll(async () => {
     container = await new GenericContainer(
-      "ghcr.io/vibewarden/httptape:latest"
+      "ghcr.io/httptape/httptape:latest"
     )
       .withCommand(["serve", "--fixtures", "/fixtures"])
       .withExposedPorts(8081)
@@ -277,7 +277,7 @@ docker run -d \
   --name httptape-mock \
   -p 8081:8081 \
   -v "$PWD/testdata/fixtures:/fixtures" \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures
 ```
 
@@ -295,7 +295,7 @@ docker run -d \
   --name httptape-mock \
   -p 8081:8081 \
   -v "$PWD/testdata/fixtures:/fixtures" \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures \
   --replay-header "Authorization=Bearer test-token" \
   --replay-header "X-Request-Id=integration-test-001"
@@ -313,7 +313,7 @@ docker stop httptape-mock && docker rm httptape-mock
 # docker-compose.test.yml
 services:
   httptape:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures"]
     ports:
       - "8081:8081"

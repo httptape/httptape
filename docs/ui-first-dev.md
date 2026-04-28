@@ -60,7 +60,7 @@ A typical setup with a React/Vue/Svelte dev server calling httptape as the API b
 # docker-compose.yml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
     ports:
       - "3001:3001"
@@ -323,7 +323,7 @@ Docker Compose for this setup:
 ```yaml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "3001", "--cors"]
     ports:
       - "3001:3001"

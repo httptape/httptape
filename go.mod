@@ -1,3 +1,3 @@
-module github.com/VibeWarden/httptape
+module github.com/httptape/httptape
 
 go 1.26

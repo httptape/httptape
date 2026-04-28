@@ -16,7 +16,7 @@ single-package layout and hexagonal-by-convention architecture.
    - `decisions.md` — all ADRs, especially the one for this issue
    - The GitHub issue and all its comments:
      ```bash
-     gh issue view <number> --repo VibeWarden/httptape --comments
+     gh issue view <number> --repo httptape/httptape --comments
      ```
    - Existing code in the package (`Glob`, `Grep`)
 
@@ -57,7 +57,7 @@ single-package layout and hexagonal-by-convention architecture.
    ```bash
    git push origin feat/<issue-number>-<short-slug>
    gh pr create \
-     --repo VibeWarden/httptape \
+     --repo httptape/httptape \
      --title "feat(#<number>): <description>" \
      --body "Closes #<number>\n\n## Summary\n<what you built>\n\n## Test plan\n<how to verify>" \
      --label "status:review"
@@ -65,7 +65,7 @@ single-package layout and hexagonal-by-convention architecture.
 
 8. **Set issue status**:
    ```bash
-   gh issue comment <number> --repo VibeWarden/httptape --body "Status: READY_FOR_REVIEW\nPR: <pr-url>"
+   gh issue comment <number> --repo httptape/httptape --body "Status: READY_FOR_REVIEW\nPR: <pr-url>"
    ```
 
 ## Code quality rules

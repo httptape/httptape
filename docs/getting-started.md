@@ -6,7 +6,7 @@ Record, Redact, and Replay HTTP traffic in 5 minutes.
 
 - Go 1.26 or later (for the Go library)
 - Or: Docker (for CLI/Docker usage with any language)
-- `go get github.com/VibeWarden/httptape`
+- `go get github.com/httptape/httptape`
 
 ## Step 1: Record HTTP traffic
 
@@ -19,7 +19,7 @@ import (
     "fmt"
     "net/http"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -62,7 +62,7 @@ import (
     "net/http"
     "net/http/httptest"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -97,7 +97,7 @@ import (
     "net/http"
     "strings"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {
@@ -144,7 +144,7 @@ import (
     "net/http/httptest"
     "testing"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func TestUserAPI(t *testing.T) {

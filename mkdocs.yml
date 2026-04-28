@@ -1,8 +1,8 @@
 site_name: httptape
 site_description: "Record, Redact, Replay -- HTTP traffic recording, redaction, and replay."
 site_url: https://vibewarden.dev/docs/httptape
-repo_url: https://github.com/VibeWarden/httptape
-repo_name: VibeWarden/httptape
+repo_url: https://github.com/httptape/httptape
+repo_name: httptape/httptape
 edit_uri: edit/main/docs/
 
 theme:
@@ -84,4 +84,4 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/VibeWarden/httptape
+      link: https://github.com/httptape/httptape

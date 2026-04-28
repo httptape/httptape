@@ -6,7 +6,7 @@
 
 services:
   serve:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     profiles: [serve]
     command:
       - serve
@@ -19,7 +19,7 @@ services:
       - ./config.json:/config/config.json:ro
 
   record:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     profiles: [record]
     command:
       - record

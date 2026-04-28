@@ -60,7 +60,7 @@ httptape record \
 The `BuildTLSConfig` function converts file paths into a `*tls.Config`:
 
 ```go
-import "github.com/VibeWarden/httptape"
+import "github.com/httptape/httptape"
 
 // Custom CA only
 tlsCfg, err := httptape.BuildTLSConfig("", "", "/path/to/ca.pem", false)

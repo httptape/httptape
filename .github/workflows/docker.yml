@@ -17,7 +17,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME_GHCR: ghcr.io/vibewarden/httptape
+  IMAGE_NAME_GHCR: ghcr.io/httptape/httptape
   IMAGE_NAME_DOCKERHUB: tibtof/httptape
 
 jobs:

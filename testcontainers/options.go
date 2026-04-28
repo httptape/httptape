@@ -92,7 +92,7 @@ func WithPort(port string) Option {
 }
 
 // WithImage overrides the Docker image reference. Defaults to
-// "ghcr.io/vibewarden/httptape:latest".
+// "ghcr.io/httptape/httptape:latest".
 func WithImage(image string) Option {
 	return func(o *options) {
 		o.image = image

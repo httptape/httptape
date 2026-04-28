@@ -268,13 +268,13 @@ Additional rules for `matcher`:
 
 ## JSON Schema
 
-A JSON Schema is available at [`config.schema.json`](https://github.com/VibeWarden/httptape/blob/main/config.schema.json) for IDE autocompletion and CI validation.
+A JSON Schema is available at [`config.schema.json`](https://github.com/httptape/httptape/blob/main/config.schema.json) for IDE autocompletion and CI validation.
 
 Reference it in your config file:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/VibeWarden/httptape/main/config.schema.json",
+  "$schema": "https://raw.githubusercontent.com/httptape/httptape/main/config.schema.json",
   "version": "1",
   "rules": [...]
 }

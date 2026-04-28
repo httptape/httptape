@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	httptape "github.com/VibeWarden/httptape/testcontainers"
+	httptape "github.com/httptape/httptape/testcontainers"
 )
 
 func TestRunContainer_ServeMode(t *testing.T) {
@@ -94,7 +94,7 @@ func TestRunContainer_WithImage(t *testing.T) {
 
 	ctr, err := httptape.RunContainer(ctx,
 		httptape.WithFixturesDir("./testdata/fixtures"),
-		httptape.WithImage("ghcr.io/vibewarden/httptape:latest"),
+		httptape.WithImage("ghcr.io/httptape/httptape:latest"),
 	)
 	if err != nil {
 		t.Fatalf("RunContainer: %v", err)

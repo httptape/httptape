@@ -328,7 +328,7 @@ import (
     "net/http"
     "time"
 
-    "github.com/VibeWarden/httptape"
+    "github.com/httptape/httptape"
 )
 
 func main() {

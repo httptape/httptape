@@ -43,8 +43,8 @@ USER 65534
 # `docker build .` and on downstream re-builds.
 LABEL org.opencontainers.image.title="httptape" \
       org.opencontainers.image.description="HTTP traffic recording, redaction, and replay — embeddable Go library, CLI, and 3 MB Docker image." \
-      org.opencontainers.image.source="https://github.com/VibeWarden/httptape" \
-      org.opencontainers.image.url="https://github.com/VibeWarden/httptape" \
+      org.opencontainers.image.source="https://github.com/httptape/httptape" \
+      org.opencontainers.image.url="https://github.com/httptape/httptape" \
       org.opencontainers.image.documentation="https://vibewarden.dev/docs/httptape/" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"

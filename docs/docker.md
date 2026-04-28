@@ -5,7 +5,7 @@ httptape is available as a minimal Docker image built from scratch (no OS, no sh
 ## Pull
 
 ```bash
-docker pull ghcr.io/vibewarden/httptape:latest
+docker pull ghcr.io/httptape/httptape:latest
 ```
 
 ## Serve mode
@@ -16,7 +16,7 @@ Replay recorded fixtures:
 docker run --rm \
   -v ./fixtures:/fixtures:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   serve --fixtures /fixtures --port 8081
 ```
 
@@ -31,7 +31,7 @@ docker run --rm \
   -v ./fixtures:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   record --upstream https://api.example.com \
          --fixtures /fixtures \
          --config /config/config.json \
@@ -49,7 +49,7 @@ docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
-  ghcr.io/vibewarden/httptape:latest \
+  ghcr.io/httptape/httptape:latest \
   proxy --upstream https://api.example.com \
         --fixtures /fixtures \
         --config /config/config.json \
@@ -85,7 +85,7 @@ Both are declared as `VOLUME` in the Dockerfile and pre-exist in the image.
 ```yaml
 services:
   mock-api:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["serve", "--fixtures", "/fixtures", "--port", "8081"]
     ports:
       - "8081:8081"
@@ -105,7 +105,7 @@ services:
 ```yaml
 services:
   recorder:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - record
       - --upstream
@@ -128,7 +128,7 @@ services:
 ```yaml
 services:
   api-proxy:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command:
       - proxy
       - --upstream
@@ -162,13 +162,13 @@ services:
 ```yaml
 services:
   recorder:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["record", "--upstream", "https://api.example.com", "--fixtures", "/fixtures", "--port", "8081"]
     volumes:
       - fixture-data:/fixtures
 
   exporter:
-    image: ghcr.io/vibewarden/httptape:latest
+    image: ghcr.io/httptape/httptape:latest
     command: ["export", "--fixtures", "/fixtures", "--output", "/output/bundle.tar.gz"]
     volumes:
       - fixture-data:/fixtures:ro
@@ -191,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mock-api:
-        image: ghcr.io/vibewarden/httptape:latest
+        image: ghcr.io/httptape/httptape:latest
         options: >-
           -v ${{ github.workspace }}/fixtures:/fixtures:ro
         ports:
