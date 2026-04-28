@@ -30,7 +30,7 @@ This demo uses the `httptape-testcontainers` SDK (`dev.httptape:httptape-testcon
 
 ```bash
 # From the parent directory of this httptape checkout
-git clone https://github.com/VibeWarden/httptape-jvm.git
+git clone https://github.com/httptape/httptape-jvm.git
 cd httptape-jvm
 ./gradlew publishToMavenLocal
 ```

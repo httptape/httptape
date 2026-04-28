@@ -51,7 +51,7 @@ This demo uses the `httptape-testcontainers-kotest` SDK (`dev.httptape:httptape-
 
 ```bash
 # From the parent directory of this httptape checkout
-git clone https://github.com/VibeWarden/httptape-jvm.git
+git clone https://github.com/httptape/httptape-jvm.git
 ```
 
 With the sibling repo present, `./gradlew test` resolves the SDK modules directly from source via composite build -- no publishing step needed.

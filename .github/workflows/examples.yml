@@ -118,7 +118,7 @@ jobs:
         if: matrix.example.java-version
         uses: actions/checkout@v6
         with:
-          repository: VibeWarden/httptape-jvm
+          repository: httptape/httptape-jvm
           path: httptape-jvm-sibling
           ref: main
 
