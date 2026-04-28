@@ -41,12 +41,23 @@ class TestcontainersConfig {
     /**
      * Wires the httptape container's dynamic port into the application properties
      * so that both Spring AI and the REST client point at the container.
+     *
+     * <p>Spring AI 2.0.0-M5 switched the OpenAI chat implementation from a
+     * hand-rolled RestClient to the official openai-java SDK. That SDK
+     * constructs request paths as {@code /chat/completions} (without a
+     * {@code /v1} prefix) and expects the base URL to include the version
+     * segment — e.g. {@code https://api.openai.com/v1}. The fixtures on
+     * disk therefore record the full path {@code /v1/chat/completions}, and
+     * the base URL must include the {@code /v1} prefix so that the SDK's
+     * requests match the recorded fixtures.
      */
     @Bean
     DynamicPropertyRegistrar httptapeProperties(HttptapeContainer httptapeContainer) {
         return registry -> {
             String baseUrl = httptapeContainer.getBaseUrl();
-            registry.add("spring.ai.openai.base-url", () -> baseUrl);
+            // The openai-java SDK appends /chat/completions to the base URL,
+            // so we add /v1 to match the recorded fixture path /v1/chat/completions.
+            registry.add("spring.ai.openai.base-url", () -> baseUrl + "/v1");
             registry.add("spring.ai.openai.api-key", () -> "sk-test-key");
             registry.add("app.external-api.base-url", () -> baseUrl);
         };
