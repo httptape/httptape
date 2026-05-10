@@ -142,6 +142,12 @@ success is unchanged.
   removed ADR is replaced with a one-line stub preserving its heading anchor.
   Surviving ADRs are not renumbered. (#246)
 
+- **decisions.md condense pass**: condensed 10 ADRs (6, 9, 10, 11, 18, 24,
+  26, 28, 37, 39) from full design documents to 5-10 line decision+rationale
+  summaries. Swept remaining stale `VibeWarden/httptape` org-path references
+  (none found in surviving content; prose references to the VibeWarden parent
+  project retained). (#246)
+
 ## [0.13.1] - 2026-04-18
 
 ### Changed
