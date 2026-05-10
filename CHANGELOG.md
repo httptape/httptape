@@ -135,6 +135,13 @@ if err != nil {
 The same pattern applies to `NewProxy` and `SSETimingAccelerated`. Behavior on
 success is unchanged.
 
+### Changed
+
+- **decisions.md cleanup**: removed 17 ADRs that did not meet the tightened
+  ADR bar (feature-applying, operational, or duplicating CLAUDE.md). Each
+  removed ADR is replaced with a one-line stub preserving its heading anchor.
+  Surviving ADRs are not renumbered. (#246)
+
 ## [0.13.1] - 2026-04-18
 
 ### Changed
