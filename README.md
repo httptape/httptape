@@ -395,7 +395,7 @@ Full docs at **[httptape.dev/docs](https://httptape.dev/docs/)**.
 
 ## About
 
-httptape is developed as part of [VibeWarden](https://vibewarden.dev). For the full docs, guides, and other projects from the VibeWarden team, visit [vibewarden.dev](https://vibewarden.dev).
+httptape originated at [VibeWarden](https://vibewarden.dev) and is now a standalone project. Full docs and guides live at [httptape.dev/docs](https://httptape.dev/docs/).
 
 ## License
 

@@ -29,7 +29,7 @@ License: Apache 2.0
 | Matching | Progressive | Exact match first, fuzzy/regex as opt-in |
 | Recording | Async by default | Non-blocking, minimal hot-path overhead |
 | Body handling | Store hash + full body | Hash for matching, full body for replay |
-| Distribution | Go module only (v1) | CLI wrapper is a future goal, not v1 |
+| Distribution | Go module (primary); standalone CLI binary and Docker image for non-Go callers | Embeddable as a Go module first; CLI/Docker added for non-Go consumers |
 
 ---
 
