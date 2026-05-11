@@ -148,6 +148,13 @@ success is unchanged.
   (none found in surviving content; prose references to the VibeWarden parent
   project retained). (#246)
 
+- **README/godoc attribution**: reframed VibeWarden mention in README and
+  `doc.go` to "httptape originated at VibeWarden and is now a standalone
+  project". Reflects post-spinout reality after the GitHub org migration.
+
+- **CLAUDE.md Distribution row**: refreshed to reflect that the CLI and
+  Docker image now ship; the "CLI is a future goal" note was stale.
+
 ## [0.13.1] - 2026-04-18
 
 ### Changed
