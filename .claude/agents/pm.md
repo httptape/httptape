@@ -37,6 +37,16 @@ coming back to ask questions.
    gh issue comment <number> --repo httptape/httptape --body "Status: READY_FOR_ARCH"
    ```
 
+## Library issues vs example issues
+
+Issues fall into two shapes; the spec template above is for **library** work. **Example** issues (anything under `examples/<demo>/`) follow a lighter ruleset:
+
+- The "As a Go developer" user story doesn't fit — frame it as "As a httptape user evaluating the [Spring Boot / Ktor / TS frontend] integration".
+- Locked decisions in `.claude/CLAUDE.md` (stdlib-only, single flat package, hexagonal, etc.) are **library-only**. Do not propagate them into example specs.
+- Acceptance criteria should name the demo's toolchain so dev/reviewer know how to verify: e.g. "build succeeds with `npm run build`", "`./mvnw test` passes", "`./gradlew test --no-daemon` passes". The `.github/workflows/examples.yml` matrix is the authoritative source of build commands.
+- Always include the demo's path (e.g. `examples/kotlin-ktor-koog`) in the spec so dev opens the right working directory.
+- Example issues rarely warrant an ADR — flag this in the spec so the architect skips straight to the design comment.
+
 ## Spec quality rules
 
 - Acceptance criteria must be testable by a developer without talking to you

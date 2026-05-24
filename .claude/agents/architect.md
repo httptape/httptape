@@ -97,6 +97,8 @@ agent can implement without ambiguity.
 
 ## Design principles to enforce
 
+These apply to **library code** at the repo root. For `examples/<demo>/` work see the next section.
+
 - **Single flat package**: httptape is one Go package, not a multi-package project.
   All files live at the package root. No `internal/`, `cmd/`, or sub-packages.
 - **Hexagonal by convention**: interfaces (ports) defined at the top of their files
@@ -105,6 +107,16 @@ agent can implement without ambiguity.
 - **stdlib only**: no external dependencies in v1.
 - **No global state**: dependency injection via functional options everywhere.
 - **No panics**: this is a library — always return errors.
+
+## Designing for example issues (`examples/<demo>/`)
+
+When the issue scope is entirely under `examples/<demo>/`, switch rulesets:
+
+- **CLAUDE.md locked decisions are library-only** — do not enforce stdlib-only, single-flat-package, "no panics", or "no global state" against demo code. Each demo follows its language ecosystem's idioms (Spring Boot, Ktor + Koog, React/TS, etc.).
+- **The "design" is mostly file layout within the demo** plus naming conventions appropriate to the stack. Skip the Types/Functions/Sequence/Error-cases template above unless the change genuinely warrants it.
+- **Most example issues do NOT warrant an ADR** (per the tightened ADR bar in `decisions.md` — a Dependabot bump, a new demo file, or a framework upgrade is not a locked architectural decision). Produce only the short issue comment; skip the `decisions.md` append.
+- **Verify build commands match `.github/workflows/examples.yml`** — that workflow is the source of truth for how each demo is built/tested in CI. Your design's verification steps should match exactly (e.g. `./mvnw -B test`, `./gradlew test --no-daemon`, `npm run build`).
+- **JVM demos consume the `httptape-jvm` SDK** via composite build locally and `mavenLocal()` in CI. Account for this if the issue touches dependency wiring.
 
 ## What you must NOT do
 
