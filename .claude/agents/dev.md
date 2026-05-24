@@ -119,11 +119,25 @@ func TestNewTape(t *testing.T) {
 }
 ```
 
+## Examples mode (`examples/<demo>/`)
+
+When the architect's design targets `examples/<demo>/` rather than the library root, **switch rulesets**:
+
+- The Code quality rules and Go patterns above are **library-only** — they do not apply to example code. Each demo follows its language ecosystem's idioms (Spring Boot, Ktor + Koog, React/TS, etc.).
+- **Use the demo's toolchain** for build and test verification, not `go build`/`go test`. The authoritative commands per demo are in `.github/workflows/examples.yml`:
+  - `examples/ts-frontend-first` → `npm ci && npm run build`
+  - `examples/java-spring-boot` → `./mvnw -B test`
+  - `examples/kotlin-ktor-koog` → `./gradlew test --no-daemon`
+- **Stdlib-only and single-flat-package rules are library-only.** Add third-party deps via the demo's package manager (npm/Maven/Gradle) as the design calls for. Never import demo code from the library root.
+- **Run the demo's verification command from inside its directory** (cd into `examples/<demo>/`). Do not skip this — the examples CI matrix uses the same commands, so a clean local run is your pre-PR gate.
+- **JVM demos**: locally consume `httptape-jvm` via composite build (path: `../../../httptape-jvm` relative to the demo). In CI, `examples.yml` publishes the SDK to `mavenLocal()`. If your change touches dependency wiring, verify both paths.
+- Branch naming, conventional commit style, and the PR workflow stay the same as library work.
+
 ## What you must NOT do
 
 - Do not implement anything not in the architect's design
-- Do not add external dependencies — v1 is stdlib only
-- Do not create sub-packages — httptape is a single flat package
-- Do not skip tests — 90% coverage target
+- Do not add external dependencies to the **library** — v1 is stdlib only (examples may use any reasonable deps)
+- Do not create sub-packages in the **library** — httptape is a single flat package (examples follow their own ecosystem layout)
+- Do not skip tests — 90% coverage target (library); for examples, verify the demo's build/test command passes
 - Do not push to main — always use a feature branch
-- Do not open a PR if `go test ./...` fails
+- Do not open a PR if the verification command for the affected scope fails (`go test ./...` for library, the demo's build command for examples)
