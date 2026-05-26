@@ -111,7 +111,6 @@ IDE users: open [`api.http`](./api.http) — IntelliJ's HTTP Client (and VS Code
 
 | Alternative | Limitation |
 |---|---|
-| **WireMock** | No native SSE record/replay. No sanitize-on-write. |
 | **Spring `MockRestServiceServer`** | Works for REST, no streaming SSE support for Spring AI. |
 | **Real OpenAI calls in tests** | Slow (network), flaky (rate limits / outages), costs money, leaks PII into CI logs. |
 | **Manual mocking (Mockito)** | Skips the HTTP layer — you're not testing the real integration. Breaks when the API contract changes. |

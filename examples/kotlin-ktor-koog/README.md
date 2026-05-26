@@ -140,7 +140,6 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 
 | Alternative | Limitation |
 |---|---|
-| **WireMock** | No native body-fuzzy matching. No sanitize-on-write. |
 | **Koog's built-in mocks (`getMockExecutor`, `mockTool`)** | Mocks the LLM at executor level, skipping the HTTP layer entirely. You are not testing that your agent works with a real OpenAI-compatible endpoint. httptape tests the full HTTP integration -- serialization, headers, content negotiation -- same as production. |
 | **Real OpenAI calls in tests** | Slow, flaky, costs money, leaks PII into CI logs. |
 | **Manual Ktor test stubs** | Skips the HTTP layer. Breaks when the API contract changes. |

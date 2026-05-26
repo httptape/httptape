@@ -12,11 +12,7 @@ httptape captures HTTP request/response pairs, redacts sensitive data on write, 
 
 ## Why httptape?
 
-**WireMock requires Java.** Separate process, 200 MB+ memory, can't embed in a Go binary.
-
-**Go mocking libraries** (`gock`, `httpmock`) only work inside test code. No standalone server, no recording, no fixture management.
-
-**Nobody does redaction.** Existing tools record raw traffic including secrets and PII. Redaction is always an afterthought. httptape redacts on write -- sensitive data never hits disk.
+Standalone server + CLI, **sanitize-on-write by default**, SSE event-level replay, and embeddable as a Go library with zero deps. For the full story (extracted from VibeWarden's egress proxy) and side-by-side comparisons with WireMock, Hoverfly, go-vcr, and others, see [Why httptape](why.md).
 
 ## Key features
 
