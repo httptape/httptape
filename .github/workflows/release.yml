@@ -1,8 +1,18 @@
 # .github/workflows/release.yml
 #
-# Run tests and publish a GitHub Release with auto-generated notes.
-# httptape is a Go library — no binaries needed.
+# Run tests, publish a GitHub Release with auto-generated notes, and notify
+# httptape/httptape-js (the npm-distribution sibling repo) so it can build
+# and publish per-platform binary packages plus vite-plugin-httptape.
+#
 # Triggers: semver tags (v*).
+#
+# Required secrets:
+#   HTTPTAPE_JS_DISPATCH_TOKEN — fine-grained PAT (or GitHub App token) with
+#     "Actions: write" on httptape/httptape-js. Used by the final step to
+#     fire a repository_dispatch event.
+#     If missing, the dispatch step fails loudly and the rest of the release
+#     still ships; npm packages will not be published automatically until
+#     the secret is added.
 
 name: Release
 
@@ -32,3 +42,22 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          # Strip leading "v" so the payload version matches the npm
+          # version (e.g. tag v0.13.2 → version 0.13.2).
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify httptape-js (binary build + npm publish)
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HTTPTAPE_JS_DISPATCH_TOKEN }}
+          repository: httptape/httptape-js
+          event-type: httptape-release
+          client-payload: |
+            {
+              "version": "${{ steps.version.outputs.version }}",
+              "sha": "${{ github.sha }}"
+            }
