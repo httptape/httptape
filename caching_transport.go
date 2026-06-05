@@ -3,9 +3,12 @@ package httptape
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +97,15 @@ func WithCacheFilter(fn func(*http.Response) bool) CachingOption {
 // WithCacheSingleFlight controls single-flight deduplication of concurrent
 // cache misses. When true (default), concurrent requests with the same match
 // key share a single upstream call.
+//
+// The single-flight key is derived from: HTTP method, URL path, raw query
+// string, request body hash, and a canonical SHA-256 hash of all request
+// headers except hop-by-hop / volatile headers (see sfHeaderDenylist). This
+// key fully identifies every dimension a Matcher could distinguish, so a
+// single-flight waiter never receives a response that would not match its own
+// request. The cost is reduced collapsing when two equivalent requests differ
+// only in incidental headers (e.g. a per-request trace ID); both then make
+// separate upstream calls.
 //
 // Known limitation: waiters do not observe their request's context cancellation
 // until the leader's upstream call completes. This is a consequence of using
@@ -336,13 +348,80 @@ func (ct *CachingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 
 	// 6. MISS: forward to upstream.
-	sfKey := req.Method + "|" + req.URL.Path + "|" + bodyHash
+	sfKey := singleFlightKey(req, bodyHash)
 
 	if ct.singleFlight {
 		return ct.roundTripWithSingleFlight(req, reqBody, bodyHash, sfKey)
 	}
 
 	return ct.roundTripUpstream(req, reqBody, bodyHash)
+}
+
+// sfHeaderDenylist names request headers excluded from the single-flight key.
+// These are hop-by-hop / per-connection / volatile headers not inspected by
+// any built-in Matcher; including them would needlessly defeat single-flight
+// collapsing for genuinely-equivalent requests. Keys are stored in canonical
+// (http.CanonicalHeaderKey) form.
+var sfHeaderDenylist = map[string]struct{}{
+	"Connection":        {},
+	"Proxy-Connection":  {},
+	"Keep-Alive":        {},
+	"Transfer-Encoding": {},
+	"Te":                {},
+	"Trailer":           {},
+	"Upgrade":           {},
+	"Content-Length":    {},
+	"Host":              {},
+}
+
+// singleFlightKey derives a single-flight deduplication key that fully
+// identifies a matchable request. It folds in method, URL path, raw query
+// string, the request body hash (already computed by the caller), and a
+// canonical SHA-256 hash of all request headers not in sfHeaderDenylist.
+//
+// The key is safe for any configured Matcher: two requests sharing a key are
+// indistinguishable on every dimension a Matcher could read, so a
+// single-flight waiter never receives a response that would not match its own
+// request.
+//
+// singleFlightKey never fails and performs no I/O. It reads req.Header
+// read-only and never mutates the request.
+func singleFlightKey(req *http.Request, bodyHash string) string {
+	// Collect non-denylisted header names in sorted order.
+	names := make([]string, 0, len(req.Header))
+	for name := range req.Header {
+		canonical := http.CanonicalHeaderKey(name)
+		if _, denied := sfHeaderDenylist[canonical]; !denied {
+			names = append(names, canonical)
+		}
+	}
+	sort.Strings(names)
+
+	// Hash the canonical header representation.
+	h := sha256.New()
+	for _, name := range names {
+		vals := req.Header[name]
+		// Sort a copy of the value slice so multi-valued headers hash
+		// deterministically regardless of insertion order.
+		valsCopy := make([]string, len(vals))
+		copy(valsCopy, vals)
+		sort.Strings(valsCopy)
+
+		// Frame: name \x00 v1 \x01 v2 ... \n — control bytes that cannot
+		// appear in header names or values, keeping serialization unambiguous.
+		h.Write([]byte(name))
+		h.Write([]byte{0x00})
+		for i, v := range valsCopy {
+			if i > 0 {
+				h.Write([]byte{0x01})
+			}
+			h.Write([]byte(v))
+		}
+		h.Write([]byte{0x0a}) // \n
+	}
+	headerDigest := hex.EncodeToString(h.Sum(nil))
+
+	return req.Method + "|" + req.URL.Path + "|" + req.URL.RawQuery + "|" + bodyHash + "|" + headerDigest
 }
 
 // roundTripWithSingleFlight coordinates single-flight dedup for non-SSE
