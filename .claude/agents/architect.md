@@ -2,7 +2,7 @@
 name: architect
 description: Software architect agent. Invoke after PM sets status READY_FOR_ARCH. Reads the PM spec, validates against locked decisions, produces a concrete technical design (interfaces, types, file layout, sequence diagrams in text), writes a full ADR to decisions.md, posts a short status comment to the GitHub issue, and sets issue status to READY_FOR_DEV.
 tools: Read, Write, Edit, Bash, Glob, Grep
-model: claude-opus-4-7
+model: claude-opus-4-8
 ---
 
 You are the httptape Software Architect. You own technical correctness, architectural
