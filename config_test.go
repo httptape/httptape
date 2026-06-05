@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -1117,4 +1118,301 @@ func TestLoadConfig_PathPatternValidationErrors(t *testing.T) {
 // writeTestFile is a helper that writes content to the given path.
 func writeTestFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// --- redact_query and fake_query config action tests ---
+
+func TestLoadConfig_RedactQuery_Valid(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantParams []string
+	}{
+		{
+			name:       "explicit params",
+			input:      `{"version":"1","rules":[{"action":"redact_query","params":["api_key","token"]}]}`,
+			wantParams: []string{"api_key", "token"},
+		},
+		{
+			name:       "empty params uses defaults",
+			input:      `{"version":"1","rules":[{"action":"redact_query"}]}`,
+			wantParams: nil, // no params field means empty slice
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadConfig(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(cfg.Rules) != 1 {
+				t.Fatalf("len(rules) = %d, want 1", len(cfg.Rules))
+			}
+			if cfg.Rules[0].Action != ActionRedactQuery {
+				t.Errorf("action = %q, want %q", cfg.Rules[0].Action, ActionRedactQuery)
+			}
+			if tt.wantParams != nil {
+				if len(cfg.Rules[0].Params) != len(tt.wantParams) {
+					t.Fatalf("params len = %d, want %d", len(cfg.Rules[0].Params), len(tt.wantParams))
+				}
+				for i, p := range tt.wantParams {
+					if cfg.Rules[0].Params[i] != p {
+						t.Errorf("params[%d] = %q, want %q", i, cfg.Rules[0].Params[i], p)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLoadConfig_FakeQuery_Valid(t *testing.T) {
+	input := `{"version":"1","rules":[{"action":"fake_query","seed":"my-seed","params":["api_key","token"]}]}`
+
+	cfg, err := LoadConfig(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Rules) != 1 {
+		t.Fatalf("len(rules) = %d, want 1", len(cfg.Rules))
+	}
+	rule := cfg.Rules[0]
+	if rule.Action != ActionFakeQuery {
+		t.Errorf("action = %q, want %q", rule.Action, ActionFakeQuery)
+	}
+	if rule.Seed != "my-seed" {
+		t.Errorf("seed = %q, want %q", rule.Seed, "my-seed")
+	}
+	if len(rule.Params) != 2 {
+		t.Fatalf("params len = %d, want 2", len(rule.Params))
+	}
+}
+
+func TestLoadConfig_RedactQuery_ValidationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:    "redact_query with paths is rejected",
+			input:   `{"version":"1","rules":[{"action":"redact_query","paths":["$.x"]}]}`,
+			wantErr: `does not use "paths"`,
+		},
+		{
+			name:    "redact_query with seed is rejected",
+			input:   `{"version":"1","rules":[{"action":"redact_query","seed":"s"}]}`,
+			wantErr: `does not use "seed"`,
+		},
+		{
+			name:    "redact_query with fields is rejected",
+			input:   `{"version":"1","rules":[{"action":"redact_query","fields":{"$.x":"email"}}]}`,
+			wantErr: `does not use "fields"`,
+		},
+		{
+			name:    "redact_query with headers is rejected",
+			input:   `{"version":"1","rules":[{"action":"redact_query","headers":["Authorization"]}]}`,
+			wantErr: `does not use "headers"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadConfig(strings.NewReader(tt.input))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_FakeQuery_ValidationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:    "fake_query missing seed",
+			input:   `{"version":"1","rules":[{"action":"fake_query","params":["api_key"]}]}`,
+			wantErr: `"fake_query" requires non-empty "seed"`,
+		},
+		{
+			name:    "fake_query missing params",
+			input:   `{"version":"1","rules":[{"action":"fake_query","seed":"s"}]}`,
+			wantErr: `"fake_query" requires non-empty "params"`,
+		},
+		{
+			name:    "fake_query with paths is rejected",
+			input:   `{"version":"1","rules":[{"action":"fake_query","seed":"s","params":["api_key"],"paths":["$.x"]}]}`,
+			wantErr: `does not use "paths"`,
+		},
+		{
+			name:    "fake_query with fields is rejected",
+			input:   `{"version":"1","rules":[{"action":"fake_query","seed":"s","params":["api_key"],"fields":{"$.x":"email"}}]}`,
+			wantErr: `does not use "fields"`,
+		},
+		{
+			name:    "fake_query with headers is rejected",
+			input:   `{"version":"1","rules":[{"action":"fake_query","seed":"s","params":["api_key"],"headers":["Authorization"]}]}`,
+			wantErr: `does not use "headers"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadConfig(strings.NewReader(tt.input))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfig_BuildPipeline_RedactQuery_RedactsMatchingParams(t *testing.T) {
+	cfg := &Config{
+		Version: "1",
+		Rules: []Rule{
+			{Action: ActionRedactQuery, Params: []string{"api_key", "token"}},
+		},
+	}
+
+	pipeline := cfg.BuildPipeline()
+
+	tape := Tape{
+		Request: RecordedReq{
+			Method:  "GET",
+			URL:     "https://example.com/api?api_key=secret&keep=value",
+			Headers: make(http.Header),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    make(http.Header),
+		},
+	}
+
+	result := pipeline.Sanitize(tape)
+
+	// Verify URL via query string parsing.
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key = %q, want %q", got, Redacted)
+	}
+	if got := u.Query().Get("keep"); got != "value" {
+		t.Errorf("keep = %q, want %q", got, "value")
+	}
+}
+
+func TestConfig_BuildPipeline_RedactQuery_DefaultsWhenNoParams(t *testing.T) {
+	// redact_query with no params uses DefaultSensitiveQueryParams.
+	cfg := &Config{
+		Version: "1",
+		Rules: []Rule{
+			{Action: ActionRedactQuery}, // no Params => defaults
+		},
+	}
+
+	pipeline := cfg.BuildPipeline()
+
+	tape := Tape{
+		Request: RecordedReq{
+			Method:  "GET",
+			URL:     "https://example.com/api?api_key=secret&other=keep",
+			Headers: make(http.Header),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    make(http.Header),
+		},
+	}
+
+	result := pipeline.Sanitize(tape)
+
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key = %q, want %q", got, Redacted)
+	}
+	if got := u.Query().Get("other"); got != "keep" {
+		t.Errorf("other = %q, want %q", got, "keep")
+	}
+}
+
+func TestConfig_BuildPipeline_FakeQuery_FakesMatchingParams(t *testing.T) {
+	cfg := &Config{
+		Version: "1",
+		Rules: []Rule{
+			{Action: ActionFakeQuery, Seed: "test-seed", Params: []string{"api_key"}},
+		},
+	}
+
+	pipeline := cfg.BuildPipeline()
+
+	tape := Tape{
+		Request: RecordedReq{
+			Method:  "GET",
+			URL:     "https://example.com/api?api_key=original&keep=value",
+			Headers: make(http.Header),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    make(http.Header),
+		},
+	}
+
+	result := pipeline.Sanitize(tape)
+
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	got := u.Query().Get("api_key")
+	if !strings.HasPrefix(got, "fake_") {
+		t.Errorf("api_key = %q, want fake_* prefix", got)
+	}
+	if got == "original" {
+		t.Error("api_key value should have changed")
+	}
+	if u.Query().Get("keep") != "value" {
+		t.Errorf("keep = %q, want %q", u.Query().Get("keep"), "value")
+	}
+}
+
+func TestConfig_BuildPipeline_FakeQuery_IsDeterministic(t *testing.T) {
+	cfg := &Config{
+		Version: "1",
+		Rules: []Rule{
+			{Action: ActionFakeQuery, Seed: "test-seed", Params: []string{"api_key"}},
+		},
+	}
+
+	pipeline := cfg.BuildPipeline()
+
+	tape := Tape{
+		Request: RecordedReq{
+			Method:  "GET",
+			URL:     "https://example.com/api?api_key=original",
+			Headers: make(http.Header),
+		},
+		Response: RecordedResp{Headers: make(http.Header)},
+	}
+
+	result1 := pipeline.Sanitize(tape)
+	result2 := pipeline.Sanitize(tape)
+
+	if result1.Request.URL != result2.Request.URL {
+		t.Errorf("fake_query is not deterministic:\nfirst:  %q\nsecond: %q",
+			result1.Request.URL, result2.Request.URL)
+	}
 }
