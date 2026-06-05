@@ -1780,3 +1780,373 @@ func TestCachingTransport_WithCacheReplayTiming_PreFeatureNoDelay(t *testing.T) 
 		t.Error("sleepFunc was called for pre-feature fixture (ElapsedMS=0)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// AC-4: single-flight key distinguishes query string — regression test
+// ---------------------------------------------------------------------------
+
+// TestCachingTransport_SingleFlightDistinguishesQueryString verifies that two
+// concurrent cache-miss requests differing only by query string each receive
+// the correct upstream response and that upstream is called exactly twice.
+// This is the exact bug reported in #285 (page=1 waiter received page=2 body).
+func TestCachingTransport_SingleFlightDistinguishesQueryString(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	var callCount atomic.Int64
+	// ready is closed once both goroutines have entered the upstream stub,
+	// ensuring they are in the inflight window at the same time.
+	var arrivedCount atomic.Int64
+	unblock := make(chan struct{})
+
+	upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		n := callCount.Add(1)
+		arrivedCount.Add(1)
+		// First arrival waits until the second has also arrived (both concurrent misses).
+		if n == 1 {
+			<-unblock
+		}
+		page := req.URL.Query().Get("page")
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("page=" + page)),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheMatcher(NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, QueryParamsCriterion{})),
+		WithCacheSingleFlight(true),
+	)
+
+	// Release the first goroutine once the second has entered the stub.
+	go func() {
+		for arrivedCount.Load() < 2 {
+			// spin — in tests this resolves within microseconds once the
+			// second goroutine starts its upstream call.
+		}
+		close(unblock)
+	}()
+
+	type result struct {
+		body string
+		err  error
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("GET", "http://example.com/data?page=1", nil)
+		resp, err := ct.RoundTrip(req)
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			results[0] = result{body: string(b)}
+		} else {
+			results[0] = result{err: err}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("GET", "http://example.com/data?page=2", nil)
+		resp, err := ct.RoundTrip(req)
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			results[1] = result{body: string(b)}
+		} else {
+			results[1] = result{err: err}
+		}
+	}()
+
+	wg.Wait()
+
+	if c := callCount.Load(); c != 2 {
+		t.Errorf("upstream called %d times, want 2 (distinct query strings must not collapse)", c)
+	}
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("goroutine %d got error: %v", i, r.err)
+		}
+	}
+	// Each goroutine must receive its own page's body.
+	if results[0].body != "page=1" && results[1].body != "page=1" {
+		t.Errorf("neither goroutine received page=1 body; got %q and %q", results[0].body, results[1].body)
+	}
+	if results[0].body != "page=2" && results[1].body != "page=2" {
+		t.Errorf("neither goroutine received page=2 body; got %q and %q", results[0].body, results[1].body)
+	}
+	// Verify each goroutine received its own query's response (not the other's).
+	for i, r := range results {
+		page := fmt.Sprintf("page=%d", i+1)
+		if r.body != page {
+			t.Errorf("goroutine %d got body %q, want %q", i, r.body, page)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-5: single-flight key still collapses genuinely identical requests
+// ---------------------------------------------------------------------------
+
+// TestCachingTransport_SingleFlightCollapsesIdenticalRequests verifies that
+// two concurrent cache-miss requests that are genuinely identical (same URL,
+// same headers) still share a single upstream call.
+func TestCachingTransport_SingleFlightCollapsesIdenticalRequests(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	var callCount atomic.Int64
+	upstream := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		callCount.Add(1)
+		time.Sleep(50 * time.Millisecond) // widen inflight window
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("shared-body")),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheMatcher(NewCompositeMatcher(MethodCriterion{}, PathCriterion{}, QueryParamsCriterion{})),
+		WithCacheSingleFlight(true),
+	)
+
+	const N = 5
+	var wg sync.WaitGroup
+	wg.Add(N)
+	bodies := make([]string, N)
+	errs := make([]error, N)
+
+	for i := 0; i < N; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			req, _ := http.NewRequest("GET", "http://example.com/data?page=1", nil)
+			resp, err := ct.RoundTrip(req)
+			errs[idx] = err
+			if resp != nil {
+				b, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				bodies[idx] = string(b)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if c := callCount.Load(); c != 1 {
+		t.Errorf("upstream called %d times, want 1 (identical requests must collapse)", c)
+	}
+	for i := 0; i < N; i++ {
+		if errs[i] != nil {
+			t.Errorf("goroutine %d error: %v", i, errs[i])
+		}
+		if bodies[i] != "shared-body" {
+			t.Errorf("goroutine %d body = %q, want %q", i, bodies[i], "shared-body")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-2: single-flight key distinguishes header values
+// ---------------------------------------------------------------------------
+
+// TestCachingTransport_SingleFlightDistinguishesHeaders verifies that two
+// concurrent cache-miss requests differing only by a matcher-relevant header
+// each receive their correct upstream response and that upstream is called
+// exactly twice.
+func TestCachingTransport_SingleFlightDistinguishesHeaders(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+
+	var callCount atomic.Int64
+	var arrivedCount atomic.Int64
+	unblock := make(chan struct{})
+
+	upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		n := callCount.Add(1)
+		arrivedCount.Add(1)
+		if n == 1 {
+			<-unblock
+		}
+		accept := req.Header.Get("Accept")
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("accept=" + accept)),
+		}, nil
+	})
+
+	ct := NewCachingTransport(upstream, store,
+		WithCacheMatcher(NewCompositeMatcher(MethodCriterion{}, PathCriterion{})),
+		WithCacheSingleFlight(true),
+	)
+
+	go func() {
+		for arrivedCount.Load() < 2 {
+		}
+		close(unblock)
+	}()
+
+	type result struct {
+		body string
+		err  error
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+		req.Header.Set("Accept", "application/json")
+		resp, err := ct.RoundTrip(req)
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			results[0] = result{body: string(b)}
+		} else {
+			results[0] = result{err: err}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest("GET", "http://example.com/api", nil)
+		req.Header.Set("Accept", "text/csv")
+		resp, err := ct.RoundTrip(req)
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			results[1] = result{body: string(b)}
+		} else {
+			results[1] = result{err: err}
+		}
+	}()
+
+	wg.Wait()
+
+	if c := callCount.Load(); c != 2 {
+		t.Errorf("upstream called %d times, want 2 (distinct Accept headers must not collapse)", c)
+	}
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("goroutine %d got error: %v", i, r.err)
+		}
+	}
+	wantBodies := []string{"accept=application/json", "accept=text/csv"}
+	for i, r := range results {
+		if r.body != wantBodies[i] {
+			t.Errorf("goroutine %d got body %q, want %q", i, r.body, wantBodies[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unit test: singleFlightKey
+// ---------------------------------------------------------------------------
+
+// TestSingleFlightKey verifies the key construction logic with a table of
+// inputs covering distinct-key and same-key cases.
+func TestSingleFlightKey(t *testing.T) {
+	t.Parallel()
+
+	makeReq := func(method, rawURL string, headers http.Header) *http.Request {
+		req, _ := http.NewRequest(method, rawURL, nil)
+		for k, vs := range headers {
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
+		return req
+	}
+
+	tests := []struct {
+		name      string
+		req1      *http.Request
+		bodyHash1 string
+		req2      *http.Request
+		bodyHash2 string
+		wantSame  bool
+	}{
+		{
+			name:      "same request produces same key",
+			req1:      makeReq("GET", "http://example.com/api?page=1", http.Header{"Accept": {"application/json"}}),
+			bodyHash1: "abc",
+			req2:      makeReq("GET", "http://example.com/api?page=1", http.Header{"Accept": {"application/json"}}),
+			bodyHash2: "abc",
+			wantSame:  true,
+		},
+		{
+			name:      "different query string produces different key",
+			req1:      makeReq("GET", "http://example.com/api?page=1", nil),
+			bodyHash1: "",
+			req2:      makeReq("GET", "http://example.com/api?page=2", nil),
+			bodyHash2: "",
+			wantSame:  false,
+		},
+		{
+			name:      "different Accept header produces different key",
+			req1:      makeReq("GET", "http://example.com/api", http.Header{"Accept": {"application/json"}}),
+			bodyHash1: "",
+			req2:      makeReq("GET", "http://example.com/api", http.Header{"Accept": {"text/csv"}}),
+			bodyHash2: "",
+			wantSame:  false,
+		},
+		{
+			name:      "different body hash produces different key",
+			req1:      makeReq("POST", "http://example.com/api", nil),
+			bodyHash1: "hash1",
+			req2:      makeReq("POST", "http://example.com/api", nil),
+			bodyHash2: "hash2",
+			wantSame:  false,
+		},
+		{
+			name:      "header value order does not change the key",
+			req1:      makeReq("GET", "http://example.com/api", http.Header{"X-Foo": {"b", "a"}}),
+			bodyHash1: "",
+			req2:      makeReq("GET", "http://example.com/api", http.Header{"X-Foo": {"a", "b"}}),
+			bodyHash2: "",
+			wantSame:  true,
+		},
+		{
+			name:      "denylisted Connection header difference does not change the key",
+			req1:      makeReq("GET", "http://example.com/api", http.Header{"Connection": {"keep-alive"}}),
+			bodyHash1: "",
+			req2:      makeReq("GET", "http://example.com/api", http.Header{"Connection": {"close"}}),
+			bodyHash2: "",
+			wantSame:  true,
+		},
+		{
+			name:      "denylisted Content-Length difference does not change the key",
+			req1:      makeReq("POST", "http://example.com/api", http.Header{"Content-Length": {"0"}}),
+			bodyHash1: "",
+			req2:      makeReq("POST", "http://example.com/api", http.Header{"Content-Length": {"42"}}),
+			bodyHash2: "",
+			wantSame:  true,
+		},
+		{
+			name:      "nil headers produce same key as empty headers",
+			req1:      makeReq("GET", "http://example.com/api", nil),
+			bodyHash1: "",
+			req2:      makeReq("GET", "http://example.com/api", http.Header{}),
+			bodyHash2: "",
+			wantSame:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k1 := singleFlightKey(tt.req1, tt.bodyHash1)
+			k2 := singleFlightKey(tt.req2, tt.bodyHash2)
+			if tt.wantSame && k1 != k2 {
+				t.Errorf("expected same key; got\n  k1=%q\n  k2=%q", k1, k2)
+			}
+			if !tt.wantSame && k1 == k2 {
+				t.Errorf("expected different keys; both produced %q", k1)
+			}
+		})
+	}
+}
