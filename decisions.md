@@ -7083,12 +7083,12 @@ Removed in #246 cleanup — did not meet the tightened ADR bar (see issue for cr
 
 ---
 
-## ADR-47: Single-flight key fully identifies a matchable request
+### ADR-47: Single-flight key fully identifies a matchable request
 **Date**: 2026-06-05
 **Issue**: #285
 **Status**: Accepted
 
-### Context
+#### Context
 
 `CachingTransport.RoundTrip` builds its single-flight deduplication key
 (`caching_transport.go:339`) as:
@@ -7114,7 +7114,7 @@ inspects — the `Matcher` interface (`Match(req, candidates) (Tape, bool)`) exp
 no introspection, and the PM spec explicitly forbids changing it. We must therefore
 choose a key that is safe for *any* matcher the embedder could plug in.
 
-### Decision
+#### Decision
 
 Construct the single-flight key from **every request dimension a `Matcher` could
 possibly distinguish**, derived only from `*http.Request` fields and stdlib
@@ -7148,12 +7148,12 @@ and that no built-in matcher inspects, so that incidental transport noise does n
 needlessly defeat collapsing. Everything else is included (conservative-by-default:
 unknown headers are kept in the key).
 
-#### Types
+##### Types
 
 No new exported types. No change to `Matcher`, `Criterion`, `CompositeMatcher`, or
 any option type. No change to `CachingTransport`'s struct fields or public API.
 
-#### Functions and methods
+##### Functions and methods
 
 One new unexported helper in `caching_transport.go`:
 
@@ -7202,7 +7202,7 @@ built-in criterion matches on it and it is redundant with path/route; if a futur
 criterion matches on Host, revisit. Authorization/Cookie/Accept and all other
 content-negotiation or app headers are **kept** (they are matcher-relevant).
 
-#### File layout
+##### File layout
 
 Modified files only — no new files:
 
@@ -7224,7 +7224,7 @@ Modified files only — no new files:
 parameter and its inflight-map logic is key-agnostic. The only change is *what key*
 `RoundTrip` passes in.
 
-#### Sequence
+##### Sequence
 
 1. `RoundTrip` buffers the request body, computes `bodyHash`, restores `req.Body`
    (unchanged from today).
@@ -7239,7 +7239,7 @@ parameter and its inflight-map logic is key-agnostic. The only change is *what k
 6. Inflight coordination, leader/waiter handoff, SSE re-query, and stale fallback
    are all unchanged.
 
-#### Error cases
+##### Error cases
 
 - `singleFlightKey` cannot fail — it performs no I/O and returns a string. No new
   error path.
@@ -7253,7 +7253,7 @@ parameter and its inflight-map logic is key-agnostic. The only change is *what k
   hex segment, never concatenated raw into the `|`-delimited key, so no delimiter
   injection is possible.
 
-#### Test strategy
+##### Test strategy
 
 Table-light, goroutine-based, mirroring the existing
 `TestCachingTransport_SingleFlightDedup` pattern (barrier via `sync.WaitGroup`,
@@ -7300,7 +7300,7 @@ Table-light, goroutine-based, mirroring the existing
   permutations; identical keys when only a denylisted header (e.g. `Connection`)
   differs.
 
-### Consequences
+#### Consequences
 
 - **Correctness is guaranteed for any matcher**, including custom `CriterionFunc`
   and `MatcherFunc` implementations, without touching the `Matcher`/`Criterion`
@@ -7318,58 +7318,12 @@ Table-light, goroutine-based, mirroring the existing
   `SingleFlightKeyer`) that a matcher may implement to narrow the key — defaulting to
   this safe key. Deferred; not needed for correctness.
 
-## PM Log
-
-### 2026-06-05
-
-**Issue created/updated:** #285 — fix(caching): single-flight key omits query/headers; concurrent waiters get wrong response
-
-**Action:** Wrote implementation-ready spec and posted as a comment on issue #285. Applied label `status:ready-for-arch`. Created the `status:ready-for-arch` label (did not previously exist in repo).
-
-**Spec summary:**
-- Root cause pinned to `caching_transport.go:339` — key excludes `req.URL.RawQuery` and header dimensions.
-- 8 acceptance criteria covering: correctness for query-string and header differences, single-flight collapsing preserved for genuinely-identical requests, regression tests for both cases, stdlib-only constraint, godoc update, and no regressions in existing tests.
-- Scope is tightly bounded to `caching_transport.go` and `caching_transport_test.go`.
-- Key design question delegated to architect: whether to extend the key with raw headers or adopt a smarter mechanism — must satisfy AC-2 (header differences produce independent upstream calls) while remaining stdlib-only.
-
-**Open questions:** None.
-
-### 2026-06-05 (3)
-
-**Issue created/updated:** #280 — security(cli): record/proxy fail open without --config (no raw recording mode is violated)
-
-**Action:** Wrote implementation-ready spec and posted as a comment on issue #280. Applied labels `status:ready-for-arch` and `milestone:5-production-readiness`.
-
-**Spec summary:**
-- Recommends Option A: auto-apply safe default pipeline (`RedactHeaders()` + `RedactQueryParams()`) when no `--config` is supplied, plus a prominent stderr warning naming every redacted header and query param, plus an explicit opt-out flag `--unsafe-raw` that uses the no-op pipeline and prints a louder `UNSAFE` warning.
-- `--config` still replaces the default pipeline exactly as today; no stacking.
-- `--unsafe-raw` + `--config` together is a usage error (exit code 1).
-- Both `record` and `proxy` subcommands treated symmetrically.
-- No changes to the library's own `NewRecorder`/`NewProxy` defaults; fix is CLI-only.
-- 3 open questions delegated to architect: warning output mechanism for testability (logger vs separate writer), flag-interaction check ordering, and `--config` flag description text update.
-- No ADR required (CLI behavior correction, not a library architecture decision).
-
-**Open questions:** See spec comment on #280 — 3 architect-facing questions about logger testability, flag-check ordering, and flag-description text.
-
-### 2026-06-05 (2)
-
-**Issue created/updated:** #279 — security(sanitizer): query-string & userinfo secrets are never sanitized
-
-**Action:** Wrote implementation-ready spec and posted as a comment on issue #279. Applied label `status:ready-for-arch` and posted `Status: READY_FOR_ARCH` comment.
-
-**Spec summary:**
-- 14 acceptance criteria covering: `RedactQueryParams`, `FakeQueryParams`, `DefaultSensitiveQueryParams`, userinfo unconditional redaction, config-file wiring (`redact_query` / `fake_query` actions), determinism guarantee, silent-skip on malformed URLs, param-name case-sensitivity (case-sensitive, with rationale), key-order caveat after `url.Values.Encode`, godoc requirements, and test coverage floor.
-- Key decisions made in spec: case-sensitive matching (safer than silent case-folding); userinfo always redacted by both functions (no opt-out); `fake_query` requires explicit `params` (empty params = error, unlike `redact_query` which has a useful default set); `FakeQueryParamsWith` deferred (no identified use case).
-- Scope bounded to `sanitizer.go` and `config.go` only. No new dependencies.
-
-**Open questions:** None.
-
-## ADR-48: Query-string and userinfo sanitization in the sanitize-on-write pipeline
+### ADR-48: Query-string and userinfo sanitization in the sanitize-on-write pipeline
 **Date**: 2026-06-05
 **Issue**: #279
 **Status**: Accepted
 
-### Context
+#### Context
 
 `RecordedReq.URL` is a raw string marshaled verbatim to disk (`tape.go:63`). No
 existing `SanitizeFunc` inspects it. Query-parameter secrets (`?api_key=`,
@@ -7385,7 +7339,7 @@ This ADR is warranted (it extends the sanitization security boundary) per the
 tightened ADR bar; it adds two new public `SanitizeFunc` constructors, a default
 list helper, unconditional userinfo redaction, and two config actions.
 
-### Decision
+#### Decision
 
 Add URL sanitization to `sanitizer.go` mirroring the exact shape of the existing
 header/body sanitizers, and wire two new config actions in `config.go`. All work is
@@ -7395,7 +7349,7 @@ stdlib-only: `net/url` (already imported by `matcher.go`) is the only new import
 present (`sanitizer.go:512` `computeHMAC`, `sanitizer.go:579` `fakeString`) and
 in-package reachable.
 
-#### Approach decision — re-encode only when a value actually changed (option b)
+##### Approach decision — re-encode only when a value actually changed (option b)
 
 The PM spec's key trade-off: `url.Values.Encode()` sorts keys alphabetically, so
 round-tripping any URL through parse→Encode→assign mutates param order even when no
@@ -7422,7 +7376,7 @@ param matched (AC-7 requires unconditional userinfo redaction). So a URL like
 (userinfo stripped), and as a side effect its query may be re-sorted — acceptable
 and matching-safe. A URL with no userinfo and no matching param is left byte-identical.
 
-#### Types
+##### Types
 
 No new exported types. Internal:
 
@@ -7431,7 +7385,7 @@ No new exported types. Internal:
   `api_key`, `access_token`, `token`, `secret`, `password`, `sig`, `signature`,
   `X-Amz-Signature`, `X-Goog-Signature`.
 
-#### Functions and methods
+##### Functions and methods
 
 New exported symbols in `sanitizer.go`:
 
@@ -7455,10 +7409,11 @@ Internal helper in `sanitizer.go` (shared by both constructors to avoid
 duplication):
 
 ```go
-// sanitizeRequestURL parses rawURL, applies replace() to each value of each
-// param whose name is in names, strips userinfo, and re-encodes only if a
-// change occurred. On url.Parse error it returns rawURL unchanged.
-// replace receives (name, value) and returns the replacement value.
+// sanitizeURL parses rawURL, applies replace() to each value of each query/fragment
+// param whose name is in names, strips userinfo, and re-encodes only if a change
+// occurred. On structural url.Parse error it returns rawURL unchanged; on a malformed
+// query or fragment (ParseQuery error) it fails CLOSED, redacting that whole component.
+// replace receives a value and returns its replacement.
 func sanitizeURL(rawURL string, names map[string]struct{}, replace func(value string) string) string
 ```
 
@@ -7472,7 +7427,7 @@ only reassign a scalar string field, so no deep copy of headers/body is needed �
 they are left as-is, satisfying AC-11's "byte-identical" requirement for
 headers/body/response).
 
-#### File layout
+##### File layout
 
 - `sanitizer.go` — modified: add `defaultSensitiveQueryParams` var,
   `DefaultSensitiveQueryParams`, `RedactQueryParams`, `FakeQueryParams`,
@@ -7485,7 +7440,7 @@ headers/body/response).
 
 No new files; no new packages; single flat package preserved.
 
-#### Config wiring
+##### Config wiring
 
 - Constants: `ActionRedactQuery = "redact_query"`, `ActionFakeQuery = "fake_query"`.
   Add both to `validActions`.
@@ -7503,7 +7458,7 @@ No new files; no new packages; single flat package preserved.
   - `ActionRedactQuery` => `RedactQueryParams(rule.Params...)`.
   - `ActionFakeQuery` => `FakeQueryParams(rule.Seed, rule.Params...)`.
 
-#### Sequence (per SanitizeFunc invocation, applied by Pipeline.Sanitize on write)
+##### Sequence (per SanitizeFunc invocation, applied by Pipeline.Sanitize on write)
 
 1. `Pipeline.Sanitize(t)` calls the URL `SanitizeFunc` (already fires before
    `Store.Save` — AC-10, no pipeline change).
@@ -7513,18 +7468,41 @@ No new files; no new packages; single flat package preserved.
    b. `changed := false`.
    c. If `u.User != nil`: set `u.User = url.User(Redacted)` (username `[REDACTED]`,
       no password => password cleared, AC-7); `changed = true`.
-   d. `values := u.Query()`; for each `name` in `values` that is in the `names` set
-      (raw, case-sensitive string equality), replace every element of
-      `values[name]` via `replace(v)`; if any replacement happened, `changed = true`.
-   e. If `changed`: `u.RawQuery = values.Encode()`; return `u.String()`.
-      Else: return `rawURL` (byte-identical, AC-12).
+   d. **Query (fail closed).** Parse with `values, qErr := url.ParseQuery(u.RawQuery)`,
+      NOT `u.Query()`. `u.Query()` swallows the parse error and silently *drops* any
+      param whose value has malformed percent-encoding (e.g. `?api_key=ab%ZZcd`),
+      which would leave `changed = false` and return the raw URL with the cleartext
+      secret intact — a fail-open leak reachable from the live recorder path. So:
+      - if `qErr != nil`, the query is untrusted: set `u.RawQuery = Redacted` and
+        `changed = true` (redact the WHOLE query — conservative over-redaction, never
+        a sibling-param leak; userinfo already stripped above is preserved).
+      - else, for each `name` in `values` in the `names` set (raw, case-sensitive),
+        set `changed = true` (whenever a configured name is *present* — decoupled
+        from byte-equality, so the intent "a sensitive param was here, re-encode
+        authoritatively" is explicit) and replace every element via `replace(v)`;
+        then if `changed`, `u.RawQuery = values.Encode()`.
+   e. **Fragment (fail closed).** HTTP request URLs normally carry no fragment, but
+      the public `SanitizeFunc` applies to arbitrary tapes, and OAuth implicit-flow
+      tokens (`access_token`, `id_token`) / some presigned schemes embed credentials
+      in the fragment. Apply the same name-based redaction/fake to `u.Fragment` via
+      `url.ParseQuery(u.Fragment)`; on a fragment parse error replace the whole
+      fragment with `Redacted`. (`url.Parse` already rejects malformed percent-encoding
+      in the fragment structurally, so the error branch is a defensive guard.)
+   f. If `changed`: return `u.String()`. Else: return `rawURL` (byte-identical, AC-12).
 3. The `SanitizeFunc` assigns the result to `t.Request.URL` and returns `t`.
 
-#### Error cases
+##### Error cases
 
-- Malformed URL (`url.Parse` error): leave URL unchanged, return no error
-  (silent skip — consistent with non-JSON body handling, ADR-17). AC-2/AC-5.
-- No matching params and no userinfo: URL returned byte-identical. AC-12.
+- Structural URL parse error (`url.Parse` fails — cannot extract any component):
+  leave URL unchanged, return no error (silent skip — consistent with non-JSON body
+  handling, ADR-17). AC-2/AC-5.
+- **Malformed query string** (`url.ParseQuery` fails on a value's percent-encoding,
+  but `url.Parse` succeeded): fail CLOSED — redact the entire `RawQuery` to
+  `[REDACTED]` rather than passing it through. This closes the fail-open leak found
+  in review (see "Hardened during review" below).
+- **Malformed fragment**: fail closed — replace the whole fragment with `[REDACTED]`.
+- No matching params and no userinfo and no fragment secret: URL returned
+  byte-identical. AC-12.
 - Empty `names` for `RedactQueryParams`: substitute `DefaultSensitiveQueryParams()`.
 - `FakeQueryParams` with empty `names`: at the library level this is a no-op (no
   param matches) — not an error; the *config* layer rejects empty `params` for
@@ -7532,7 +7510,7 @@ No new files; no new packages; single flat package preserved.
 - Userinfo with username only (`https://user@host`): still stripped to
   `https://[REDACTED]@host`; `changed = true`.
 
-#### Test strategy (table-driven, stdlib `testing` only, behavior-named)
+##### Test strategy (table-driven, stdlib `testing` only, behavior-named)
 
 In `sanitizer_test.go`:
 - Redaction replaces matching param values, preserves non-matching ones (AC-2, AC-11).
@@ -7562,11 +7540,25 @@ In `config_test.go`:
 - `fake_query` missing `seed` => validation error; empty `params` => validation error.
 - `LoadConfig` accepts `params` field (DisallowUnknownFields path).
 
-### Consequences
+#### Consequences
 
 - The URL surface of the sanitize-on-write boundary is now closed for query
-  params and userinfo; combined with header/body sanitizers, the documented
-  "fixtures safe to commit" guarantee holds for the common credential-in-URL cases.
+  params, userinfo, AND the fragment; combined with header/body sanitizers, the
+  documented "fixtures safe to commit" guarantee holds for the common
+  credential-in-URL cases. Malformed query/fragment strings fail CLOSED (whole
+  component redacted) rather than passing through.
+
+##### Hardened during review (PR #295)
+
+The original design parsed the query with `u.Query()` and only fail-closed-handled
+`url.Parse` errors. Review found this **fail-open**: `u.Query()` silently drops a
+param with malformed percent-encoding, so a value like `?api_key=ab%ZZcd` left
+`changed = false` and the raw URL — cleartext secret included — was persisted via
+`recorder.go`'s `req.URL.String()`. The shipped code switches to
+`url.ParseQuery(u.RawQuery)` with an explicit error branch that redacts the whole
+query, adds the same fail-closed treatment to the fragment, and decouples `changed`
+from byte-equality (set when a configured name is present). This ADR documents the
+shipped behavior, not the original draft.
 - Option (b) keeps untouched URLs byte-stable, minimizing fixture diff noise; the
   only re-encoding (and possible key re-sort) happens when a value was actually
   changed or userinfo was present — all matching-safe.
@@ -7583,7 +7575,7 @@ In `config_test.go`:
 
 ---
 
-## ADR-49: CLI `record`/`proxy` fail closed by default (safe sanitization + `--unsafe-raw` opt-out)
+### ADR-49: CLI `record`/`proxy` fail closed by default (safe sanitization + `--unsafe-raw` opt-out)
 
 **Date**: 2026-06-05
 **Issue**: #280
@@ -7634,11 +7626,11 @@ cache. `WithProxySanitizer` already wires the sanitizer to the L2 write path
 **same** `WithProxySanitizer` option, so persisted fixtures are sanitized and no
 L1/L2-specific handling is required.
 
-#### Types
+##### Types
 
 None. No new exported types.
 
-#### Functions and methods
+##### Functions and methods
 
 One new unexported helper in `cmd/httptape/main.go`:
 
@@ -7680,7 +7672,7 @@ actual defaults.)
 No new library functions. `RedactHeaders`, `RedactQueryParams`, `NewPipeline`,
 `WithSanitizer`, `WithProxySanitizer` already exist.
 
-#### File layout
+##### File layout
 
 Modified:
 - `cmd/httptape/main.go`
@@ -7697,7 +7689,7 @@ Modified:
 
 No library files change.
 
-#### Sequence (per command, after `fs.Parse` and the existing
+##### Sequence (per command, after `fs.Parse` and the existing
 `--upstream`/`--fixtures` required-flag checks)
 
 1. Validate mutual exclusion: `if *configPath != "" && *unsafeRaw { return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")} }`. This runs **before** `LoadConfigFile`, so the guaranteed-error path performs no file read.
@@ -7712,7 +7704,7 @@ No library files change.
    starts."
 4. Remaining flow (recorder/proxy construction, reverse proxy, listen) is unchanged.
 
-#### Error cases
+##### Error cases
 
 - `--config` + `--unsafe-raw` → `*usageError` → exit 1, message on stderr via
   `logger.Println` (the `run` dispatcher already maps `*usageError` to `exitUsage`
@@ -7723,7 +7715,7 @@ No library files change.
   `defaultCLISanitizer`); `NewPipeline`/`RedactHeaders`/`RedactQueryParams` do not
   return errors.
 
-#### Test strategy (CLI test harness, `cmd/httptape/main_test.go`)
+##### Test strategy (CLI test harness, `cmd/httptape/main_test.go`)
 
 Reuse the **existing** `captureStderr(t, fn)` helper — it already swaps the
 package-level `logger` to an `os.Pipe`, which is the minimal seam the PM asked
@@ -7772,7 +7764,7 @@ Prefer table-driven tests where the record/proxy rows share structure; a small
 helper that runs a command against a live upstream and returns the written
 fixtures + captured stderr keeps the two subcommands' tests DRY.
 
-### Consequences
+#### Consequences
 
 - The CLI now honors the project's "no raw recording mode" guarantee by default;
   raw recording is reachable only via an explicit, loudly-warned `--unsafe-raw`.
@@ -7789,3 +7781,51 @@ fixtures + captured stderr keeps the two subcommands' tests DRY.
 - The warning text duplicates the default header/param lists as literal strings;
   the drift-guard test prevents silent divergence from the canonical default
   slices without coupling the user-facing copy to runtime list ordering.
+
+---
+
+## PM Log
+
+### 2026-06-05
+
+**Issue created/updated:** #285 — fix(caching): single-flight key omits query/headers; concurrent waiters get wrong response
+
+**Action:** Wrote implementation-ready spec and posted as a comment on issue #285. Applied label `status:ready-for-arch`. Created the `status:ready-for-arch` label (did not previously exist in repo).
+
+**Spec summary:**
+- Root cause pinned to `caching_transport.go:339` — key excludes `req.URL.RawQuery` and header dimensions.
+- 8 acceptance criteria covering: correctness for query-string and header differences, single-flight collapsing preserved for genuinely-identical requests, regression tests for both cases, stdlib-only constraint, godoc update, and no regressions in existing tests.
+- Scope is tightly bounded to `caching_transport.go` and `caching_transport_test.go`.
+- Key design question delegated to architect: whether to extend the key with raw headers or adopt a smarter mechanism — must satisfy AC-2 (header differences produce independent upstream calls) while remaining stdlib-only.
+
+**Open questions:** None.
+
+### 2026-06-05 (3)
+
+**Issue created/updated:** #280 — security(cli): record/proxy fail open without --config (no raw recording mode is violated)
+
+**Action:** Wrote implementation-ready spec and posted as a comment on issue #280. Applied labels `status:ready-for-arch` and `milestone:5-production-readiness`.
+
+**Spec summary:**
+- Recommends Option A: auto-apply safe default pipeline (`RedactHeaders()` + `RedactQueryParams()`) when no `--config` is supplied, plus a prominent stderr warning naming every redacted header and query param, plus an explicit opt-out flag `--unsafe-raw` that uses the no-op pipeline and prints a louder `UNSAFE` warning.
+- `--config` still replaces the default pipeline exactly as today; no stacking.
+- `--unsafe-raw` + `--config` together is a usage error (exit code 1).
+- Both `record` and `proxy` subcommands treated symmetrically.
+- No changes to the library's own `NewRecorder`/`NewProxy` defaults; fix is CLI-only.
+- 3 open questions delegated to architect: warning output mechanism for testability (logger vs separate writer), flag-interaction check ordering, and `--config` flag description text update.
+- No ADR required (CLI behavior correction, not a library architecture decision).
+
+**Open questions:** See spec comment on #280 — 3 architect-facing questions about logger testability, flag-check ordering, and flag-description text.
+
+### 2026-06-05 (2)
+
+**Issue created/updated:** #279 — security(sanitizer): query-string & userinfo secrets are never sanitized
+
+**Action:** Wrote implementation-ready spec and posted as a comment on issue #279. Applied label `status:ready-for-arch` and posted `Status: READY_FOR_ARCH` comment.
+
+**Spec summary:**
+- 14 acceptance criteria covering: `RedactQueryParams`, `FakeQueryParams`, `DefaultSensitiveQueryParams`, userinfo unconditional redaction, config-file wiring (`redact_query` / `fake_query` actions), determinism guarantee, silent-skip on malformed URLs, param-name case-sensitivity (case-sensitive, with rationale), key-order caveat after `url.Values.Encode`, godoc requirements, and test coverage floor.
+- Key decisions made in spec: case-sensitive matching (safer than silent case-folding); userinfo always redacted by both functions (no opt-out); `fake_query` requires explicit `params` (empty params = error, unlike `redact_query` which has a useful default set); `FakeQueryParamsWith` deferred (no identified use case).
+- Scope bounded to `sanitizer.go` and `config.go` only. No new dependencies.
+
+**Open questions:** None.
