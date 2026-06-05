@@ -1794,14 +1794,13 @@ func TestCachingTransport_SingleFlightDistinguishesQueryString(t *testing.T) {
 	store := NewMemoryStore()
 
 	var callCount atomic.Int64
-	// ready is closed once both goroutines have entered the upstream stub,
-	// ensuring they are in the inflight window at the same time.
-	var arrivedCount atomic.Int64
+	// arrived is signalled once per upstream entry. Buffered so senders never block.
+	arrived := make(chan struct{}, 2)
 	unblock := make(chan struct{})
 
 	upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		n := callCount.Add(1)
-		arrivedCount.Add(1)
+		arrived <- struct{}{}
 		// First arrival waits until the second has also arrived (both concurrent misses).
 		if n == 1 {
 			<-unblock
@@ -1819,11 +1818,22 @@ func TestCachingTransport_SingleFlightDistinguishesQueryString(t *testing.T) {
 		WithCacheSingleFlight(true),
 	)
 
-	// Release the first goroutine once the second has entered the stub.
+	// Release the first goroutine once both have entered the stub, or after a
+	// short timeout. The timeout lets the test proceed to its callCount assertion
+	// and fail cleanly when a key regression collapses both requests into one
+	// upstream call (only one arrival ever fires).
 	go func() {
-		for arrivedCount.Load() < 2 {
-			// spin — in tests this resolves within microseconds once the
-			// second goroutine starts its upstream call.
+		count := 0
+		deadline := time.After(3 * time.Second)
+		for count < 2 {
+			select {
+			case <-arrived:
+				count++
+			case <-deadline:
+				t.Log("only one upstream arrival before deadline — key regression suspected; unblocking so test can fail on callCount assertion")
+				close(unblock)
+				return
+			}
 		}
 		close(unblock)
 	}()
@@ -1962,12 +1972,13 @@ func TestCachingTransport_SingleFlightDistinguishesHeaders(t *testing.T) {
 	store := NewMemoryStore()
 
 	var callCount atomic.Int64
-	var arrivedCount atomic.Int64
+	// arrived is signalled once per upstream entry. Buffered so senders never block.
+	arrived := make(chan struct{}, 2)
 	unblock := make(chan struct{})
 
 	upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		n := callCount.Add(1)
-		arrivedCount.Add(1)
+		arrived <- struct{}{}
 		if n == 1 {
 			<-unblock
 		}
@@ -1984,8 +1995,22 @@ func TestCachingTransport_SingleFlightDistinguishesHeaders(t *testing.T) {
 		WithCacheSingleFlight(true),
 	)
 
+	// Release the first goroutine once both have entered the stub, or after a
+	// short timeout. The timeout lets the test proceed to its callCount assertion
+	// and fail cleanly when a key regression collapses both requests into one
+	// upstream call (only one arrival ever fires).
 	go func() {
-		for arrivedCount.Load() < 2 {
+		count := 0
+		deadline := time.After(3 * time.Second)
+		for count < 2 {
+			select {
+			case <-arrived:
+				count++
+			case <-deadline:
+				t.Log("only one upstream arrival before deadline — key regression suspected; unblocking so test can fail on callCount assertion")
+				close(unblock)
+				return
+			}
 		}
 		close(unblock)
 	}()
