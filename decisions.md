@@ -7547,18 +7547,6 @@ In `config_test.go`:
   documented "fixtures safe to commit" guarantee holds for the common
   credential-in-URL cases. Malformed query/fragment strings fail CLOSED (whole
   component redacted) rather than passing through.
-
-##### Hardened during review (PR #295)
-
-The original design parsed the query with `u.Query()` and only fail-closed-handled
-`url.Parse` errors. Review found this **fail-open**: `u.Query()` silently drops a
-param with malformed percent-encoding, so a value like `?api_key=ab%ZZcd` left
-`changed = false` and the raw URL — cleartext secret included — was persisted via
-`recorder.go`'s `req.URL.String()`. The shipped code switches to
-`url.ParseQuery(u.RawQuery)` with an explicit error branch that redacts the whole
-query, adds the same fail-closed treatment to the fragment, and decouples `changed`
-from byte-equality (set when a configured name is present). This ADR documents the
-shipped behavior, not the original draft.
 - Option (b) keeps untouched URLs byte-stable, minimizing fixture diff noise; the
   only re-encoding (and possible key re-sort) happens when a value was actually
   changed or userinfo was present — all matching-safe.
@@ -7572,6 +7560,18 @@ shipped behavior, not the original draft.
   can be added later without breaking this design.
 - New `Rule.Params` field is additive and backward-compatible; existing configs
   without it are unaffected.
+
+##### Hardened during review (PR #295)
+
+The original design parsed the query with `u.Query()` and only fail-closed-handled
+`url.Parse` errors. Review found this **fail-open**: `u.Query()` silently drops a
+param with malformed percent-encoding, so a value like `?api_key=ab%ZZcd` left
+`changed = false` and the raw URL — cleartext secret included — was persisted via
+`recorder.go`'s `req.URL.String()`. The shipped code switches to
+`url.ParseQuery(u.RawQuery)` with an explicit error branch that redacts the whole
+query, adds the same fail-closed treatment to the fragment, and decouples `changed`
+from byte-equality (set when a configured name is present). This ADR documents the
+shipped behavior, not the original draft.
 
 ---
 
