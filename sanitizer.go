@@ -84,14 +84,32 @@ func DefaultSensitiveQueryParams() []string {
 
 // sanitizeURL parses rawURL, applies replace to each value of each query
 // parameter whose name is in the names set, strips userinfo unconditionally
-// when present, and re-encodes only when a change actually occurred. On
-// url.Parse error it returns rawURL unchanged (silent skip, consistent with
-// body sanitization behavior).
+// when present, and re-encodes only when a change actually occurred.
+//
+// Security boundary — fail-closed behavior:
+//   - On url.Parse error (malformed URL structure): returns rawURL unchanged,
+//     consistent with body sanitization (silent skip). The structural parse
+//     error means no scheme/host/path can be extracted safely.
+//   - On url.ParseQuery error (malformed percent-encoding in the query string,
+//     e.g. "?api_key=ab%ZZcd"): the query string is treated as untrusted and
+//     the entire RawQuery is replaced with a single "[REDACTED]" marker. The
+//     cleartext query string is never returned, regardless of whether any
+//     configured param name would have matched. Userinfo is still stripped.
+//
+// Fragment handling: fragment values whose parameter name appears in names
+// are also redacted/faked. HTTP request URLs normally carry no fragment
+// (fragments are client-side only and not transmitted over the wire), but
+// the SanitizeFunc is public API applied to arbitrary tapes, so OAuth
+// implicit-flow tokens (access_token, id_token) stored in fragments are
+// covered. Fragment key=value pairs are parsed with url.ParseQuery; on
+// fragment parse error the entire fragment is replaced with "[REDACTED]".
 //
 // replace receives the original value and returns the replacement value.
 func sanitizeURL(rawURL string, names map[string]struct{}, replace func(value string) string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
+		// Structural parse failure — cannot safely extract any component.
+		// Silent skip, consistent with body sanitization behavior.
 		return rawURL
 	}
 
@@ -104,22 +122,67 @@ func sanitizeURL(rawURL string, names map[string]struct{}, replace func(value st
 	}
 
 	// Modify matching query parameter values.
-	if len(names) > 0 {
-		values := u.Query()
-		for name, vals := range values {
-			if _, ok := names[name]; !ok {
-				continue
-			}
-			for i, v := range vals {
-				vals[i] = replace(v)
-				if vals[i] != v {
-					changed = true
+	// Fail closed: use url.ParseQuery with explicit error handling instead of
+	// u.Query(), which swallows the error and silently drops params with
+	// malformed percent-encoding (e.g. ?api_key=ab%ZZcd). Without this fix,
+	// the dropped param would never match, changed would stay false, and the
+	// raw URL containing the cleartext secret would be returned and persisted.
+	if len(names) > 0 && u.RawQuery != "" {
+		values, qErr := url.ParseQuery(u.RawQuery)
+		if qErr != nil {
+			// Query string is malformed — treat as untrusted and redact entirely.
+			// We do NOT return rawURL here: userinfo may already have been
+			// stripped above, and we must not leak the cleartext query string.
+			u.RawQuery = Redacted
+			changed = true
+		} else {
+			for name, vals := range values {
+				if _, ok := names[name]; !ok {
+					continue
 				}
+				// Set changed whenever a configured sensitive param name is
+				// present, regardless of whether the replacement value differs
+				// byte-for-byte. This makes the security intent explicit: "a
+				// sensitive param was present, so re-encode authoritatively."
+				changed = true
+				for i, v := range vals {
+					vals[i] = replace(v)
+				}
+				values[name] = vals
 			}
-			values[name] = vals
+			if changed {
+				u.RawQuery = values.Encode()
+			}
 		}
-		if changed {
-			u.RawQuery = values.Encode()
+	}
+
+	// Redact matching names in the URL fragment.
+	// HTTP request URLs normally carry no fragment, but the public SanitizeFunc
+	// API is applied to arbitrary tapes; OAuth implicit-flow tokens
+	// (access_token, id_token) and some presigned-URL schemes embed credentials
+	// in fragments. We apply the same name-based redaction here.
+	// On fragment parse error the entire fragment is replaced with "[REDACTED]".
+	if len(names) > 0 && u.Fragment != "" {
+		fragVals, fErr := url.ParseQuery(u.Fragment)
+		if fErr != nil {
+			u.Fragment = Redacted
+			changed = true
+		} else {
+			fragChanged := false
+			for name, vals := range fragVals {
+				if _, ok := names[name]; !ok {
+					continue
+				}
+				fragChanged = true
+				for i, v := range vals {
+					vals[i] = replace(v)
+				}
+				fragVals[name] = vals
+			}
+			if fragChanged {
+				u.Fragment = fragVals.Encode()
+				changed = true
+			}
 		}
 	}
 
@@ -145,8 +208,13 @@ func sanitizeURL(rawURL string, names map[string]struct{}, replace func(value st
 // acceptable for matching purposes -- httptape's matchers parse query strings
 // in an order-independent fashion.
 //
-// If url.Parse returns an error (malformed URL), the URL is left unchanged and
-// no error is returned (silent skip, consistent with body sanitization behavior).
+// Fail-closed security behavior: if the query string contains malformed
+// percent-encoding (e.g. "?api_key=ab%ZZcd"), the entire query string is
+// replaced with "[REDACTED]" rather than passing the raw cleartext through.
+// Fragment values whose parameter name appears in the sensitive set are also
+// redacted; on fragment parse error the entire fragment is replaced with
+// "[REDACTED]". On url.Parse error (structurally malformed URL), the URL is
+// left unchanged (silent skip, consistent with body sanitization behavior).
 //
 // The returned function does not mutate the input Tape -- it assigns a new
 // string to t.Request.URL.
@@ -209,8 +277,13 @@ func RedactQueryParams(names ...string) SanitizeFunc {
 // acceptable for matching purposes -- httptape's matchers parse query strings
 // in an order-independent fashion.
 //
-// If url.Parse returns an error (malformed URL), the URL is left unchanged and
-// no error is returned (silent skip, consistent with body sanitization behavior).
+// Fail-closed security behavior: if the query string contains malformed
+// percent-encoding (e.g. "?api_key=ab%ZZcd"), the entire query string is
+// replaced with "[REDACTED]" rather than passing the raw cleartext through.
+// Fragment values whose parameter name appears in the sensitive set are also
+// faked; on fragment parse error the entire fragment is replaced with
+// "[REDACTED]". On url.Parse error (structurally malformed URL), the URL is
+// left unchanged (silent skip, consistent with body sanitization behavior).
 //
 // The returned function does not mutate the input Tape -- it assigns a new
 // string to t.Request.URL.
