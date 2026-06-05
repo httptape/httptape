@@ -200,13 +200,7 @@ Matcher criterion types: method, path, body_fuzzy (requires paths), content_nego
 
 ## How it compares
 
-| Feature | httptape | WireMock | gock/httpmock | MSW |
-|---|---|---|---|---|
-| SSE record/replay | **yes** | no | no | partial (mock-only) |
-| Redaction on write | **yes** | no | no | no |
-| Embeddable in Go | **yes** | no (Java) | yes | no (browser) |
-| Proxy with fallback | **yes** | no | no | no |
-| Content negotiation | **yes** | yes | no | no |
+Standalone server + CLI, sanitize-on-write by default, SSE event-level replay, proxy with L1/L2 fallback, zero deps. Full comparison (WireMock, Hoverfly, go-vcr, gock/httpmock, json-server, MSW): https://httptape.dev/docs/why
 
 ## Key APIs
 

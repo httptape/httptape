@@ -4,8 +4,7 @@
 
 httptape is an embeddable Go library for HTTP traffic recording, sanitization, and replay.
 It captures HTTP request/response pairs, sanitizes sensitive data on write, and replays
-them as a mock server. Think WireMock, but native Go, embeddable, and with sanitization
-built into the core.
+them as a mock server. Native Go, embeddable, with sanitization built into the core.
 
 Target: Go developers who need deterministic, safe API mocking without Java, external
 processes, or manual fixture management.

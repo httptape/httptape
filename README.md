@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/httptape/httptape/main/assets/logo.png" alt="httptape logo" width="300">
 </p>
 
-<h3 align="center">Like WireMock, but a 3 MB embeddable Go library — with redaction, SSE, and recording built in.</h3>
+<h3 align="center">A 3 MB embeddable Go library for HTTP record / redact / replay — with SSE event-level support and sanitize-on-write built in.</h3>
 
 <p align="center">
   <a href="https://pkg.go.dev/github.com/httptape/httptape"><img src="https://pkg.go.dev/badge/github.com/httptape/httptape.svg" alt="Go Reference"></a>
@@ -33,11 +33,7 @@ transitive dependencies.
 
 ## Why httptape?
 
-- **WireMock requires Java** -- separate process, 200 MB+ memory, can't embed in a Go binary
-- **Go mocking libraries** (`gock`, `httpmock`) only work inside test code -- no standalone server, no recording, no fixture management
-- **json-server / Mockoon** -- no recording, no redaction, manual fixture writing only
-- **Nobody does redaction** -- existing tools record raw traffic including secrets and PII. httptape redacts on write -- sensitive data never hits disk
-- **SSE record and replay** -- record Server-Sent Event streams (LLM completions, real-time feeds) with per-event timing, replay them with configurable speed (realtime, accelerated, or instant), and redact PII from individual event payloads. No other Go mocking tool does this
+Standalone server + CLI, **sanitize-on-write by default**, SSE event-level replay, and embeddable as a Go library with zero deps. For the full story (extracted from VibeWarden's egress proxy) and side-by-side comparisons with WireMock, Hoverfly, go-vcr, and others, see [Why httptape](https://httptape.dev/docs/why/).
 
 ## Use cases
 
@@ -350,24 +346,6 @@ Runnable end-to-end examples live in [`examples/`](examples/):
 - [`ts-frontend-first`](examples/ts-frontend-first/) — Vite + React talking to an httptape proxy with **live** source-state updates over SSE. Demonstrates fallback-to-cache (live → L1 → L2), per-event redaction, and the `/__httptape/health` endpoint.
 
 More examples coming. See [`examples/README.md`](examples/README.md) for the index.
-
-## How it compares
-
-| Feature | httptape | WireMock | go-vcr | json-server | MSW | gock |
-|---|---|---|---|---|---|---|
-| Embeddable in Go | **yes** | no (Java) | yes (test-only) | no (Node) | no (browser) | yes |
-| Standalone server | **yes** | yes | no | yes | no | no |
-| Docker | **3 MB** | 200 MB+ | n/a | 50 MB+ | n/a | n/a |
-| Recording | **yes** | yes | yes | no | no | no |
-| Redaction on write | **yes** | no | manual hooks | no | no | no |
-| Deterministic faking | **yes** | no | no | no | no | no |
-| Proxy with fallback | **yes** | no | no | no | no | no |
-| SSE record/replay | **yes** | no | no | no | partial | no |
-| Frontend mock backend | **yes** | yes | no | yes | yes (browser) | no |
-| Fixture import/export | **yes** | partial | no | no | no | no |
-| Dependencies | **zero** | JVM | yaml.v3 | npm | npm | 1 |
-
-**vs. [go-vcr](https://github.com/dnaeon/go-vcr)** — go-vcr is the de-facto cassette library for Go tests. httptape covers a different surface: it can also run as a standalone mock server (Docker / CLI / Testcontainers), redacts on write through a declarative pipeline (go-vcr exposes `BeforeSaveHook` callbacks but no built-in rules), records SSE streams with per-event timing, and bundles a fallback-to-cache proxy. If your only need is replaying cassettes inside `*_test.go`, go-vcr is smaller and a perfectly good fit.
 
 ## Key design decisions
 
