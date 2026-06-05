@@ -52,6 +52,32 @@ const (
 
 var logger = log.New(os.Stderr, "httptape: ", 0)
 
+// safeDefaultWarning is printed to stderr when neither --config nor --unsafe-raw
+// is supplied. It names every header and query param category from the library's
+// default sensitive lists so users know exactly what is being redacted.
+const safeDefaultWarning = "WARNING: no --config supplied; applying safe default sanitization. " +
+	"Redacted headers: Authorization, Cookie, Set-Cookie, X-Api-Key, Proxy-Authorization, X-Forwarded-For. " +
+	"Redacted query params: api_key, access_token, token, secret, password, sig, signature, X-Amz-Signature, X-Goog-Signature. " +
+	"URL userinfo (user:password@) always stripped. " +
+	"To customize, use --config. To disable all sanitization (not recommended), use --unsafe-raw."
+
+// unsafeRawWarning is printed to stderr when --unsafe-raw is supplied. It is
+// intentionally loud to make clear that the fail-closed default has been
+// explicitly overridden and that raw traffic will be persisted to disk.
+const unsafeRawWarning = "UNSAFE: --unsafe-raw set; recording raw traffic with NO sanitization. " +
+	"Sensitive headers, query params, and URL userinfo WILL be written to disk verbatim. " +
+	"Do not commit these fixtures."
+
+// defaultCLISanitizer returns the safe default sanitizer pipeline applied by
+// record and proxy when neither --config nor --unsafe-raw is supplied. It
+// redacts DefaultSensitiveHeaders, DefaultSensitiveQueryParams, and URL userinfo.
+func defaultCLISanitizer() *httptape.Pipeline {
+	return httptape.NewPipeline(
+		httptape.RedactHeaders(),
+		httptape.RedactQueryParams(),
+	)
+}
+
 // repeatableFlag is a flag.Value that accumulates repeated flag uses into a slice.
 type repeatableFlag []string
 
@@ -396,7 +422,8 @@ func runRecord(args []string) error {
 	fs := flag.NewFlagSet("httptape record", flag.ContinueOnError)
 	upstream := fs.String("upstream", "", "Upstream URL, e.g. https://api.example.com (required)")
 	fixtures := fs.String("fixtures", "", "Path to fixture directory (required)")
-	configPath := fs.String("config", "", "Path to sanitization config JSON")
+	configPath := fs.String("config", "", "Path to sanitization config JSON (replaces the safe default sanitizer)")
+	unsafeRaw := fs.Bool("unsafe-raw", false, "Disable all sanitization and record raw traffic (not recommended)")
 	port := fs.Int("port", 8081, "Listen port")
 	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
 	tlsCert := fs.String("tls-cert", "", "Path to PEM client certificate for mTLS")
@@ -450,13 +477,24 @@ func runRecord(args []string) error {
 		recorderOpts = append(recorderOpts, httptape.WithRecorderTLSConfig(tlsCfg))
 	}
 
-	if *configPath != "" {
+	// Validate mutual exclusion after flag parse, before any file read.
+	if *configPath != "" && *unsafeRaw {
+		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
+	}
+
+	switch {
+	case *configPath != "":
 		cfg, err := httptape.LoadConfigFile(*configPath)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
 		pipeline := cfg.BuildPipeline()
 		recorderOpts = append(recorderOpts, httptape.WithSanitizer(pipeline))
+	case *unsafeRaw:
+		logger.Println(unsafeRawWarning)
+	default:
+		recorderOpts = append(recorderOpts, httptape.WithSanitizer(defaultCLISanitizer()))
+		logger.Println(safeDefaultWarning)
 	}
 
 	recorder := httptape.NewRecorder(store, recorderOpts...)
@@ -539,7 +577,8 @@ func runProxy(args []string) error {
 	fs := flag.NewFlagSet("httptape proxy", flag.ContinueOnError)
 	upstream := fs.String("upstream", "", "Upstream URL, e.g. https://api.example.com (required)")
 	fixtures := fs.String("fixtures", "", "Path to fixture directory for L2 cache (required)")
-	configPath := fs.String("config", "", "Path to sanitization config JSON (applied to L2 writes only)")
+	configPath := fs.String("config", "", "Path to sanitization config JSON applied to L2 writes (replaces the safe default sanitizer)")
+	unsafeRaw := fs.Bool("unsafe-raw", false, "Disable all sanitization and record raw traffic (not recommended)")
 	port := fs.Int("port", 8081, "Listen port")
 	cors := fs.Bool("cors", false, "Enable CORS headers (Access-Control-Allow-Origin: *)")
 	fallbackOn5xx := fs.Bool("fallback-on-5xx", false, "Also fall back on 5xx responses from upstream")
@@ -600,13 +639,24 @@ func runProxy(args []string) error {
 		proxyOpts = append(proxyOpts, httptape.WithProxyTLSConfig(tlsCfg))
 	}
 
-	if *configPath != "" {
+	// Validate mutual exclusion after flag parse, before any file read.
+	if *configPath != "" && *unsafeRaw {
+		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
+	}
+
+	switch {
+	case *configPath != "":
 		cfg, err := httptape.LoadConfigFile(*configPath)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
 		pipeline := cfg.BuildPipeline()
 		proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(pipeline))
+	case *unsafeRaw:
+		logger.Println(unsafeRawWarning)
+	default:
+		proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(defaultCLISanitizer()))
+		logger.Println(safeDefaultWarning)
 	}
 
 	if *fallbackOn5xx {

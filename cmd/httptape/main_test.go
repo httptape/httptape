@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1357,4 +1358,518 @@ func generateTestCertAndKey(t *testing.T, hosts ...string) (certPEM, keyPEM []by
 	}
 
 	return sc.CertPEM, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+}
+
+// --- Fail-closed (ADR-49) tests ---
+
+// runLiveCommandAndCapture starts a live CLI command (record or proxy) against
+// an httptest upstream, makes one probe request, then shuts down via SIGINT.
+// It returns the written fixtures dir and the captured stderr output.
+// probeReq is called with the base URL of the CLI listener to make the probe.
+// The function waits for the CLI to exit and for the recorder flush to complete
+// before returning, so fixture files are available immediately on return.
+func runLiveCommandAndCapture(
+	t *testing.T,
+	args []string,
+	probeReq func(baseURL string),
+) (fixturesDir string, stderr string) {
+	t.Helper()
+
+	fixturesDir = t.TempDir()
+
+	// Bind :0 to grab a free port then release it for the CLI.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	// Append fixtures and port to the caller-supplied args.
+	fullArgs := append(args, "--fixtures", fixturesDir, "--port", itoa(port))
+
+	// Set up stderr capture via os.Pipe (same mechanism as captureStderr, but
+	// inline so we can keep the pipe open until the shutdown goroutine's final
+	// "recorder flushed" write completes, avoiding a data race on the logger).
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("pipe: %v", pipeErr)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	origLogger := logger
+	logger = log.New(w, "httptape: ", 0)
+
+	// Collect stderr in background.
+	stderrCh := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		_, _ = io.Copy(&sb, r)
+		stderrCh <- sb.String()
+	}()
+
+	base := "http://127.0.0.1:" + itoa(port)
+	addr := "127.0.0.1:" + itoa(port)
+
+	done := make(chan int, 1)
+	go func() {
+		done <- run(fullArgs)
+	}()
+
+	// Wait for the listener to accept TCP connections without sending any
+	// HTTP request (which would itself be recorded as a fixture, polluting
+	// the fixture directory before the real probe).
+	listenerDeadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		if time.Now().After(listenerDeadline) {
+			// Restore before fatalf so deferred cleanup works.
+			w.Close()
+			os.Stderr = origStderr
+			logger = origLogger
+			t.Fatalf("listener never came up: %v", dialErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Make the caller's probe request.
+	probeReq(base)
+
+	// Shutdown via SIGINT so the recorder/proxy flushes async writes.
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Signal(os.Interrupt)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		w.Close()
+		os.Stderr = origStderr
+		logger = origLogger
+		t.Fatal("CLI did not exit after SIGINT")
+	}
+
+	// The recorder's Close() (which flushes async writes to disk) runs in the
+	// shutdown goroutine after httpServer.Shutdown returns. Because
+	// ListenAndServe returns as soon as Shutdown signals it, run() exits before
+	// the flush goroutine finishes. Poll until a fixture file appears so we can
+	// be confident the flush — and its final logger write ("recorder flushed")
+	// — has completed before we close the pipe and restore logger. Closing the
+	// pipe while the goroutine still holds a reference to the redirected logger
+	// would be a data race.
+	flushDeadline := time.Now().Add(3 * time.Second)
+	for {
+		entries, _ := os.ReadDir(fixturesDir)
+		for _, e := range entries {
+			if !e.IsDir() && filepath.Ext(e.Name()) == ".json" {
+				goto flushed
+			}
+		}
+		if time.Now().After(flushDeadline) {
+			goto flushed // no fixture; test assertions will report a clear failure
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+flushed:
+	// Add a small settle window for the goroutine's final logger.Println call
+	// (e.g. "recorder flushed") to complete before we restore the logger.
+	// The file poll above confirms the write finished, but the goroutine may
+	// still be executing the logger call itself.
+	time.Sleep(25 * time.Millisecond)
+
+	w.Close()
+	os.Stderr = origStderr
+	logger = origLogger
+	stderr = <-stderrCh
+	return fixturesDir, stderr
+}
+
+// loadFirstTapeFromDir reads the first JSON fixture found in dir and decodes it.
+func loadFirstTapeFromDir(t *testing.T, dir string) httptape.Tape {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read fixtures dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", e.Name(), err)
+		}
+		var tape httptape.Tape
+		if err := json.Unmarshal(data, &tape); err != nil {
+			t.Fatalf("decode fixture %s: %v", e.Name(), err)
+		}
+		return tape
+	}
+	t.Fatalf("no fixture JSON found in %s", dir)
+	return httptape.Tape{}
+}
+
+// makeProbeWithAuthAndToken returns a probeReq func that makes a GET request
+// carrying Authorization and ?token= query param.
+func makeProbeWithAuthAndToken(upstream *httptest.Server) func(baseURL string) {
+	return func(baseURL string) {
+		req, err := http.NewRequest("GET", baseURL+"/sensitive?token=mytoken", nil)
+		if err != nil {
+			panic(err)
+		}
+		req.Header.Set("Authorization", "Bearer secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return // server may be shutting down; tolerate connection error
+		}
+		resp.Body.Close()
+		_ = upstream
+	}
+}
+
+// TestRecordFailClosed_DefaultRedactsAuthAndToken verifies that the record
+// subcommand, when invoked without --config or --unsafe-raw, applies the safe
+// default pipeline and redacts Authorization headers and token query params.
+func TestRecordFailClosed_DefaultRedactsAuthAndToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, _ := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	// Authorization header must be redacted.
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] != "[REDACTED]" {
+		t.Errorf("Authorization header = %q, want %q", authVals[0], "[REDACTED]")
+	}
+
+	// token query param must be redacted.
+	parsedURL, err := url.Parse(tape.Request.URL)
+	if err != nil {
+		t.Fatalf("parse fixture URL: %v", err)
+	}
+	tokenVal := parsedURL.Query().Get("token")
+	if tokenVal != "[REDACTED]" {
+		t.Errorf("token query param = %q, want %q", tokenVal, "[REDACTED]")
+	}
+}
+
+// TestRecordFailClosed_DefaultWarningOnStderr verifies that the safe-default
+// warning appears on stderr when record runs without --config or --unsafe-raw.
+func TestRecordFailClosed_DefaultWarningOnStderr(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if !strings.Contains(stderr, "WARNING") {
+		t.Errorf("stderr does not contain WARNING substring\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "Authorization") {
+		t.Errorf("stderr does not name Authorization in safe-default warning\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "api_key") {
+		t.Errorf("stderr does not name api_key in safe-default warning\ngot: %s", stderr)
+	}
+}
+
+// TestRecordFailClosed_ConfigSuppressesDefaultWarning verifies that passing
+// --config suppresses the safe-default warning entirely.
+func TestRecordFailClosed_ConfigSuppressesDefaultWarning(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	// Minimal config file that compiles correctly.
+	configPath := filepath.Join(t.TempDir(), "sanitize.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":"1","rules":[{"action":"redact_headers","headers":["X-Test-Only"]}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL, "--config", configPath},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if strings.Contains(stderr, safeDefaultWarning) {
+		t.Errorf("safe-default warning should not appear when --config is supplied\ngot: %s", stderr)
+	}
+}
+
+// TestRecordFailClosed_UnsafeRawRecordsRaw verifies that --unsafe-raw bypasses
+// sanitization so sensitive headers are stored verbatim, and that the UNSAFE
+// warning appears on stderr.
+func TestRecordFailClosed_UnsafeRawRecordsRaw(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, stderr := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL, "--unsafe-raw"},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	// UNSAFE warning must appear on stderr.
+	if !strings.Contains(stderr, "UNSAFE") {
+		t.Errorf("stderr does not contain UNSAFE warning\ngot: %s", stderr)
+	}
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	// Authorization header must NOT be redacted.
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] == "[REDACTED]" {
+		t.Errorf("Authorization header was redacted despite --unsafe-raw")
+	}
+	if authVals[0] != "Bearer secret" {
+		t.Errorf("Authorization header = %q, want %q", authVals[0], "Bearer secret")
+	}
+}
+
+// TestRecordFailClosed_UnsafeRawPlusConfigExitsUsage verifies that combining
+// --unsafe-raw and --config produces a usage error (exit 1) without reading any file.
+func TestRecordFailClosed_UnsafeRawPlusConfigExitsUsage(t *testing.T) {
+	tmpDir := t.TempDir()
+	got := run([]string{
+		"record",
+		"--upstream", "http://example.com",
+		"--fixtures", tmpDir,
+		"--unsafe-raw",
+		"--config", "/nonexistent/path/config.json",
+	})
+	if got != exitUsage {
+		t.Errorf("got exit %d, want %d (usage error for --unsafe-raw + --config)", got, exitUsage)
+	}
+}
+
+// TestRecordHelpListsUnsafeRaw verifies that --unsafe-raw appears in the
+// record subcommand's help output.
+func TestRecordHelpListsUnsafeRaw(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+
+	go func() {
+		_ = run([]string{"record", "-h"})
+		w.Close()
+	}()
+
+	br := bufio.NewReader(r)
+	var sb strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		sb.WriteString(line)
+		if err != nil {
+			break
+		}
+	}
+	os.Stderr = origStderr
+
+	got := sb.String()
+	if !strings.Contains(got, "unsafe-raw") {
+		t.Errorf("--unsafe-raw not listed in record -h output\ngot: %s", got)
+	}
+}
+
+// TestProxyFailClosed_DefaultRedactsAuthAndToken verifies that the proxy
+// subcommand, when invoked without --config or --unsafe-raw, redacts
+// Authorization headers and token query params in L2-persisted fixtures.
+func TestProxyFailClosed_DefaultRedactsAuthAndToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, _ := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] != "[REDACTED]" {
+		t.Errorf("Authorization header = %q, want %q", authVals[0], "[REDACTED]")
+	}
+
+	parsedURL, err := url.Parse(tape.Request.URL)
+	if err != nil {
+		t.Fatalf("parse fixture URL: %v", err)
+	}
+	tokenVal := parsedURL.Query().Get("token")
+	if tokenVal != "[REDACTED]" {
+		t.Errorf("token query param = %q, want %q", tokenVal, "[REDACTED]")
+	}
+}
+
+// TestProxyFailClosed_DefaultWarningOnStderr verifies that the safe-default
+// warning appears on stderr when proxy runs without --config or --unsafe-raw.
+func TestProxyFailClosed_DefaultWarningOnStderr(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if !strings.Contains(stderr, "WARNING") {
+		t.Errorf("stderr does not contain WARNING substring\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "Authorization") {
+		t.Errorf("stderr does not name Authorization in safe-default warning\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "api_key") {
+		t.Errorf("stderr does not name api_key in safe-default warning\ngot: %s", stderr)
+	}
+}
+
+// TestProxyFailClosed_ConfigSuppressesDefaultWarning verifies that passing
+// --config suppresses the safe-default warning.
+func TestProxyFailClosed_ConfigSuppressesDefaultWarning(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	configPath := filepath.Join(t.TempDir(), "sanitize.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":"1","rules":[{"action":"redact_headers","headers":["X-Test-Only"]}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL, "--config", configPath},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if strings.Contains(stderr, safeDefaultWarning) {
+		t.Errorf("safe-default warning should not appear when --config is supplied\ngot: %s", stderr)
+	}
+}
+
+// TestProxyFailClosed_UnsafeRawRecordsRaw verifies that --unsafe-raw bypasses
+// sanitization for the proxy subcommand: sensitive headers are stored verbatim
+// and the UNSAFE warning appears on stderr.
+func TestProxyFailClosed_UnsafeRawRecordsRaw(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, stderr := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL, "--unsafe-raw"},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if !strings.Contains(stderr, "UNSAFE") {
+		t.Errorf("stderr does not contain UNSAFE warning\ngot: %s", stderr)
+	}
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] == "[REDACTED]" {
+		t.Errorf("Authorization header was redacted despite --unsafe-raw")
+	}
+	if authVals[0] != "Bearer secret" {
+		t.Errorf("Authorization header = %q, want %q", authVals[0], "Bearer secret")
+	}
+}
+
+// TestProxyFailClosed_UnsafeRawPlusConfigExitsUsage verifies that combining
+// --unsafe-raw and --config produces a usage error (exit 1) for proxy.
+func TestProxyFailClosed_UnsafeRawPlusConfigExitsUsage(t *testing.T) {
+	tmpDir := t.TempDir()
+	got := run([]string{
+		"proxy",
+		"--upstream", "http://example.com",
+		"--fixtures", tmpDir,
+		"--unsafe-raw",
+		"--config", "/nonexistent/path/config.json",
+	})
+	if got != exitUsage {
+		t.Errorf("got exit %d, want %d (usage error for --unsafe-raw + --config)", got, exitUsage)
+	}
+}
+
+// TestProxyHelpListsUnsafeRaw verifies that --unsafe-raw appears in the
+// proxy subcommand's help output.
+func TestProxyHelpListsUnsafeRaw(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+
+	go func() {
+		_ = run([]string{"proxy", "-h"})
+		w.Close()
+	}()
+
+	br := bufio.NewReader(r)
+	var sb strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		sb.WriteString(line)
+		if err != nil {
+			break
+		}
+	}
+	os.Stderr = origStderr
+
+	got := sb.String()
+	if !strings.Contains(got, "unsafe-raw") {
+		t.Errorf("--unsafe-raw not listed in proxy -h output\ngot: %s", got)
+	}
+}
+
+// TestSafeDefaultWarningDriftGuard asserts that safeDefaultWarning contains
+// every element from DefaultSensitiveHeaders() and DefaultSensitiveQueryParams().
+// This prevents silent drift between the hard-coded warning text and the
+// canonical default lists in the library.
+func TestSafeDefaultWarningDriftGuard(t *testing.T) {
+	for _, h := range httptape.DefaultSensitiveHeaders() {
+		if !strings.Contains(safeDefaultWarning, h) {
+			t.Errorf("safeDefaultWarning does not contain default sensitive header %q", h)
+		}
+	}
+	for _, p := range httptape.DefaultSensitiveQueryParams() {
+		if !strings.Contains(safeDefaultWarning, p) {
+			t.Errorf("safeDefaultWarning does not contain default sensitive query param %q", p)
+		}
+	}
 }
