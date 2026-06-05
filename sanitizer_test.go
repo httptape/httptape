@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -104,7 +105,7 @@ func TestRedactHeaders_DefaultHeaders(t *testing.T) {
 
 func TestRedactHeaders_CustomHeaders(t *testing.T) {
 	reqHeaders := http.Header{
-		"Authorization":  {"Bearer token"},
+		"Authorization":   {"Bearer token"},
 		"X-Custom-Secret": {"my-secret"},
 	}
 	tape := makeTapeWithHeaders(reqHeaders, http.Header{})
@@ -1349,8 +1350,8 @@ func TestIsUUID(t *testing.T) {
 		{"ABCDEF01-2345-6789-abcd-ef0123456789", true},
 		{"", false},
 		{"not-a-uuid", false},
-		{"550e8400e29b41d4a716446655440000", false},   // no hyphens
-		{"550e8400-e29b-41d4-a716-44665544000", false}, // too short
+		{"550e8400e29b41d4a716446655440000", false},      // no hyphens
+		{"550e8400-e29b-41d4-a716-44665544000", false},   // too short
 		{"550e8400-e29b-41d4-a716-4466554400000", false}, // too long
 		{"550e8400-e29b-41d4-a716-44665544000g", false},  // invalid hex char
 		{"550e8400+e29b-41d4-a716-446655440000", false},  // wrong separator
@@ -1565,6 +1566,648 @@ func BenchmarkSanitizer_FullPipeline(b *testing.B) {
 			}
 		})
 	}
+}
+
+// --- RedactQueryParams tests ---
+
+// makeTapeWithURL creates a minimal Tape with the given request URL.
+func makeTapeWithURL(rawURL string) Tape {
+	return Tape{
+		ID:    "test-id",
+		Route: "test-route",
+		Request: RecordedReq{
+			Method:  "GET",
+			URL:     rawURL,
+			Headers: http.Header{"Content-Type": {"application/json"}},
+			Body:    []byte("request body"),
+		},
+		Response: RecordedResp{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": {"application/json"}},
+			Body:       []byte("response body"),
+		},
+	}
+}
+
+func TestRedactQueryParams_MatchingParamIsRedacted(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?api_key=supersecret&other=value")
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key: expected %q, got %q", Redacted, got)
+	}
+	if got := u.Query().Get("other"); got != "value" {
+		t.Errorf("other: expected %q, got %q", "value", got)
+	}
+}
+
+func TestRedactQueryParams_NonMatchingParamIsUntouched(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?keep=value1&secret=value2")
+	fn := RedactQueryParams("secret")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if got := u.Query().Get("keep"); got != "value1" {
+		t.Errorf("keep: expected %q, got %q", "value1", got)
+	}
+	if got := u.Query().Get("secret"); got != Redacted {
+		t.Errorf("secret: expected %q, got %q", Redacted, got)
+	}
+}
+
+func TestRedactQueryParams_MultipleValuesForSameKeyAreEachRedacted(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?token=first&token=second")
+	fn := RedactQueryParams("token")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	vals := u.Query()["token"]
+	if len(vals) != 2 {
+		t.Fatalf("expected 2 token values, got %d", len(vals))
+	}
+	for i, v := range vals {
+		if v != Redacted {
+			t.Errorf("token[%d]: expected %q, got %q", i, Redacted, v)
+		}
+	}
+}
+
+func TestRedactQueryParams_DefaultsAreUsedWhenNoNamesProvided(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?api_key=secret&other=keep")
+	fn := RedactQueryParams() // no args => defaults
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key: expected %q, got %q", Redacted, got)
+	}
+	if got := u.Query().Get("other"); got != "keep" {
+		t.Errorf("other: expected %q, got %q", "keep", got)
+	}
+}
+
+func TestRedactQueryParams_NameMatchingIsCaseSensitive(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?api_key=secret&API_KEY=other")
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key: expected %q, got %q", Redacted, got)
+	}
+	// API_KEY must NOT be redacted (different case).
+	if got := u.Query().Get("API_KEY"); got != "other" {
+		t.Errorf("API_KEY: expected %q (unchanged), got %q", "other", got)
+	}
+}
+
+func TestRedactQueryParams_UserinfoIsAlwaysStripped(t *testing.T) {
+	tape := makeTapeWithURL("https://user:pass@host/path?other=value")
+	fn := RedactQueryParams("secret") // no matching param
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if u.User == nil {
+		t.Fatal("expected User field to be set, got nil")
+	}
+	if got := u.User.Username(); got != Redacted {
+		t.Errorf("username: expected %q, got %q", Redacted, got)
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		t.Error("password should be cleared after userinfo redaction")
+	}
+	if got := u.Query().Get("other"); got != "value" {
+		t.Errorf("other: expected %q (unchanged), got %q", "value", got)
+	}
+}
+
+func TestRedactQueryParams_UserinfoAndParamBothRedacted(t *testing.T) {
+	tape := makeTapeWithURL("https://user:pass@host/path?api_key=secret")
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if u.User == nil {
+		t.Fatal("expected User field to be set")
+	}
+	if got := u.User.Username(); got != Redacted {
+		t.Errorf("username: expected %q, got %q", Redacted, got)
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key: expected %q, got %q", Redacted, got)
+	}
+}
+
+func TestRedactQueryParams_URLWithNoQueryParamsAndNoUserinfoIsByteStable(t *testing.T) {
+	rawURL := "https://example.com/api/v1/resource"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	if result.Request.URL != rawURL {
+		t.Errorf("URL changed unexpectedly: got %q, want %q", result.Request.URL, rawURL)
+	}
+}
+
+func TestRedactQueryParams_URLWithNonMatchingParamsAndNoUserinfoIsByteStable(t *testing.T) {
+	rawURL := "https://example.com/api?foo=bar&baz=qux"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	if result.Request.URL != rawURL {
+		t.Errorf("URL changed unexpectedly: got %q, want %q", result.Request.URL, rawURL)
+	}
+}
+
+func TestRedactQueryParams_MalformedURLIsSilentlySkipped(t *testing.T) {
+	rawURL := "://malformed url"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	if result.Request.URL != rawURL {
+		t.Errorf("expected URL unchanged on parse error, got %q", result.Request.URL)
+	}
+}
+
+func TestRedactQueryParams_OnlyRequestURLIsModified(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?api_key=secret")
+	originalHeaders := tape.Request.Headers.Clone()
+	originalBody := string(tape.Request.Body)
+	originalRespBody := string(tape.Response.Body)
+
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	// URL should be changed.
+	if result.Request.URL == tape.Request.URL {
+		t.Error("expected URL to change")
+	}
+
+	// Headers, body, and response must be untouched.
+	if result.Request.Headers.Get("Content-Type") != originalHeaders.Get("Content-Type") {
+		t.Error("request headers changed unexpectedly")
+	}
+	if string(result.Request.Body) != originalBody {
+		t.Errorf("request body changed: got %q", result.Request.Body)
+	}
+	if string(result.Response.Body) != originalRespBody {
+		t.Errorf("response body changed: got %q", result.Response.Body)
+	}
+}
+
+func TestRedactQueryParams_DoesNotMutateInputTape(t *testing.T) {
+	originalURL := "https://example.com/api?api_key=secret"
+	tape := makeTapeWithURL(originalURL)
+
+	fn := RedactQueryParams("api_key")
+	_ = fn(tape)
+
+	if tape.Request.URL != originalURL {
+		t.Errorf("original tape mutated: URL is now %q", tape.Request.URL)
+	}
+}
+
+func TestRedactQueryParams_SanitizationHappensOnWrite(t *testing.T) {
+	// Verify that the secret value does not appear in the sanitized URL.
+	tape := makeTapeWithURL("https://example.com/api?api_key=my-super-secret")
+	pipeline := NewPipeline(RedactQueryParams("api_key"))
+	result := pipeline.Sanitize(tape)
+
+	if strings.Contains(result.Request.URL, "my-super-secret") {
+		t.Errorf("secret value still present in URL: %q", result.Request.URL)
+	}
+}
+
+// --- FakeQueryParams tests ---
+
+func TestFakeQueryParams_MatchingParamIsFaked(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?token=original&other=keep")
+	fn := FakeQueryParams("test-seed", "token")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	got := u.Query().Get("token")
+	if !strings.HasPrefix(got, "fake_") {
+		t.Errorf("token: expected fake_ prefix, got %q", got)
+	}
+	if got == "original" {
+		t.Error("token: value should have changed")
+	}
+	if u.Query().Get("other") != "keep" {
+		t.Errorf("other: expected %q (unchanged), got %q", "keep", u.Query().Get("other"))
+	}
+}
+
+func TestFakeQueryParams_SameSeedAndValueProduceSameFakeAcrossCalls(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?token=original")
+	fn := FakeQueryParams("test-seed", "token")
+
+	result1 := fn(tape)
+	result2 := fn(tape)
+
+	if result1.Request.URL != result2.Request.URL {
+		t.Errorf("not deterministic:\nfirst:  %q\nsecond: %q", result1.Request.URL, result2.Request.URL)
+	}
+}
+
+func TestFakeQueryParams_DifferentValuesProduceDifferentFakes(t *testing.T) {
+	tape1 := makeTapeWithURL("https://example.com/api?token=alice")
+	tape2 := makeTapeWithURL("https://example.com/api?token=bob")
+	fn := FakeQueryParams("test-seed", "token")
+
+	result1 := fn(tape1)
+	result2 := fn(tape2)
+
+	u1, err1 := parseURL(t, result1.Request.URL)
+	u2, err2 := parseURL(t, result2.Request.URL)
+	if err1 != nil || err2 != nil {
+		return
+	}
+
+	if u1.Query().Get("token") == u2.Query().Get("token") {
+		t.Errorf("different inputs should produce different fakes: both got %q", u1.Query().Get("token"))
+	}
+}
+
+func TestFakeQueryParams_UserinfoIsAlwaysStripped(t *testing.T) {
+	tape := makeTapeWithURL("https://user:pass@host/path?other=value")
+	fn := FakeQueryParams("test-seed", "token") // no matching param
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	if u.User == nil {
+		t.Fatal("expected User field to be set, got nil")
+	}
+	if got := u.User.Username(); got != Redacted {
+		t.Errorf("username: expected %q, got %q", Redacted, got)
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		t.Error("password should be cleared after userinfo redaction")
+	}
+}
+
+func TestFakeQueryParams_MultipleValuesForSameKeyAreEachFaked(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/api?token=first&token=second")
+	fn := FakeQueryParams("test-seed", "token")
+	result := fn(tape)
+
+	u, err := parseURL(t, result.Request.URL)
+	if err != nil {
+		return
+	}
+	vals := u.Query()["token"]
+	if len(vals) != 2 {
+		t.Fatalf("expected 2 token values, got %d", len(vals))
+	}
+	for i, v := range vals {
+		if !strings.HasPrefix(v, "fake_") {
+			t.Errorf("token[%d]: expected fake_ prefix, got %q", i, v)
+		}
+	}
+	// Different original values should produce different fakes.
+	if vals[0] == vals[1] {
+		t.Errorf("different original values should produce different fakes: %q == %q", vals[0], vals[1])
+	}
+}
+
+func TestFakeQueryParams_URLWithNonMatchingParamsAndNoUserinfoIsByteStable(t *testing.T) {
+	rawURL := "https://example.com/api?foo=bar&baz=qux"
+	tape := makeTapeWithURL(rawURL)
+	fn := FakeQueryParams("test-seed", "api_key")
+	result := fn(tape)
+
+	if result.Request.URL != rawURL {
+		t.Errorf("URL changed unexpectedly: got %q, want %q", result.Request.URL, rawURL)
+	}
+}
+
+func TestFakeQueryParams_MalformedURLIsSilentlySkipped(t *testing.T) {
+	rawURL := "://malformed url"
+	tape := makeTapeWithURL(rawURL)
+	fn := FakeQueryParams("test-seed", "api_key")
+	result := fn(tape)
+
+	if result.Request.URL != rawURL {
+		t.Errorf("expected URL unchanged on parse error, got %q", result.Request.URL)
+	}
+}
+
+// --- Malformed percent-encoding (fail-closed) regression tests ---
+
+// TestRedactQueryParams_MalformedPercentEncodingSecretDoesNotReachPersistedURL is a
+// security regression test for the fail-open leak in sanitizeURL. Previously,
+// u.Query() silently dropped params with malformed percent-encoding, leaving the
+// cleartext secret in the raw URL that would be written to disk.
+func TestRedactQueryParams_MalformedPercentEncodingSecretDoesNotReachPersistedURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		param  string
+		secret string
+	}{
+		{
+			name:   "invalid percent sequence in sensitive param value",
+			rawURL: "https://example.com/api?api_key=ab%ZZcd&other=value",
+			param:  "api_key",
+			secret: "ab%ZZcd",
+		},
+		{
+			name:   "truncated percent at end of value",
+			rawURL: "https://example.com/api?token=secret%",
+			param:  "token",
+			secret: "secret%",
+		},
+		{
+			name:   "percent followed by one hex digit only",
+			rawURL: "https://example.com/api?password=sec%2ret",
+			param:  "password",
+			secret: "sec%2ret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tape := makeTapeWithURL(tt.rawURL)
+			fn := RedactQueryParams(tt.param)
+			result := fn(tape)
+
+			// The secret must NOT appear anywhere in the persisted URL.
+			if strings.Contains(result.Request.URL, tt.secret) {
+				t.Errorf("cleartext secret %q still present in persisted URL: %q",
+					tt.secret, result.Request.URL)
+			}
+
+			// The result URL must not be the original raw URL (which contains
+			// the cleartext secret).
+			if result.Request.URL == tt.rawURL {
+				t.Errorf("URL was returned byte-identical to raw input; secret not redacted: %q",
+					result.Request.URL)
+			}
+		})
+	}
+}
+
+func TestFakeQueryParams_MalformedPercentEncodingSecretDoesNotReachPersistedURL(t *testing.T) {
+	rawURL := "https://example.com/api?api_key=ab%ZZcd&other=value"
+	tape := makeTapeWithURL(rawURL)
+	fn := FakeQueryParams("test-seed", "api_key")
+	result := fn(tape)
+
+	// The malformed secret must NOT appear in the persisted URL.
+	if strings.Contains(result.Request.URL, "ab%ZZcd") {
+		t.Errorf("cleartext secret still present in persisted URL: %q", result.Request.URL)
+	}
+	// Must not be byte-identical to the raw input.
+	if result.Request.URL == rawURL {
+		t.Errorf("URL returned byte-identical to raw input; secret not sanitized: %q", result.Request.URL)
+	}
+}
+
+// TestRedactQueryParams_MalformedQueryStringStillStripsUserinfo verifies that when
+// the query string is malformed, userinfo (which was already stripped before the
+// query parse attempt) is not leaked back into the output.
+func TestRedactQueryParams_MalformedQueryStringStillStripsUserinfo(t *testing.T) {
+	rawURL := "https://user:pass@example.com/api?api_key=ab%ZZcd"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	// Userinfo must not be in the result.
+	if strings.Contains(result.Request.URL, "user:pass") {
+		t.Errorf("userinfo still present in URL after malformed-query redaction: %q", result.Request.URL)
+	}
+	// Cleartext secret must not be in the result.
+	if strings.Contains(result.Request.URL, "ab%ZZcd") {
+		t.Errorf("cleartext secret still present in URL after malformed-query redaction: %q", result.Request.URL)
+	}
+}
+
+// --- Fragment sanitization tests ---
+
+func TestRedactQueryParams_SensitiveParamInFragmentIsRedacted(t *testing.T) {
+	// OAuth implicit flow puts access_token in the fragment.
+	tape := makeTapeWithURL("https://example.com/callback#access_token=mysecret&token_type=bearer")
+	fn := RedactQueryParams("access_token")
+	result := fn(tape)
+
+	// Secret must not appear in the persisted URL.
+	if strings.Contains(result.Request.URL, "mysecret") {
+		t.Errorf("fragment secret still present in persisted URL: %q", result.Request.URL)
+	}
+	// The non-sensitive fragment param should still be present.
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	fragVals, err := url.ParseQuery(u.Fragment)
+	if err != nil {
+		t.Fatalf("failed to parse fragment: %v", err)
+	}
+	if got := fragVals.Get("access_token"); got != Redacted {
+		t.Errorf("access_token in fragment: expected %q, got %q", Redacted, got)
+	}
+	if got := fragVals.Get("token_type"); got != "bearer" {
+		t.Errorf("token_type in fragment: expected %q (unchanged), got %q", "bearer", got)
+	}
+}
+
+func TestRedactQueryParams_NonSensitiveParamInFragmentIsUntouched(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/page#section=intro")
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	// URL should be byte-stable -- no sensitive params anywhere, no userinfo.
+	if result.Request.URL != "https://example.com/page#section=intro" {
+		t.Errorf("URL changed unexpectedly: got %q", result.Request.URL)
+	}
+}
+
+func TestRedactQueryParams_MalformedFragmentURLFailsStructuralParse(t *testing.T) {
+	// Go's url.Parse eagerly validates percent-encoding in the fragment, unlike
+	// in the query string. A URL with malformed percent-encoding in the fragment
+	// (e.g. %ZZ) causes url.Parse to fail, so sanitizeURL returns the raw URL
+	// unchanged (structural parse error, consistent with body sanitization).
+	// This is distinct from the query-string fail-closed path where url.Parse
+	// succeeds but url.ParseQuery fails.
+	rawURL := "https://example.com/cb#access_token=ab%ZZcd"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("access_token")
+	result := fn(tape)
+
+	// url.Parse fails entirely for this URL, so we silently skip (return raw).
+	// This is the structural-parse-error path, NOT the fragment-parse-error path.
+	if result.Request.URL != rawURL {
+		t.Errorf("expected URL unchanged on url.Parse error, got %q", result.Request.URL)
+	}
+}
+
+func TestRedactQueryParams_WellFormedFragmentWithKeyValueIsRedacted(t *testing.T) {
+	// A fragment that is valid percent-encoding but contains sensitive param names
+	// (e.g., the fragment parse path succeeds) should be redacted.
+	// We use a well-formed fragment: no malformed percent-sequences.
+	tape := makeTapeWithURL("https://example.com/callback#access_token=mysecret%20value&state=ok")
+	fn := RedactQueryParams("access_token")
+	result := fn(tape)
+
+	// The secret value must not appear in the persisted URL.
+	if strings.Contains(result.Request.URL, "mysecret") {
+		t.Errorf("fragment secret still present in persisted URL: %q", result.Request.URL)
+	}
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	fragVals, err := url.ParseQuery(u.Fragment)
+	if err != nil {
+		t.Fatalf("failed to parse fragment of result: %v", err)
+	}
+	if got := fragVals.Get("access_token"); got != Redacted {
+		t.Errorf("access_token in fragment: expected %q, got %q", Redacted, got)
+	}
+	if got := fragVals.Get("state"); got != "ok" {
+		t.Errorf("state in fragment: expected %q (unchanged), got %q", "ok", got)
+	}
+}
+
+func TestFakeQueryParams_SensitiveParamInFragmentIsFaked(t *testing.T) {
+	tape := makeTapeWithURL("https://example.com/callback#access_token=mysecret&other=keep")
+	fn := FakeQueryParams("test-seed", "access_token")
+	result := fn(tape)
+
+	// Original secret must not appear.
+	if strings.Contains(result.Request.URL, "mysecret") {
+		t.Errorf("fragment secret still present in persisted URL: %q", result.Request.URL)
+	}
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	fragVals, err := url.ParseQuery(u.Fragment)
+	if err != nil {
+		t.Fatalf("failed to parse fragment: %v", err)
+	}
+	got := fragVals.Get("access_token")
+	if !strings.HasPrefix(got, "fake_") {
+		t.Errorf("access_token in fragment: expected fake_ prefix, got %q", got)
+	}
+	if fragVals.Get("other") != "keep" {
+		t.Errorf("other in fragment: expected %q (unchanged), got %q", "keep", fragVals.Get("other"))
+	}
+}
+
+// --- changed-flag decoupling from value-equality tests ---
+
+// TestRedactQueryParams_SensitiveParamAlreadyRedactedCausesReencode verifies that
+// if a sensitive param's value already equals the replacement (e.g. the fixture
+// was already sanitized), the URL is still re-encoded authoritatively rather than
+// passed through byte-identical. This tests that changed is set by name presence,
+// not by value difference.
+func TestRedactQueryParams_SensitiveParamAlreadyRedactedCausesReencode(t *testing.T) {
+	// The value is already [REDACTED], so byte comparison would say "no change".
+	// But the param name is sensitive, so we must re-encode.
+	rawURL := "https://example.com/api?api_key=" + url.QueryEscape(Redacted) + "&other=value"
+	tape := makeTapeWithURL(rawURL)
+	fn := RedactQueryParams("api_key")
+	result := fn(tape)
+
+	u, err := url.Parse(result.Request.URL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL: %v", err)
+	}
+	if got := u.Query().Get("api_key"); got != Redacted {
+		t.Errorf("api_key: expected %q, got %q", Redacted, got)
+	}
+}
+
+// --- DefaultSensitiveQueryParams tests ---
+
+func TestDefaultSensitiveQueryParams_ReturnsACopy(t *testing.T) {
+	p1 := DefaultSensitiveQueryParams()
+	p2 := DefaultSensitiveQueryParams()
+
+	if len(p1) != len(p2) {
+		t.Fatalf("lengths differ: %d vs %d", len(p1), len(p2))
+	}
+	for i := range p1 {
+		if p1[i] != p2[i] {
+			t.Errorf("index %d: %q != %q", i, p1[i], p2[i])
+		}
+	}
+
+	// Mutating one copy must not affect the internal list.
+	p1[0] = "MUTATED"
+	p3 := DefaultSensitiveQueryParams()
+	if p3[0] == "MUTATED" {
+		t.Error("DefaultSensitiveQueryParams returned a shared slice; mutation leaked to internal state")
+	}
+}
+
+func TestDefaultSensitiveQueryParams_ContainsExpectedParams(t *testing.T) {
+	params := DefaultSensitiveQueryParams()
+	expected := map[string]bool{
+		"api_key":          false,
+		"access_token":     false,
+		"token":            false,
+		"secret":           false,
+		"password":         false,
+		"sig":              false,
+		"signature":        false,
+		"X-Amz-Signature":  false,
+		"X-Goog-Signature": false,
+	}
+
+	for _, p := range params {
+		if _, ok := expected[p]; ok {
+			expected[p] = true
+		}
+	}
+
+	for name, found := range expected {
+		if !found {
+			t.Errorf("expected param %q not found in DefaultSensitiveQueryParams()", name)
+		}
+	}
+}
+
+// parseURL is a test helper that parses a URL or fails the test.
+func parseURL(t *testing.T, rawURL string) (*url.URL, error) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("failed to parse result URL %q: %v", rawURL, err)
+	}
+	return u, nil
 }
 
 func TestDefaultSensitiveHeaders_ReturnsACopy(t *testing.T) {

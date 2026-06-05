@@ -17,6 +17,10 @@ const (
 	ActionRedactBody = "redact_body"
 	// ActionFake maps to FakeFields.
 	ActionFake = "fake"
+	// ActionRedactQuery maps to RedactQueryParams.
+	ActionRedactQuery = "redact_query"
+	// ActionFakeQuery maps to FakeQueryParams.
+	ActionFakeQuery = "fake_query"
 )
 
 // configVersion is the only supported config version.
@@ -27,6 +31,8 @@ var validActions = map[string]struct{}{
 	ActionRedactHeaders: {},
 	ActionRedactBody:    {},
 	ActionFake:          {},
+	ActionRedactQuery:   {},
+	ActionFakeQuery:     {},
 }
 
 // Config represents a declarative configuration for httptape.
@@ -70,16 +76,22 @@ type CriterionConfig struct {
 //   - "redact_headers": Headers (optional; defaults to DefaultSensitiveHeaders)
 //   - "redact_body":    Paths (required, non-empty)
 //   - "fake":           Seed (required, non-empty) and either Paths or Fields (mutually exclusive)
+//   - "redact_query":   Params (optional; defaults to DefaultSensitiveQueryParams)
+//   - "fake_query":     Seed (required, non-empty) and Params (required, non-empty)
 //
 // For "fake" rules, Fields maps JSONPath-like paths to faker specifications.
 // A faker spec is either a string shorthand (e.g., "email", "phone") or an
 // object with a "type" field and type-specific parameters.
+//
+// For "redact_query" and "fake_query" rules, Params lists the URL query
+// parameter names to sanitize. Name matching is case-sensitive (RFC 3986).
 type Rule struct {
 	Action  string         `json:"action"`
 	Headers []string       `json:"headers,omitempty"`
 	Paths   []string       `json:"paths,omitempty"`
 	Seed    string         `json:"seed,omitempty"`
 	Fields  map[string]any `json:"fields,omitempty"`
+	Params  []string       `json:"params,omitempty"`
 }
 
 // LoadConfig reads a JSON sanitization config from r, validates it, and
@@ -197,6 +209,42 @@ func (c *Config) Validate() error {
 				if _, err := parseFakerSpec(spec); err != nil {
 					errs = append(errs, fmt.Sprintf("%s: %q field %q: %v", prefix, rule.Action, path, err))
 				}
+			}
+			if len(rule.Headers) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"headers\"", prefix, rule.Action))
+			}
+
+		case ActionRedactQuery:
+			// Params is optional (empty => DefaultSensitiveQueryParams).
+			// Reject fields that belong to other actions.
+			if len(rule.Paths) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"paths\"", prefix, rule.Action))
+			}
+			if rule.Seed != "" {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"seed\"", prefix, rule.Action))
+			}
+			if len(rule.Fields) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"fields\"", prefix, rule.Action))
+			}
+			if len(rule.Headers) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"headers\"", prefix, rule.Action))
+			}
+
+		case ActionFakeQuery:
+			// Seed and Params are both required for fake_query.
+			// Empty Params would be a no-op and is almost certainly a misconfiguration.
+			if rule.Seed == "" {
+				errs = append(errs, fmt.Sprintf("%s: %q requires non-empty \"seed\"", prefix, rule.Action))
+			}
+			if len(rule.Params) == 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q requires non-empty \"params\"", prefix, rule.Action))
+			}
+			// Reject fields that belong to other actions.
+			if len(rule.Paths) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"paths\"", prefix, rule.Action))
+			}
+			if len(rule.Fields) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"fields\"", prefix, rule.Action))
 			}
 			if len(rule.Headers) > 0 {
 				errs = append(errs, fmt.Sprintf("%s: %q does not use \"headers\"", prefix, rule.Action))
@@ -387,6 +435,12 @@ func (c *Config) BuildPipeline() *Pipeline {
 			} else {
 				funcs = append(funcs, FakeFields(rule.Seed, rule.Paths...))
 			}
+
+		case ActionRedactQuery:
+			funcs = append(funcs, RedactQueryParams(rule.Params...))
+
+		case ActionFakeQuery:
+			funcs = append(funcs, FakeQueryParams(rule.Seed, rule.Params...))
 		}
 	}
 

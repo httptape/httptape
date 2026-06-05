@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -43,6 +44,270 @@ func DefaultSensitiveHeaders() []string {
 	cp := make([]string, len(defaultSensitiveHeaders))
 	copy(cp, defaultSensitiveHeaders)
 	return cp
+}
+
+// defaultSensitiveQueryParams is the internal list of URL query parameter names
+// that commonly contain sensitive data. Access it via DefaultSensitiveQueryParams().
+var defaultSensitiveQueryParams = []string{
+	"api_key",
+	"access_token",
+	"token",
+	"secret",
+	"password",
+	"sig",
+	"signature",
+	"X-Amz-Signature",
+	"X-Goog-Signature",
+}
+
+// DefaultSensitiveQueryParams returns a copy of the predefined set of URL query
+// parameter names that commonly contain sensitive data. These parameters are
+// redacted by default when using RedactQueryParams without explicit names.
+//
+// A new copy is returned on each call to prevent mutation of the internal list.
+//
+// The set includes:
+//   - api_key -- generic API key authentication
+//   - access_token -- OAuth access tokens
+//   - token -- generic tokens
+//   - secret -- generic secrets
+//   - password -- plaintext passwords in URLs
+//   - sig -- presigned URL signatures (short form)
+//   - signature -- presigned URL signatures (long form)
+//   - X-Amz-Signature -- AWS presigned URL signature
+//   - X-Goog-Signature -- Google Cloud presigned URL signature
+func DefaultSensitiveQueryParams() []string {
+	cp := make([]string, len(defaultSensitiveQueryParams))
+	copy(cp, defaultSensitiveQueryParams)
+	return cp
+}
+
+// sanitizeURL parses rawURL, applies replace to each value of each query
+// parameter whose name is in the names set, strips userinfo unconditionally
+// when present, and re-encodes only when a change actually occurred.
+//
+// Security boundary — fail-closed behavior:
+//   - On url.Parse error (malformed URL structure): returns rawURL unchanged,
+//     consistent with body sanitization (silent skip). The structural parse
+//     error means no scheme/host/path can be extracted safely.
+//   - On url.ParseQuery error (malformed percent-encoding in the query string,
+//     e.g. "?api_key=ab%ZZcd"): the query string is treated as untrusted and
+//     the entire RawQuery is replaced with a single "[REDACTED]" marker. The
+//     cleartext query string is never returned, regardless of whether any
+//     configured param name would have matched. Userinfo is still stripped.
+//
+// Fragment handling: fragment values whose parameter name appears in names
+// are also redacted/faked. HTTP request URLs normally carry no fragment
+// (fragments are client-side only and not transmitted over the wire), but
+// the SanitizeFunc is public API applied to arbitrary tapes, so OAuth
+// implicit-flow tokens (access_token, id_token) stored in fragments are
+// covered. Fragment key=value pairs are parsed with url.ParseQuery; on
+// fragment parse error the entire fragment is replaced with "[REDACTED]".
+//
+// replace receives the original value and returns the replacement value.
+func sanitizeURL(rawURL string, names map[string]struct{}, replace func(value string) string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// Structural parse failure — cannot safely extract any component.
+		// Silent skip, consistent with body sanitization behavior.
+		return rawURL
+	}
+
+	changed := false
+
+	// Unconditionally strip userinfo (AC-7: userinfo is always a credential).
+	if u.User != nil {
+		u.User = url.User(Redacted)
+		changed = true
+	}
+
+	// Modify matching query parameter values.
+	// Fail closed: use url.ParseQuery with explicit error handling instead of
+	// u.Query(), which swallows the error and silently drops params with
+	// malformed percent-encoding (e.g. ?api_key=ab%ZZcd). Without this fix,
+	// the dropped param would never match, changed would stay false, and the
+	// raw URL containing the cleartext secret would be returned and persisted.
+	if len(names) > 0 && u.RawQuery != "" {
+		values, qErr := url.ParseQuery(u.RawQuery)
+		if qErr != nil {
+			// Query string is malformed — treat as untrusted and redact entirely.
+			// We do NOT return rawURL here: userinfo may already have been
+			// stripped above, and we must not leak the cleartext query string.
+			u.RawQuery = Redacted
+			changed = true
+		} else {
+			for name, vals := range values {
+				if _, ok := names[name]; !ok {
+					continue
+				}
+				// Set changed whenever a configured sensitive param name is
+				// present, regardless of whether the replacement value differs
+				// byte-for-byte. This makes the security intent explicit: "a
+				// sensitive param was present, so re-encode authoritatively."
+				changed = true
+				for i, v := range vals {
+					vals[i] = replace(v)
+				}
+				values[name] = vals
+			}
+			if changed {
+				u.RawQuery = values.Encode()
+			}
+		}
+	}
+
+	// Redact matching names in the URL fragment.
+	// HTTP request URLs normally carry no fragment, but the public SanitizeFunc
+	// API is applied to arbitrary tapes; OAuth implicit-flow tokens
+	// (access_token, id_token) and some presigned-URL schemes embed credentials
+	// in fragments. We apply the same name-based redaction here.
+	// On fragment parse error the entire fragment is replaced with "[REDACTED]".
+	if len(names) > 0 && u.Fragment != "" {
+		fragVals, fErr := url.ParseQuery(u.Fragment)
+		if fErr != nil {
+			u.Fragment = Redacted
+			changed = true
+		} else {
+			fragChanged := false
+			for name, vals := range fragVals {
+				if _, ok := names[name]; !ok {
+					continue
+				}
+				fragChanged = true
+				for i, v := range vals {
+					vals[i] = replace(v)
+				}
+				fragVals[name] = vals
+			}
+			if fragChanged {
+				u.Fragment = fragVals.Encode()
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return rawURL
+	}
+	return u.String()
+}
+
+// RedactQueryParams returns a SanitizeFunc that replaces the values of the
+// specified URL query parameters with "[REDACTED]" in t.Request.URL.
+// Userinfo (user:password@ in the authority component) is always stripped and
+// replaced with "[REDACTED]", regardless of which parameter names are matched.
+//
+// Query parameter name matching is case-sensitive per RFC 3986 -- "api_key"
+// and "API_KEY" are treated as different parameters. To cover both cases, pass
+// both names explicitly.
+//
+// If no names are provided, DefaultSensitiveQueryParams is used.
+//
+// The re-encoded URL may have its query parameters in a different order than
+// the original (url.Values.Encode sorts keys alphabetically). This is
+// acceptable for matching purposes -- httptape's matchers parse query strings
+// in an order-independent fashion.
+//
+// Fail-closed security behavior: if the query string contains malformed
+// percent-encoding (e.g. "?api_key=ab%ZZcd"), the entire query string is
+// replaced with "[REDACTED]" rather than passing the raw cleartext through.
+// Fragment values whose parameter name appears in the sensitive set are also
+// redacted; on fragment parse error the entire fragment is replaced with
+// "[REDACTED]". On url.Parse error (structurally malformed URL), the URL is
+// left unchanged (silent skip, consistent with body sanitization behavior).
+//
+// The returned function does not mutate the input Tape -- it assigns a new
+// string to t.Request.URL.
+//
+// Example:
+//
+//	// Redact default sensitive query params:
+//	sanitizer := NewPipeline(RedactQueryParams())
+//
+//	// Redact specific query params:
+//	sanitizer := NewPipeline(RedactQueryParams("api_key", "sig"))
+//
+//	// Use with Recorder:
+//	recorder := NewRecorder(store, WithSanitizer(
+//	    NewPipeline(RedactQueryParams()),
+//	))
+func RedactQueryParams(names ...string) SanitizeFunc {
+	if len(names) == 0 {
+		names = DefaultSensitiveQueryParams()
+	}
+
+	// Build a set of query parameter names for O(1) lookup.
+	// Names are case-sensitive (RFC 3986): do NOT canonicalize.
+	sensitive := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		sensitive[name] = struct{}{}
+	}
+
+	return func(t Tape) Tape {
+		t.Request.URL = sanitizeURL(t.Request.URL, sensitive, func(_ string) string {
+			return Redacted
+		})
+		return t
+	}
+}
+
+// FakeQueryParams returns a SanitizeFunc that replaces the values of the
+// specified URL query parameters with deterministic fakes derived from
+// HMAC-SHA256 in t.Request.URL. Userinfo (user:password@ in the authority
+// component) is always stripped and replaced with "[REDACTED]", regardless
+// of which parameter names are matched.
+//
+// The seed is a project-level HMAC key. The same seed and input value always
+// produce the same fake output, preserving cross-fixture consistency.
+// Different seeds produce different fakes.
+//
+// The seed must be non-empty and unique to your project. Treat it as a
+// moderately sensitive value: anyone who knows the seed can predict the fake
+// output for any input. Do not use an empty string, a default placeholder, or
+// a seed shared across unrelated projects.
+//
+// The fake value format is: fake_<first 8 hex characters of HMAC-SHA256>.
+//
+// Query parameter name matching is case-sensitive per RFC 3986 -- "api_key"
+// and "API_KEY" are treated as different parameters. To cover both cases, pass
+// both names explicitly.
+//
+// The re-encoded URL may have its query parameters in a different order than
+// the original (url.Values.Encode sorts keys alphabetically). This is
+// acceptable for matching purposes -- httptape's matchers parse query strings
+// in an order-independent fashion.
+//
+// Fail-closed security behavior: if the query string contains malformed
+// percent-encoding (e.g. "?api_key=ab%ZZcd"), the entire query string is
+// replaced with "[REDACTED]" rather than passing the raw cleartext through.
+// Fragment values whose parameter name appears in the sensitive set are also
+// faked; on fragment parse error the entire fragment is replaced with
+// "[REDACTED]". On url.Parse error (structurally malformed URL), the URL is
+// left unchanged (silent skip, consistent with body sanitization behavior).
+//
+// The returned function does not mutate the input Tape -- it assigns a new
+// string to t.Request.URL.
+//
+// Example:
+//
+//	sanitizer := NewPipeline(
+//	    RedactHeaders(),
+//	    FakeQueryParams("my-project-seed", "api_key", "access_token"),
+//	)
+func FakeQueryParams(seed string, names ...string) SanitizeFunc {
+	// Build a set of query parameter names for O(1) lookup.
+	// Names are case-sensitive (RFC 3986): do NOT canonicalize.
+	sensitive := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		sensitive[name] = struct{}{}
+	}
+
+	return func(t Tape) Tape {
+		t.Request.URL = sanitizeURL(t.Request.URL, sensitive, func(v string) string {
+			return fakeString(computeHMAC(seed, v))
+		})
+		return t
+	}
 }
 
 // SanitizeFunc is a function that transforms a Tape as part of a sanitization
