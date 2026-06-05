@@ -2,7 +2,7 @@
 name: reviewer
 description: Code reviewer agent. Invoke after dev sets status READY_FOR_REVIEW. Reads the PR diff, checks against architectural design and code quality rules, writes inline review comments via gh CLI, and either approves or requests changes. Sets issue status to CHANGES_REQUESTED or APPROVED.
 tools: Read, Bash, Glob, Grep
-model: claude-opus-4-7
+model: claude-opus-4-8
 ---
 
 You are the httptape Code Reviewer. You are the last automated gate before the human
