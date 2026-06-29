@@ -22,14 +22,14 @@ repositories {
 
 dependencies {
     // Ktor server
-    implementation("io.ktor:ktor-server-netty:3.5.0")
-    implementation("io.ktor:ktor-server-sse:3.5.0")
-    implementation("io.ktor:ktor-server-content-negotiation:3.5.0")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:3.5.0")
+    implementation("io.ktor:ktor-server-netty:3.5.1")
+    implementation("io.ktor:ktor-server-sse:3.5.1")
+    implementation("io.ktor:ktor-server-content-negotiation:3.5.1")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.5.1")
 
     // Ktor client (for the weather tool's REST call)
-    implementation("io.ktor:ktor-client-cio:3.5.0")
-    implementation("io.ktor:ktor-client-content-negotiation:3.5.0")
+    implementation("io.ktor:ktor-client-cio:3.5.1")
+    implementation("io.ktor:ktor-client-content-negotiation:3.5.1")
 
     // Koog — AI agent framework (Ktor plugin + agents)
     implementation("ai.koog:koog-ktor:0.8.0")
@@ -38,18 +38,18 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 
     // Logging
-    implementation("ch.qos.logback:logback-classic:1.5.34")
+    implementation("ch.qos.logback:logback-classic:1.5.37")
 
     // Test — Kotest
-    testImplementation("io.kotest:kotest-runner-junit5:6.1.11")
-    testImplementation("io.kotest:kotest-assertions-core:6.1.11")
+    testImplementation("io.kotest:kotest-runner-junit5:6.2.1")
+    testImplementation("io.kotest:kotest-assertions-core:6.2.1")
 
     // Test — httptape SDK (brings Testcontainers transitively)
     testImplementation("dev.httptape:httptape-testcontainers-kotest:0.1.0-SNAPSHOT")
 
     // Test — Ktor server test host and client
-    testImplementation("io.ktor:ktor-server-test-host:3.5.0")
-    testImplementation("io.ktor:ktor-client-content-negotiation:3.5.0")
+    testImplementation("io.ktor:ktor-server-test-host:3.5.1")
+    testImplementation("io.ktor:ktor-client-content-negotiation:3.5.1")
 }
 
 tasks.withType<Test>().configureEach {
