@@ -1573,13 +1573,16 @@ sanitizer := httptape.NewPipeline(
 
 ## CLI and Docker
 
-Redaction is available in all httptape modes (record, proxy) via a JSON config file:
+The `record` and `proxy` commands fail closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning naming what is redacted is printed to stderr. The safe default does **not** redact request or response bodies — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with a custom pipeline; use `--unsafe-raw` to disable all sanitization (not recommended, prints a loud warning).
 
 ```bash
-# Record with redaction
+# Safe-by-default (no config needed — headers + query params + userinfo are redacted)
+httptape record --upstream https://api.example.com --fixtures ./mocks
+
+# Custom rules (config replaces the safe default)
 httptape record --upstream https://api.example.com --fixtures ./mocks --config redact.json
 
-# Proxy with redaction (applied to L2/disk cache only)
+# Proxy with custom rules (applied to L2/disk cache only)
 httptape proxy --upstream https://api.example.com --fixtures ./cache --config redact.json
 ```
 
@@ -1827,7 +1830,6 @@ proxy := httptape.NewProxy(l1, l2,
 ```bash
 httptape proxy --upstream https://api.example.com \
     --fixtures ./cache \
-    --config redact.json \
     --port 8081
 ```
 
@@ -1835,24 +1837,25 @@ httptape proxy --upstream https://api.example.com \
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory for L2 cache |
-| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--config` | (none) | Path to sanitization config JSON (applied to L2 writes only). Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic to L2. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
 
-The L1 cache is always an in-memory store managed internally. The `--fixtures` directory is the L2 (persistent, redacted) cache.
+`proxy` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically to L2 writes and a warning is printed to stderr. Bodies are NOT redacted by the safe default.
+
+The L1 cache is always an in-memory store managed internally. The `--fixtures` directory is the L2 (persistent, sanitized) cache.
 
 ## Docker
 
 ```bash
 docker run --rm \
   -v ./cache:/fixtures \
-  -v ./redact.json:/config/config.json:ro \
   -p 8081:8081 \
   ghcr.io/httptape/httptape:latest \
   proxy --upstream https://api.example.com \
         --fixtures /fixtures \
-        --config /config/config.json \
         --port 8081
 ```
 
@@ -1868,8 +1871,6 @@ services:
       - https://api.staging.example.com
       - --fixtures
       - /fixtures
-      - --config
-      - /config/config.json
       - --port
       - "3001"
       - --cors
@@ -1877,7 +1878,6 @@ services:
       - "3001:3001"
     volumes:
       - ./cache:/fixtures
-      - ./redact.json:/config/config.json:ro
 
   frontend:
     build:
@@ -1898,16 +1898,15 @@ A typical frontend development workflow using proxy mode:
 
 1. Start the proxy pointing at your staging/development API
 2. Build your UI -- all requests go through the proxy to the real API
-3. Responses are cached to disk (L2) with secrets redacted
+3. Responses are cached to disk (L2) with secrets redacted automatically (safe default)
 4. If the API goes down (network issue, deployment, VPN disconnect), the proxy serves cached responses
 5. When the API comes back, fresh responses are served and the cache is updated
 
 ```bash
-# Start proxy with redaction
+# Start proxy (safe-by-default sanitization applied automatically)
 httptape proxy \
     --upstream https://staging-api.example.com \
     --fixtures ./api-cache \
-    --config redact.json \
     --port 3001 \
     --cors
 
@@ -4302,7 +4301,7 @@ httptape serve --fixtures ./testdata/fixtures --port 9090 --fallback-status 502
 
 ### record
 
-Proxy requests to an upstream server, record and redact responses.
+Proxy requests to an upstream server, record and sanitize responses.
 
 ```bash
 httptape record --upstream <url> --fixtures <dir> [flags]
@@ -4312,7 +4311,8 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory |
-| `--config` | (none) | Path to redaction config JSON |
+| `--config` | (none) | Path to sanitization config JSON. Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. See [Config](config.md). |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic. Prints a loud warning. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
@@ -4320,11 +4320,24 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 | `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
 | `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
-The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
+`record` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning naming what is redacted is printed to stderr. Bodies are NOT redacted by the safe default — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with custom rules; use `--unsafe-raw` to disable all sanitization (not recommended).
+
+The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream and responses are recorded and sanitized to the fixtures directory.
 
 The upstream URL must include the scheme and host (e.g., `https://api.example.com`).
 
-**Example:**
+**Example (safe default — no config needed):**
+
+```bash
+httptape record \
+  --upstream https://api.github.com \
+  --fixtures ./fixtures \
+  --port 8081
+```
+
+Point your application at `http://localhost:8081`. Traffic is recorded with the built-in safe sanitization pipeline applied automatically; a warning lists exactly what is redacted.
+
+**Example (custom rules):**
 
 ```bash
 httptape record \
@@ -4334,7 +4347,7 @@ httptape record \
   --port 8081
 ```
 
-Then point your application at `http://localhost:8081` instead of the real API. All traffic is recorded and redacted.
+When `--config` is supplied its `rules` replace the safe default pipeline (full control).
 
 ### proxy
 
@@ -4348,7 +4361,8 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory for L2 (persistent) cache |
-| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--config` | (none) | Path to sanitization config JSON (applied to L2 writes only). Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. See [Config](config.md). |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic to L2. Prints a loud warning. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
@@ -4358,20 +4372,21 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 | `--tls-ca` | (none) | Path to PEM CA certificate(s) for upstream verification. See [TLS](tls.md). |
 | `--tls-insecure` | `false` | Skip TLS verification (development only). See [TLS](tls.md). |
 
+`proxy` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically to L2 writes and a warning is printed to stderr. Bodies are NOT redacted by the safe default — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with custom rules; use `--unsafe-raw` to disable all sanitization (not recommended).
+
 When the upstream is reachable, requests are forwarded and responses are cached:
 
 - **L1 (memory):** raw, unsanitized responses for best within-session fidelity
-- **L2 (disk):** redacted responses that persist across restarts
+- **L2 (disk):** sanitized responses that persist across restarts
 
 When the upstream is unreachable (or returns 5xx with `--fallback-on-5xx`), the proxy serves cached responses. The `X-Httptape-Source` header indicates whether a response came from `l1-cache`, `l2-cache`, or the real upstream (header absent).
 
-**Example:**
+**Example (safe default — no config needed):**
 
 ```bash
 httptape proxy \
   --upstream https://api.staging.example.com \
   --fixtures ./cache \
-  --config redact.json \
   --port 3001 \
   --cors \
   --fallback-on-5xx
@@ -4491,11 +4506,10 @@ The `serve`, `record`, and `proxy` commands handle SIGINT and SIGTERM for gracef
 ## Typical workflow
 
 ```bash
-# 1. Record traffic from a real API (with redaction)
+# 1. Record traffic from a real API (safe-by-default sanitization applied automatically)
 httptape record \
   --upstream https://api.example.com \
-  --fixtures ./fixtures \
-  --config redact.json
+  --fixtures ./fixtures
 
 # 2. Export the fixtures
 httptape export --fixtures ./fixtures --output fixtures.tar.gz
@@ -4539,9 +4553,19 @@ The `--fixtures` flag inside the container always points to `/fixtures` (the mou
 
 ## Record mode
 
-Proxy and record traffic from an upstream (with redaction):
+The container records safe-by-default: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning is printed to stderr. Bodies are NOT redacted by the safe default — mount a `--config` to cover secrets in bodies or to customise the pipeline.
 
 ```bash
+# Safe-by-default (no config needed)
+docker run --rm \
+  -v ./fixtures:/fixtures \
+  -p 8081:8081 \
+  ghcr.io/httptape/httptape:latest \
+  record --upstream https://api.example.com \
+         --fixtures /fixtures \
+         --port 8081
+
+# Custom rules (config replaces the safe default)
 docker run --rm \
   -v ./fixtures:/fixtures \
   -v ./redact.json:/config/config.json:ro \
@@ -4557,9 +4581,20 @@ Note: the fixtures volume is mounted read-write (no `:ro`) so the recorder can w
 
 ## Proxy mode
 
-Forward to upstream with automatic fallback to cached responses:
+The container records safe-by-default: without `--config`, the same built-in safe sanitization pipeline is applied to L2 (disk) writes and a warning is printed to stderr. Supply `--config` to customise the pipeline.
 
 ```bash
+# Safe-by-default (no config needed)
+docker run --rm \
+  -v ./cache:/fixtures \
+  -p 8081:8081 \
+  ghcr.io/httptape/httptape:latest \
+  proxy --upstream https://api.example.com \
+        --fixtures /fixtures \
+        --port 8081 \
+        --cors
+
+# Custom rules (config replaces the safe default)
 docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
@@ -4572,7 +4607,7 @@ docker run --rm \
         --cors
 ```
 
-The `--fixtures` volume stores the L2 (persistent, redacted) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
+The `--fixtures` volume stores the L2 (persistent, sanitized) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
 
 See [Proxy Mode](proxy.md) for a full guide.
 
@@ -4617,6 +4652,8 @@ services:
 
 ### Record mode
 
+Safe sanitization is applied automatically without `--config`; mount a config only when you need custom rules.
+
 ```yaml
 services:
   recorder:
@@ -4627,15 +4664,12 @@ services:
       - https://api.example.com
       - --fixtures
       - /fixtures
-      - --config
-      - /config/config.json
       - --port
       - "8081"
     ports:
       - "8081:8081"
     volumes:
       - ./fixtures:/fixtures
-      - ./redact.json:/config/config.json:ro
 ```
 
 ### Proxy mode (frontend dev with fallback)
@@ -4650,8 +4684,6 @@ services:
       - https://api.staging.example.com
       - --fixtures
       - /fixtures
-      - --config
-      - /config/config.json
       - --port
       - "3001"
       - --cors
@@ -4659,7 +4691,6 @@ services:
       - "3001:3001"
     volumes:
       - ./cache:/fixtures
-      - ./redact.json:/config/config.json:ro
 
   frontend:
     build:
