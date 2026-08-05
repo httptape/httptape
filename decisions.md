@@ -7800,6 +7800,49 @@ The --config/--unsafe-raw mutual-exclusion check is moved before NewFileStore (M
 and BuildTLSConfig (PEM reads) in both runRecord and runProxy, honoring this ADR's
 "error path must not touch disk" statement literally (previously it ran after those).
 
+### ADR-50: base64 fallback + `body_encoding` marker for non-UTF-8 text bodies
+
+**Date**: 2026-08-05
+**Issue**: #303
+**Status**: Accepted
+
+#### Context
+
+`marshalBody` emitted text-Content-Type bodies as `string(body)`. `encoding/json`
+replaces invalid UTF-8 with U+FFFD, so non-UTF-8 text bodies (Latin-1, Shift-JIS, …)
+were silently corrupted on persist and the stored `body_hash` no longer matched the
+stored body; replay/diff/export propagated the corruption. ADR-41 had removed the
+`body_encoding` field, assuming Content-Type alone determines body shape — which holds
+only for valid UTF-8 text.
+
+#### Decision
+
+Gate the text path on `utf8.Valid`. Valid UTF-8 text → JSON string (unchanged).
+Non-UTF-8 text → base64 string plus a `"body_encoding": "base64"` marker.
+
+The text unmarshal path takes the string verbatim, so a base64 fallback there is
+undetectable from Content-Type alone. Try-base64-first is rejected: any legitimate text
+body that is valid base64 would be silently misdecoded — a worse bug than the original.
+The marker disambiguates authoritatively: base64-decode on load iff the marker is present.
+
+Scope is minimal: the marker is emitted (`omitempty`) only for the non-UTF-8 text case.
+JSON, valid-UTF-8 text, binary, and nil bodies are byte-identical to before, so no existing
+fixture changes on disk. On unmarshal the marker is honored only for JSON-string bodies and
+takes priority over Content-Type; object/array/null tokens ignore it (legacy `identity`
+stays ignored). Reusing the value `"base64"` is compatible with, and quietly repairs, any
+v0.11 fixtures that carried it. A marker asserting base64 over un-decodable data is a hard
+error (fail closed).
+
+#### Consequences
+
+- Non-UTF-8 text bodies round-trip byte-identically; `body_hash` stays consistent.
+- The fixture format gains one narrowly-scoped, self-describing field; documented in
+  `docs/fixtures-authoring.md`.
+- Not fixed here: a JSON-CT body that is a scalar JSON string whose contents are valid
+  base64 (e.g. `"body": "aGVsbG8="` under `application/json`) can still be misdecoded by
+  the pre-existing json-fallback path. It is orthogonal to #303 (marshal never flags it as
+  base64) and tracked separately if it surfaces.
+
 ---
 
 ## PM Log

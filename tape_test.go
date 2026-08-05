@@ -991,6 +991,380 @@ func TestRecordedResp_JSON_RoundTrip_WithElapsedMS(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-50: non-UTF-8 text body encoding tests
+// ---------------------------------------------------------------------------
+
+// TestRoundTrip_Latin1TextBody_SurvivesByteIdentically is the primary repro
+// for #303: a Latin-1 text body must survive marshal → unmarshal byte-identically.
+// encoding/json replaces invalid UTF-8 with U+FFFD when marshaling a string, so
+// without the base64 fallback the body would be silently corrupted on persist.
+func TestRoundTrip_Latin1TextBody_SurvivesByteIdentically(t *testing.T) {
+	// "café au lait" in ISO-8859-1: 0xe9 is the Latin-1 code point for é.
+	latin1Body := []byte("caf\xe9 au lait")
+	headers := http.Header{"Content-Type": {"text/plain; charset=iso-8859-1"}}
+
+	req := RecordedReq{
+		Method:   "POST",
+		URL:      "http://example.com/api",
+		Headers:  headers,
+		Body:     latin1Body,
+		BodyHash: BodyHashFromBytes(latin1Body),
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	// Fixture must contain the body_encoding marker.
+	if !strings.Contains(string(data), `"body_encoding":"base64"`) {
+		t.Errorf("expected body_encoding:base64 in fixture, got: %s", data)
+	}
+
+	var req2 RecordedReq
+	if err := json.Unmarshal(data, &req2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if !bytes.Equal(req2.Body, latin1Body) {
+		t.Errorf("body mismatch after round-trip:\n  want: %v\n  got:  %v", latin1Body, req2.Body)
+	}
+}
+
+// TestRoundTrip_Latin1TextBody_Resp_SurvivesByteIdentically mirrors the repro
+// on RecordedResp to ensure both marshal paths are covered.
+func TestRoundTrip_Latin1TextBody_Resp_SurvivesByteIdentically(t *testing.T) {
+	latin1Body := []byte("caf\xe9 au lait")
+	headers := http.Header{"Content-Type": {"text/plain; charset=iso-8859-1"}}
+
+	resp := RecordedResp{
+		StatusCode: 200,
+		Headers:    headers,
+		Body:       latin1Body,
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	if !strings.Contains(string(data), `"body_encoding":"base64"`) {
+		t.Errorf("expected body_encoding:base64 in fixture, got: %s", data)
+	}
+
+	var resp2 RecordedResp
+	if err := json.Unmarshal(data, &resp2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if !bytes.Equal(resp2.Body, latin1Body) {
+		t.Errorf("body mismatch after round-trip:\n  want: %v\n  got:  %v", latin1Body, resp2.Body)
+	}
+}
+
+// TestBodyHash_MatchesStoredBody_ForNonUTF8Text asserts that after a round-trip
+// the stored body_hash still matches the round-tripped body. This is the
+// divergence guard for #303: before the fix, body_hash was computed over the
+// original bytes but the stored body was U+FFFD-corrupted.
+func TestBodyHash_MatchesStoredBody_ForNonUTF8Text(t *testing.T) {
+	latin1Body := []byte("caf\xe9 au lait")
+	headers := http.Header{"Content-Type": {"text/plain; charset=iso-8859-1"}}
+	originalHash := BodyHashFromBytes(latin1Body)
+
+	req := RecordedReq{
+		Method:   "POST",
+		URL:      "http://example.com",
+		Headers:  headers,
+		Body:     latin1Body,
+		BodyHash: originalHash,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	var req2 RecordedReq
+	if err := json.Unmarshal(data, &req2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	roundTripHash := BodyHashFromBytes(req2.Body)
+	if roundTripHash != originalHash {
+		t.Errorf("body_hash mismatch after round-trip: stored=%q computed-over-body=%q",
+			originalHash, roundTripHash)
+	}
+}
+
+// TestMarshalBody_TextCTShapes exercises marshalBody for the text Content-Type
+// branch covering valid UTF-8 (no marker) and several non-UTF-8 encodings (marker set).
+func TestMarshalBody_TextCTShapes(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        []byte
+		ct          string
+		wantEncoded bool   // true → base64 in JSON; false → plain string
+		wantMarker  string // expected body_encoding value in emitted JSON ("" = absent)
+	}{
+		{
+			name:        "valid UTF-8 text emits plain string without marker",
+			body:        []byte("hello world"),
+			ct:          "text/plain",
+			wantEncoded: false,
+			wantMarker:  "",
+		},
+		{
+			name:        "Latin-1 byte emits base64 with base64 marker",
+			body:        []byte("caf\xe9 au lait"),
+			ct:          "text/plain; charset=iso-8859-1",
+			wantEncoded: true,
+			wantMarker:  "base64",
+		},
+		{
+			name:        "lone 0xFF byte emits base64 with base64 marker",
+			body:        []byte{0xFF},
+			ct:          "text/plain",
+			wantEncoded: true,
+			wantMarker:  "base64",
+		},
+		{
+			name:        "Shift-JIS sample emits base64 with base64 marker",
+			body:        []byte{0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd}, // "こんにちは" in Shift-JIS
+			ct:          "text/plain; charset=shift_jis",
+			wantEncoded: true,
+			wantMarker:  "base64",
+		},
+		{
+			name:        "application/xml valid UTF-8 no marker",
+			body:        []byte("<root/>"),
+			ct:          "application/xml",
+			wantEncoded: false,
+			wantMarker:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := http.Header{"Content-Type": {tt.ct}}
+			req := RecordedReq{Method: "POST", URL: "http://x", Headers: headers, Body: tt.body}
+			data, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal error: %v", err)
+			}
+			s := string(data)
+
+			hasMarker := strings.Contains(s, `"body_encoding":"base64"`)
+			if tt.wantMarker == "base64" && !hasMarker {
+				t.Errorf("expected body_encoding:base64 in output, got: %s", s)
+			}
+			if tt.wantMarker == "" && hasMarker {
+				t.Errorf("unexpected body_encoding field in output, got: %s", s)
+			}
+
+			// Verify round-trip restores the original bytes.
+			var req2 RecordedReq
+			if err := json.Unmarshal(data, &req2); err != nil {
+				t.Fatalf("unmarshal error: %v", err)
+			}
+			if !bytes.Equal(req2.Body, tt.body) {
+				t.Errorf("body mismatch after round-trip:\n  want: %v\n  got:  %v", tt.body, req2.Body)
+			}
+		})
+	}
+}
+
+// TestUnmarshalBody_Base64MarkerTakesPriorityOverContentType asserts that when
+// body_encoding is "base64", the body is base64-decoded regardless of Content-Type.
+func TestUnmarshalBody_Base64MarkerTakesPriorityOverContentType(t *testing.T) {
+	// base64("café") with a text/plain Content-Type and the explicit marker.
+	// Without the marker, a text CT would store this verbatim as "Y2Fmw6k=".
+	latin1Body := []byte("caf\xe9 au lait")
+	encoded := "Y2Fm6SBhdSBsYWl0" // base64.StdEncoding of latin1Body
+
+	input := `{
+		"method": "POST",
+		"url": "http://example.com",
+		"headers": {"Content-Type": ["text/plain; charset=iso-8859-1"]},
+		"body": "` + encoded + `",
+		"body_encoding": "base64",
+		"body_hash": ""
+	}`
+
+	var req RecordedReq
+	if err := json.Unmarshal([]byte(input), &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if !bytes.Equal(req.Body, latin1Body) {
+		t.Errorf("Body = %v, want %v", req.Body, latin1Body)
+	}
+}
+
+// TestUnmarshalBody_LegitTextThatLooksLikeBase64_ReadVerbatim guards the
+// ambiguity that drove the marker decision: a legitimate UTF-8 text body that
+// happens to be valid base64 must be read verbatim (not decoded) when no marker
+// is present.
+func TestUnmarshalBody_LegitTextThatLooksLikeBase64_ReadVerbatim(t *testing.T) {
+	// "SGVsbG8=" is the base64 encoding of "Hello". As a text/plain body it
+	// should be stored verbatim — the literal string "SGVsbG8=" — not decoded
+	// to "Hello". This is the key regression guard for try-base64-first rejection.
+	input := `{
+		"method": "GET",
+		"url": "http://example.com",
+		"headers": {"Content-Type": ["text/plain"]},
+		"body": "SGVsbG8=",
+		"body_hash": ""
+	}`
+
+	var req RecordedReq
+	if err := json.Unmarshal([]byte(input), &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	want := "SGVsbG8="
+	if string(req.Body) != want {
+		t.Errorf("Body = %q, want %q (must be verbatim, not base64-decoded)", string(req.Body), want)
+	}
+}
+
+// TestUnmarshalBody_Base64MarkerWithBadBase64_Errors asserts that a body marked
+// as base64 but containing invalid base64 data is a hard error (fail closed),
+// not silent corruption.
+func TestUnmarshalBody_Base64MarkerWithBadBase64_Errors(t *testing.T) {
+	input := `{
+		"method": "POST",
+		"url": "http://example.com",
+		"headers": {"Content-Type": ["text/plain"]},
+		"body": "!!!not-valid-base64!!!",
+		"body_encoding": "base64",
+		"body_hash": ""
+	}`
+
+	var req RecordedReq
+	err := json.Unmarshal([]byte(input), &req)
+	if err == nil {
+		t.Error("expected error for invalid base64 under body_encoding=base64, got nil")
+	}
+}
+
+// TestUnmarshalBody_ExistingFixturesWithoutMarker_UnchangedBehavior is the
+// backwards-compatibility regression: fixtures without body_encoding must
+// unmarshal identically to before ADR-50.
+func TestUnmarshalBody_ExistingFixturesWithoutMarker_UnchangedBehavior(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string // expected Body as string
+	}{
+		{
+			name: "text/plain body without marker stays verbatim",
+			input: `{
+				"method": "GET",
+				"url": "http://example.com",
+				"headers": {"Content-Type": ["text/plain"]},
+				"body": "hello world",
+				"body_hash": ""
+			}`,
+			want: "hello world",
+		},
+		{
+			name: "JSON body without marker stays native JSON",
+			input: `{
+				"method": "POST",
+				"url": "http://example.com",
+				"headers": {"Content-Type": ["application/json"]},
+				"body": {"key": "value"},
+				"body_hash": ""
+			}`,
+			want: `{"key":"value"}`,
+		},
+		{
+			name: "legacy body_encoding identity is ignored (object body)",
+			input: `{
+				"method": "POST",
+				"url": "http://example.com",
+				"headers": {"Content-Type": ["application/json"]},
+				"body": {"ok": true},
+				"body_encoding": "identity",
+				"body_hash": ""
+			}`,
+			want: `{"ok":true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req RecordedReq
+			if err := json.Unmarshal([]byte(tt.input), &req); err != nil {
+				t.Fatalf("unmarshal error: %v", err)
+			}
+			if string(req.Body) != tt.want {
+				t.Errorf("Body = %q, want %q", string(req.Body), tt.want)
+			}
+		})
+	}
+}
+
+// TestMarshalBody_NoMarkerOnUTF8TextOrOtherCTs verifies that the body_encoding
+// field is completely absent (omitempty) for all non-non-UTF-8-text cases,
+// keeping existing fixture files byte-identical on disk.
+func TestMarshalBody_NoMarkerOnUTF8TextOrOtherCTs(t *testing.T) {
+	tests := []struct {
+		name string
+		req  RecordedReq
+	}{
+		{
+			name: "UTF-8 text body",
+			req: RecordedReq{
+				Method:  "POST",
+				URL:     "http://x",
+				Headers: http.Header{"Content-Type": {"text/plain"}},
+				Body:    []byte("hello"),
+			},
+		},
+		{
+			name: "JSON body",
+			req: RecordedReq{
+				Method:  "POST",
+				URL:     "http://x",
+				Headers: http.Header{"Content-Type": {"application/json"}},
+				Body:    []byte(`{"a":1}`),
+			},
+		},
+		{
+			name: "binary body",
+			req: RecordedReq{
+				Method:  "GET",
+				URL:     "http://x",
+				Headers: http.Header{"Content-Type": {"image/png"}},
+				Body:    []byte{0x89, 0x50, 0x4e, 0x47},
+			},
+		},
+		{
+			name: "nil body",
+			req: RecordedReq{
+				Method:  "GET",
+				URL:     "http://x",
+				Headers: http.Header{"Content-Type": {"application/json"}},
+				Body:    nil,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(tt.req)
+			if err != nil {
+				t.Fatalf("marshal error: %v", err)
+			}
+			if strings.Contains(string(data), "body_encoding") {
+				t.Errorf("unexpected body_encoding field in output for %s: %s", tt.name, data)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // elapsedMS helper
 // ---------------------------------------------------------------------------
 

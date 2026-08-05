@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Tape represents a single recorded HTTP interaction (request + response pair).
@@ -52,7 +54,10 @@ type Tape struct {
 // The Body field is always stored as []byte in Go. When marshaled to JSON,
 // the body representation depends on the Content-Type header:
 //   - JSON Content-Type (application/json, +json suffix): native JSON object/array
-//   - Text Content-Type (text/*, application/xml, etc.): JSON string
+//   - Text Content-Type (text/*, application/xml, etc.) with valid UTF-8: JSON string
+//   - Text Content-Type with non-UTF-8 bytes: base64-encoded JSON string; the
+//     companion field "body_encoding":"base64" (omitempty) marks this case so that
+//     unmarshal can distinguish it from a legitimate text body that is valid base64.
 //   - Binary or missing Content-Type: base64-encoded JSON string
 //   - Nil or empty body: JSON null
 type RecordedReq struct {
@@ -96,8 +101,9 @@ type RecordedReq struct {
 //
 // The Body field is always stored as []byte in Go. When marshaled to JSON,
 // the body representation depends on the Content-Type header (same rules as
-// RecordedReq). For SSE (text/event-stream) responses, the discrete events
-// are stored in SSEEvents and Body is nil.
+// RecordedReq, including the "body_encoding":"base64" marker for non-UTF-8 text).
+// For SSE (text/event-stream) responses, the discrete events are stored in
+// SSEEvents and Body is nil.
 //
 // During replay, if SSEEvents is non-nil and non-empty the tape is treated
 // as an SSE tape and Body is ignored (even if present).
@@ -144,7 +150,9 @@ func (r RecordedResp) IsSSE() bool {
 // MarshalJSON implements json.Marshaler for RecordedReq.
 // The body field's JSON representation depends on the Content-Type from Headers:
 //   - JSON Content-Type: native JSON value (object/array/primitive)
-//   - Text Content-Type: JSON string (UTF-8)
+//   - Text Content-Type with valid UTF-8: JSON string
+//   - Text Content-Type with non-UTF-8 bytes: base64-encoded JSON string; the
+//     "body_encoding" field is set to "base64" to mark this case for unmarshal.
 //   - Binary or missing Content-Type: base64-encoded JSON string
 //   - Nil or empty body: JSON null
 func (r RecordedReq) MarshalJSON() ([]byte, error) {
@@ -154,30 +162,34 @@ func (r RecordedReq) MarshalJSON() ([]byte, error) {
 		URLPattern       string      `json:"url_pattern,omitempty"`
 		Headers          http.Header `json:"headers"`
 		Body             any         `json:"body"`
+		BodyEncoding     string      `json:"body_encoding,omitempty"`
 		BodyHash         string      `json:"body_hash"`
 		Truncated        bool        `json:"truncated,omitempty"`
 		OriginalBodySize int64       `json:"original_body_size,omitempty"`
 	}
 
+	bodyVal, bodyEnc := marshalBody(r.Body, r.Headers)
 	a := alias{
 		Method:           r.Method,
 		URL:              r.URL,
 		URLPattern:       r.URLPattern,
 		Headers:          r.Headers,
-		Body:             nil, // default: null
+		Body:             bodyVal,
+		BodyEncoding:     bodyEnc,
 		BodyHash:         r.BodyHash,
 		Truncated:        r.Truncated,
 		OriginalBodySize: r.OriginalBodySize,
 	}
 
-	a.Body = marshalBody(r.Body, r.Headers)
 	return json.Marshal(a)
 }
 
 // UnmarshalJSON implements json.Unmarshaler for RecordedReq.
 // It detects the JSON token type of the body field and decodes accordingly:
 //   - JSON object/array: body stored as compact JSON bytes
-//   - JSON string: text or base64 based on Content-Type
+//   - JSON string with body_encoding=="base64": base64-decoded bytes
+//   - JSON string (text Content-Type, no marker): verbatim UTF-8 bytes
+//   - JSON string (binary/unknown Content-Type): base64-decoded bytes
 //   - JSON null: body is nil
 func (r *RecordedReq) UnmarshalJSON(data []byte) error {
 	type alias struct {
@@ -186,6 +198,7 @@ func (r *RecordedReq) UnmarshalJSON(data []byte) error {
 		URLPattern       string          `json:"url_pattern,omitempty"`
 		Headers          http.Header     `json:"headers"`
 		Body             json.RawMessage `json:"body"`
+		BodyEncoding     string          `json:"body_encoding"`
 		BodyHash         string          `json:"body_hash"`
 		Truncated        bool            `json:"truncated,omitempty"`
 		OriginalBodySize int64           `json:"original_body_size,omitempty"`
@@ -204,7 +217,7 @@ func (r *RecordedReq) UnmarshalJSON(data []byte) error {
 	r.Truncated = a.Truncated
 	r.OriginalBodySize = a.OriginalBodySize
 
-	body, err := unmarshalBody(a.Body, a.Headers)
+	body, err := unmarshalBody(a.Body, a.Headers, a.BodyEncoding)
 	if err != nil {
 		return fmt.Errorf("unmarshal RecordedReq body: %w", err)
 	}
@@ -214,40 +227,45 @@ func (r *RecordedReq) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON implements json.Marshaler for RecordedResp.
 // The body field's JSON representation depends on the Content-Type from Headers
-// (same rules as RecordedReq.MarshalJSON).
+// (same rules as RecordedReq.MarshalJSON, including the "body_encoding":"base64"
+// marker for non-UTF-8 text bodies).
 func (r RecordedResp) MarshalJSON() ([]byte, error) {
 	type alias struct {
 		StatusCode       int         `json:"status_code"`
 		Headers          http.Header `json:"headers"`
 		Body             any         `json:"body"`
+		BodyEncoding     string      `json:"body_encoding,omitempty"`
 		Truncated        bool        `json:"truncated,omitempty"`
 		OriginalBodySize int64       `json:"original_body_size,omitempty"`
 		SSEEvents        []SSEEvent  `json:"sse_events,omitempty"`
 		ElapsedMS        int64       `json:"elapsed_ms,omitempty"`
 	}
 
+	bodyVal, bodyEnc := marshalBody(r.Body, r.Headers)
 	a := alias{
 		StatusCode:       r.StatusCode,
 		Headers:          r.Headers,
-		Body:             nil,
+		Body:             bodyVal,
+		BodyEncoding:     bodyEnc,
 		Truncated:        r.Truncated,
 		OriginalBodySize: r.OriginalBodySize,
 		SSEEvents:        r.SSEEvents,
 		ElapsedMS:        r.ElapsedMS,
 	}
 
-	a.Body = marshalBody(r.Body, r.Headers)
 	return json.Marshal(a)
 }
 
 // UnmarshalJSON implements json.Unmarshaler for RecordedResp.
 // It detects the JSON token type of the body field and decodes accordingly
-// (same rules as RecordedReq.UnmarshalJSON).
+// (same rules as RecordedReq.UnmarshalJSON, including the "body_encoding":"base64"
+// marker for non-UTF-8 text bodies).
 func (r *RecordedResp) UnmarshalJSON(data []byte) error {
 	type alias struct {
 		StatusCode       int             `json:"status_code"`
 		Headers          http.Header     `json:"headers"`
 		Body             json.RawMessage `json:"body"`
+		BodyEncoding     string          `json:"body_encoding"`
 		Truncated        bool            `json:"truncated,omitempty"`
 		OriginalBodySize int64           `json:"original_body_size,omitempty"`
 		SSEEvents        []SSEEvent      `json:"sse_events,omitempty"`
@@ -266,7 +284,7 @@ func (r *RecordedResp) UnmarshalJSON(data []byte) error {
 	r.SSEEvents = a.SSEEvents
 	r.ElapsedMS = a.ElapsedMS
 
-	body, err := unmarshalBody(a.Body, a.Headers)
+	body, err := unmarshalBody(a.Body, a.Headers, a.BodyEncoding)
 	if err != nil {
 		return fmt.Errorf("unmarshal RecordedResp body: %w", err)
 	}
@@ -275,10 +293,20 @@ func (r *RecordedResp) UnmarshalJSON(data []byte) error {
 }
 
 // marshalBody returns the appropriate JSON value for the body field based on
-// the Content-Type from headers. Returns nil for nil/empty bodies.
-func marshalBody(body []byte, headers http.Header) any {
+// the Content-Type from headers, and the body_encoding marker string (non-empty
+// only for the non-UTF-8 text fallback case).
+//
+// Encoding rules:
+//   - nil/empty body → (nil, "")
+//   - JSON Content-Type, valid JSON → (json.RawMessage, "")
+//   - JSON Content-Type, invalid JSON → (base64 string, "")
+//   - Text Content-Type, valid UTF-8 → (string, "")
+//   - Text Content-Type, non-UTF-8 bytes → (base64 string, "base64")
+//   - Binary/unknown Content-Type → (base64 string, "")
+//   - Missing/unparseable Content-Type → (base64 string, "")
+func marshalBody(body []byte, headers http.Header) (any, string) {
 	if len(body) == 0 {
-		return nil
+		return nil, ""
 	}
 
 	ct := ""
@@ -288,30 +316,45 @@ func marshalBody(body []byte, headers http.Header) any {
 
 	mt, err := ParseMediaType(ct)
 	if err != nil || ct == "" {
-		// Unknown/missing CT: base64
-		return base64.StdEncoding.EncodeToString(body)
+		// Unknown/missing CT: base64, no marker.
+		return base64.StdEncoding.EncodeToString(body), ""
 	}
 
 	if IsJSON(mt) {
 		// Verify the body is valid JSON before emitting as native.
 		if json.Valid(body) {
-			return json.RawMessage(body)
+			return json.RawMessage(body), ""
 		}
-		// Invalid JSON despite JSON CT: fall back to base64.
-		return base64.StdEncoding.EncodeToString(body)
+		// Invalid JSON despite JSON CT: fall back to base64, no marker.
+		return base64.StdEncoding.EncodeToString(body), ""
 	}
 
 	if IsText(mt) {
-		return string(body)
+		if utf8.Valid(body) {
+			// Valid UTF-8 text: emit as a JSON string, no marker.
+			return string(body), ""
+		}
+		// Non-UTF-8 text (Latin-1, Shift-JIS, etc.): emit as base64 and set
+		// the body_encoding marker so unmarshal can distinguish this from a
+		// legitimate text body that happens to look like base64.
+		return base64.StdEncoding.EncodeToString(body), "base64"
 	}
 
-	// Binary: base64
-	return base64.StdEncoding.EncodeToString(body)
+	// Binary: base64, no marker.
+	return base64.StdEncoding.EncodeToString(body), ""
 }
 
-// unmarshalBody decodes the body JSON value based on its token type and the
-// Content-Type from headers. Returns nil for JSON null or missing body.
-func unmarshalBody(raw json.RawMessage, headers http.Header) ([]byte, error) {
+// unmarshalBody decodes the body JSON value based on its token type, the
+// Content-Type from headers, and an optional body_encoding marker.
+//
+// When encoding is "base64" (case-insensitive), JSON-string bodies are
+// base64-decoded unconditionally and authoritatively — Content-Type is not
+// consulted. A malformed base64 value under a "base64" marker is a hard error
+// (fail closed). All other encoding values (empty, "identity", or any unknown
+// string) are ignored for non-object/array tokens.
+//
+// Returns nil for JSON null or a missing body.
+func unmarshalBody(raw json.RawMessage, headers http.Header, encoding string) ([]byte, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
@@ -332,10 +375,23 @@ func unmarshalBody(raw json.RawMessage, headers http.Header) ([]byte, error) {
 		return buf.Bytes(), nil
 
 	case firstByte == '"':
-		// JSON string: could be text or base64.
+		// JSON string: could be text, base64, or a non-UTF-8 text fallback.
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
 			return nil, fmt.Errorf("decode body string: %w", err)
+		}
+
+		// The body_encoding marker takes priority over Content-Type for string
+		// bodies. This is the only safe disambiguation for the text path: a
+		// legitimate UTF-8 text body might look like valid base64, so we never
+		// try-base64-first for text. The marker is only emitted for non-UTF-8
+		// text bodies and is authoritative when present.
+		if strings.EqualFold(encoding, "base64") {
+			decoded, err := base64.StdEncoding.DecodeString(s)
+			if err != nil {
+				return nil, fmt.Errorf("decode base64 body (body_encoding=base64): %w", err)
+			}
+			return decoded, nil
 		}
 
 		ct := ""
@@ -361,7 +417,9 @@ func unmarshalBody(raw json.RawMessage, headers http.Header) ([]byte, error) {
 		}
 
 		if parseErr == nil && IsText(mt) {
-			// Text CT: store string as UTF-8 bytes.
+			// Text CT without a base64 marker: store string verbatim as bytes.
+			// This correctly handles both normal UTF-8 text AND any text body
+			// that happens to look like valid base64 (e.g., "SGVsbG8=").
 			return []byte(s), nil
 		}
 
