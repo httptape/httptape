@@ -120,9 +120,11 @@ func WithBufferSize(size int) RecorderOption {
 	}
 }
 
-// WithOnError sets a callback invoked when an async store write fails.
-// The callback is called from the background goroutine, so it must be
-// safe for concurrent use. Defaults to a no-op (errors are discarded).
+// WithOnError sets a callback invoked when a store write fails or a tape is
+// dropped. The callback may be called from the background drain goroutine
+// (async write errors) or from the RoundTrip goroutine (e.g. when a tape is
+// dropped because the recorder was closed while RoundTrip was in flight). It
+// must be safe for concurrent use. Defaults to a no-op (errors are discarded).
 func WithOnError(fn func(error)) RecorderOption {
 	return func(r *Recorder) {
 		r.onError = fn

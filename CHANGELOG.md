@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-05
+
 ### Added
 
 - **Inbound TLS listener**: CLI commands `serve`, `record`, and `proxy`
@@ -86,19 +88,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Config support for `path_pattern`**: declarative `"type": "path_pattern"`
   criterion with `"pattern"` field. (#196)
 
+- **`RedactQueryParams` / `FakeQueryParams`**: `SanitizeFunc` constructors
+  that redact or deterministically fake URL query parameter values. Userinfo
+  (`user:password@` in the authority) is always stripped, regardless of
+  which parameter names are configured. Both functions default to
+  `DefaultSensitiveQueryParams()` when called with no names. Fail-closed:
+  malformed percent-encoded query strings are replaced wholesale with
+  `[REDACTED]` rather than passed through as cleartext. (#295)
+
+- **`DefaultSensitiveQueryParams`**: returns a copy of the built-in list of
+  query parameter names commonly carrying sensitive data (`api_key`,
+  `access_token`, `token`, `secret`, `password`, `sig`, `signature`,
+  `X-Amz-Signature`, `X-Goog-Signature`). (#295)
+
+- **`--unsafe-raw` CLI flag**: `record` and `proxy` commands now apply safe
+  default sanitization (redact default sensitive headers + query params) unless
+  `--unsafe-raw` is passed. This flag disables all sanitization for callers who
+  explicitly opt out. The previous behavior (no sanitization by default) is
+  now opt-in. (#297)
+
+- **`body_encoding: "base64"` field**: non-UTF-8 text bodies that cannot be
+  stored as plain JSON strings are persisted as base64-encoded strings with an
+  explicit `"body_encoding": "base64"` marker. Fixtures written before this
+  change are unaffected (all-UTF-8 text bodies remain plain strings). (#303)
+
+### Security
+
+- **CLI fail-closed sanitization**: `httptape record` and `httptape proxy` now
+  default to redacting `DefaultSensitiveHeaders()` and `DefaultSensitiveQueryParams()`
+  from every recorded tape. Raw recording requires an explicit `--unsafe-raw` flag.
+  This eliminates the risk of committing API keys or session tokens to version
+  control when using the CLI without a config file. (#297)
+
+- **Matcher-only config fail-closed**: when a config file supplies a `matcher`
+  block but no `sanitizer` block, the CLI now rejects the invocation with an
+  error rather than silently recording without sanitization. A sanitizer is
+  required whenever a custom matcher is provided. (#306)
+
+### Fixed
+
+- **Single-flight key correctness**: the deduplication key for concurrent cache
+  misses now includes the raw query string and a canonical SHA-256 hash of all
+  request headers outside the hop-by-hop denylist. Previously, two requests
+  with the same method, path, and body but different query parameters or headers
+  could incorrectly share one upstream call and receive the same response.
+  (ADR-47, #294)
+
+- **SSE streams past upstream timeout**: SSE responses are now kept alive past
+  the `WithCacheUpstreamTimeout` deadline. The timeout previously applied to
+  the entire SSE stream duration; it now bounds only the header phase. (#300)
+
+- **Fail-closed on matcher-only configs**: the CLI now rejects a config file
+  that provides a `matcher` block without a `sanitizer` block rather than
+  recording without sanitization. (#306)
+
+- **Config schema for `redact_query` / `fake_query` actions**: the JSON config
+  schema now accepts `"redact_query"` and `"fake_query"` as sanitizer action
+  types. Legacy config actions that carry unrecognized fields now return an
+  error at load time rather than silently ignoring them. (#310)
+
+- **Non-UTF-8 text bodies persisted correctly**: text-typed response bodies
+  containing non-UTF-8 byte sequences (e.g. Latin-1 encoded text) now survive
+  the record → persist → replay round-trip byte-identically. Previously they
+  were silently corrupted by JSON encoding. (#303)
+
+- **SIGINT drains pending recordings**: `httptape record` and `httptape proxy`
+  now call `Recorder.Close()` before exiting on SIGINT, flushing any tapes
+  buffered in the async channel. Previously, tapes in flight at shutdown time
+  were silently dropped. (#304)
+
+- **`WithOnError` fires on racing-drop path**: `WithOnError` callbacks are now
+  also invoked when a tape is dropped because `RoundTrip` raced against
+  `Recorder.Close()`. Previously, only background drain-goroutine errors
+  triggered the callback; silent tape drops on the hot path were invisible to
+  callers. (#304)
+
 ### Breaking Changes
-
-- **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
-  These now accept `*templateCtx` (unexported) instead of `*http.Request`.
-  External callers should use `ResolveTemplateBodySimple` instead. Pre-1.0,
-  acceptable. (#196)
-
-- **Unknown template namespaces**: expressions like `{{state.counter}}` that
-  were previously left as literal text are now replaced with empty string in
-  lenient mode (error in strict mode). All supported expressions are now
-  explicitly dispatched. (#196)
-
-### Breaking Changes (prior)
 
 - **`NewServer` signature change**: `NewServer(store Store, opts ...ServerOption)`
   now returns `(*Server, error)` instead of `*Server`. The constructor validates
@@ -116,10 +181,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now returns `(SSETimingMode, error)` instead of `SSETimingMode`. Returns an
   error when factor is <= 0 instead of panicking. (#215, ADR-46)
 
+- **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
+  These now accept `*templateCtx` (unexported) instead of `*http.Request`.
+  External callers should use `ResolveTemplateBodySimple` instead. Pre-1.0,
+  acceptable. (#196)
+
+- **Unknown template namespaces**: expressions like `{{state.counter}}` that
+  were previously left as literal text are now replaced with empty string in
+  lenient mode (error in strict mode). All supported expressions are now
+  explicitly dispatched. (#196)
+
 ### Migration
 
-All three changes are caught by the Go compiler -- no silent breakage. Update
-call sites as follows:
+All `NewServer` / `NewProxy` / `SSETimingAccelerated` changes are caught by
+the Go compiler — no silent breakage. Update call sites as follows:
 
 ```go
 // Before

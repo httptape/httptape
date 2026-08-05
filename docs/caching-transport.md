@@ -119,7 +119,9 @@ httptape.WithCacheSingleFlight(true)  // default
 httptape.WithCacheSingleFlight(false) // disable
 ```
 
-Controls single-flight deduplication of concurrent cache misses. When enabled, concurrent requests with the same match key (method + path + body hash) share a single upstream call. Each waiter receives an independent response with its own body reader.
+Controls single-flight deduplication of concurrent cache misses. When enabled, concurrent requests with the same single-flight key share a single upstream call; each waiter receives an independent response with its own body reader.
+
+The single-flight key is derived from HTTP method, URL path, raw query string, request body hash, and a canonical SHA-256 hash of all request headers except hop-by-hop and volatile headers (see `sfHeaderDenylist` in the source). This fully covers every dimension a Matcher could distinguish, so a waiter never receives a response that would not match its own request. The trade-off is reduced collapsing: two requests that are semantically equivalent but carry incidental header differences (e.g. a per-request trace ID) each make a separate upstream call rather than sharing one.
 
 For SSE responses, the first caller gets the live tee'd stream. Concurrent callers wait for the stream to complete, then get the cached tape.
 
