@@ -2175,3 +2175,244 @@ func TestSingleFlightKey(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Upstream timeout: SSE vs buffered path correctness (#300)
+// ---------------------------------------------------------------------------
+
+// TestCachingTransport_UpstreamTimeoutSSEvsBuffered verifies that the
+// disarmable-timer approach (context.WithCancelCause + time.AfterFunc) behaves
+// correctly for both SSE and buffered responses.
+func TestCachingTransport_UpstreamTimeoutSSEvsBuffered(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			// Core regression: the SSE stream must stay readable past the timeout.
+			// Previously, defer cancel() fired on return from roundTripUpstream,
+			// tearing down the body immediately.
+			name: "SSE stream stays open past upstream timeout while streaming",
+			run: func(t *testing.T) {
+				t.Parallel()
+				store := NewMemoryStore()
+
+				const timeout = 60 * time.Millisecond
+				const eventInterval = 40 * time.Millisecond
+				const numEvents = 4 // span = 4 * 40ms = 160ms >> timeout
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(200)
+					flusher, ok := w.(http.Flusher)
+					if !ok {
+						t.Error("httptest server does not support Flusher")
+						return
+					}
+					for i := 0; i < numEvents; i++ {
+						fmt.Fprintf(w, "data: event-%d\n\n", i)
+						flusher.Flush()
+						if i < numEvents-1 {
+							time.Sleep(eventInterval)
+						}
+					}
+				}))
+				defer srv.Close()
+
+				ct := NewCachingTransport(http.DefaultTransport, store,
+					WithCacheUpstreamTimeout(timeout),
+					WithCacheSingleFlight(false),
+				)
+
+				req, _ := http.NewRequest("GET", srv.URL+"/stream", nil)
+				resp, err := ct.RoundTrip(req)
+				if err != nil {
+					t.Fatalf("RoundTrip error: %v", err)
+				}
+
+				body, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if readErr != nil {
+					t.Fatalf("SSE body read error after timeout window: %v", readErr)
+				}
+
+				for i := 0; i < numEvents; i++ {
+					want := fmt.Sprintf("event-%d", i)
+					if !strings.Contains(string(body), want) {
+						t.Errorf("SSE body missing %q; got %q", want, string(body))
+					}
+				}
+
+				// Wait for the async onDone callback to persist the tape.
+				time.Sleep(150 * time.Millisecond)
+
+				tapes, _ := store.List(context.Background(), Filter{})
+				if len(tapes) != 1 {
+					t.Fatalf("store has %d tapes after SSE stream, want 1", len(tapes))
+				}
+				if !tapes[0].Response.IsSSE() {
+					t.Error("stored tape is not SSE")
+				}
+				if len(tapes[0].Response.SSEEvents) != numEvents {
+					t.Errorf("stored tape has %d SSE events, want %d", len(tapes[0].Response.SSEEvents), numEvents)
+				}
+			},
+		},
+		{
+			// The header phase must still be bounded: an SSE request that never
+			// sends headers should time out.
+			name: "upstream timeout aborts an SSE request that stalls before sending headers",
+			run: func(t *testing.T) {
+				t.Parallel()
+				store := NewMemoryStore()
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// Block until the client disconnects (timeout fires).
+					<-r.Context().Done()
+				}))
+				defer srv.Close()
+
+				ct := NewCachingTransport(http.DefaultTransport, store,
+					WithCacheUpstreamTimeout(50*time.Millisecond),
+					WithCacheSingleFlight(false),
+				)
+
+				req, _ := http.NewRequest("GET", srv.URL+"/stream", nil)
+				resp, err := ct.RoundTrip(req)
+				if err == nil {
+					resp.Body.Close()
+					t.Fatal("expected error when upstream stalls before headers, got nil")
+				}
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("expected context.DeadlineExceeded, got %v", err)
+				}
+			},
+		},
+		{
+			// Buffered semantics must be unchanged: the timer stays armed during
+			// the body read, so a stalled buffered body read aborts with a
+			// deadline error. roundTripUpstream catches the error, calls onError,
+			// and still returns the (empty) response — so we verify via the
+			// onError callback rather than the test's own io.ReadAll.
+			// Uses a mock transport with io.Pipe to give deterministic stall
+			// behavior without any server-side race.
+			name: "upstream timeout still bounds a buffered response whose body stalls",
+			run: func(t *testing.T) {
+				t.Parallel()
+				store := NewMemoryStore()
+
+				var (
+					capturedErr error
+					errMu       sync.Mutex
+				)
+
+				upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					pr, pw := io.Pipe()
+					// Close the pipe with context.Cause so io.ReadAll inside
+					// roundTripUpstream gets context.DeadlineExceeded.
+					go func() {
+						<-req.Context().Done()
+						pw.CloseWithError(context.Cause(req.Context()))
+					}()
+					return &http.Response{
+						StatusCode: 200,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       pr,
+					}, nil
+				})
+
+				ct := NewCachingTransport(upstream, store,
+					WithCacheUpstreamTimeout(60*time.Millisecond),
+					WithCacheSingleFlight(false),
+					WithCacheOnError(func(err error) {
+						errMu.Lock()
+						capturedErr = err
+						errMu.Unlock()
+					}),
+				)
+
+				req, _ := http.NewRequest("GET", "http://example.com/data", nil)
+				resp, err := ct.RoundTrip(req)
+				if err != nil {
+					t.Fatalf("expected headers to arrive before timeout, got: %v", err)
+				}
+				resp.Body.Close()
+
+				// The body read inside roundTripUpstream should have timed out,
+				// triggering onError with context.DeadlineExceeded.
+				errMu.Lock()
+				bodyErr := capturedErr
+				errMu.Unlock()
+				if bodyErr == nil {
+					t.Fatal("onError not called; expected deadline exceeded on stalled body read")
+				}
+				if !errors.Is(bodyErr, context.DeadlineExceeded) {
+					t.Errorf("expected context.DeadlineExceeded in onError, got %v", bodyErr)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, tt.run)
+	}
+}
+
+// TestCachingTransport_ClosingSSEBodyReleasesUpstreamContext verifies that
+// closing a recorded SSE response body cancels the upstream-timeout context,
+// proving that cancel ownership transferred to the stream lifecycle and does not
+// leak the context.
+func TestCachingTransport_ClosingSSEBodyReleasesUpstreamContext(t *testing.T) {
+	t.Parallel()
+
+	var capturedCtx context.Context
+	var ctxMu sync.Mutex
+
+	upstream := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		ctxMu.Lock()
+		capturedCtx = req.Context()
+		ctxMu.Unlock()
+
+		body := "data: hello\n\ndata: world\n\n"
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	store := NewMemoryStore()
+	ct := NewCachingTransport(upstream, store,
+		WithCacheUpstreamTimeout(500*time.Millisecond),
+		WithCacheSingleFlight(false),
+	)
+
+	req, _ := http.NewRequest("GET", "http://example.com/stream", nil)
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
+	}
+
+	// Read stream to completion.
+	io.ReadAll(resp.Body) //nolint:errcheck
+
+	// Before Close: context should still be live (timer has not fired).
+	ctxMu.Lock()
+	ctx := capturedCtx
+	ctxMu.Unlock()
+	if ctx.Err() != nil {
+		t.Errorf("context cancelled before body Close: %v", ctx.Err())
+	}
+
+	// Close triggers cancelOnCloseReadCloser.cancel(nil).
+	resp.Body.Close()
+
+	// After Close: context must be cancelled.
+	if ctx.Err() == nil {
+		t.Error("context still live after body Close; cancel ownership transfer failed")
+	}
+}
