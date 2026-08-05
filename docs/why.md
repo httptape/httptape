@@ -13,7 +13,7 @@ httptape was extracted from [VibeWarden](https://vibewarden.dev/), where we need
 
 We tried WireMock (Java process, no SSE replay), go-vcr (test-time-only, redaction via user hooks), and a handful of intercept-the-client mocking libraries. None of them treated the safe path as the default. So we built httptape and shipped it as a Go library, a CLI, and a 3 MB Docker image.
 
-The locked decision: **there is no "raw" recording mode**. Sanitization happens on write, deterministically (HMAC-SHA256 for fakes), before any tape touches a store. The safe path is the only path.
+The locked decision: the CLI is **safe-by-default with a loud explicit opt-out**. Sanitization happens on write, deterministically (HMAC-SHA256 for fakes), before any tape touches a store. Running `record` or `proxy` without `--config` applies a built-in safe pipeline automatically; the only way to disable it is `--unsafe-raw`, which prints a prominent warning. The embedded library API leaves sanitization to the embedder (the library's `NewRecorder` default is a no-op pipeline so embedders have full control), but the CLI enforces fail-closed behavior (ADR-49).
 
 ## How it compares to other tools
 

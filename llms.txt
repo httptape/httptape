@@ -167,12 +167,17 @@ defer srv.Close()
 
 ```
 httptape serve             --fixtures <dir> [--port 8081] [--cors] [--delay 200ms] [--config config.json]
-httptape record            --upstream <url> --fixtures <dir> [--config redact.json]
-httptape proxy             --upstream <url> --fixtures <dir> [--config redact.json] [--fallback-on-5xx]
+httptape record            --upstream <url> --fixtures <dir> [--config redact.json] [--unsafe-raw]
+httptape proxy             --upstream <url> --fixtures <dir> [--config redact.json] [--unsafe-raw] [--fallback-on-5xx]
 httptape export            --fixtures <dir> [--output file.tar.gz] [--routes r1,r2]
 httptape import            --fixtures <dir> [--input file.tar.gz]
 httptape migrate-fixtures  [--recursive] <dir>
 ```
+
+record/proxy fail closed: without --config a built-in safe sanitization pipeline (sensitive
+headers + query params + URL userinfo) is applied automatically; bodies are NOT covered.
+--config replaces the safe default (if config rules are empty, safe default is layered in).
+--unsafe-raw disables all sanitization; mutually exclusive with --config.
 
 migrate-fixtures: converts v0.11 fixtures (base64 bodies, body_encoding field)
 to v0.12 format (Content-Type-driven body shape). Idempotent. Skips non-tape files.

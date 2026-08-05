@@ -57,7 +57,8 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory |
-| `--config` | (none) | Path to redaction config JSON |
+| `--config` | (none) | Path to sanitization config JSON. Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. See [Config](config.md). |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic. Prints a loud warning. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--tls-cert` | (none) | Path to PEM client certificate for mTLS. See [TLS](tls.md). |
@@ -69,11 +70,24 @@ httptape record --upstream <url> --fixtures <dir> [flags]
 | `--tls-listener-auto` | `false` | Generate a self-signed cert at startup. See [TLS](tls.md). |
 | `--tls-listener-san` | `localhost,127.0.0.1,::1` | Comma-separated SANs for auto-cert (requires `--tls-listener-auto`). |
 
-The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream, and responses are recorded (with optional redaction) to the fixtures directory.
+`record` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning naming what is redacted is printed to stderr. Bodies are NOT redacted by the safe default — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with custom rules; use `--unsafe-raw` to disable all sanitization (not recommended).
+
+The recorder starts a reverse proxy on the specified port. All requests are forwarded to the upstream and responses are recorded and sanitized to the fixtures directory.
 
 The upstream URL must include the scheme and host (e.g., `https://api.example.com`).
 
-**Example:**
+**Example (safe default — no config needed):**
+
+```bash
+httptape record \
+  --upstream https://api.github.com \
+  --fixtures ./fixtures \
+  --port 8081
+```
+
+Point your application at `http://localhost:8081`. Traffic is recorded with the built-in safe sanitization pipeline applied automatically; a warning lists exactly what is redacted.
+
+**Example (custom rules):**
 
 ```bash
 httptape record \
@@ -83,7 +97,7 @@ httptape record \
   --port 8081
 ```
 
-Then point your application at `http://localhost:8081` instead of the real API. All traffic is recorded and redacted.
+When `--config` is supplied its `rules` replace the safe default pipeline (full control).
 
 ### proxy
 
@@ -97,7 +111,8 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory for L2 (persistent) cache |
-| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--config` | (none) | Path to sanitization config JSON (applied to L2 writes only). Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. See [Config](config.md). |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic to L2. Prints a loud warning. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
@@ -110,6 +125,8 @@ httptape proxy --upstream <url> --fixtures <dir> [flags]
 | `--tls-listener-key` | (none) | Path to PEM private key for inbound TLS. See [TLS](tls.md). |
 | `--tls-listener-auto` | `false` | Generate a self-signed cert at startup. See [TLS](tls.md). |
 | `--tls-listener-san` | `localhost,127.0.0.1,::1` | Comma-separated SANs for auto-cert (requires `--tls-listener-auto`). |
+
+`proxy` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically to L2 writes and a warning is printed to stderr. Bodies are NOT redacted by the safe default — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with custom rules; use `--unsafe-raw` to disable all sanitization (not recommended).
 
 When the upstream is reachable, requests are forwarded and responses are cached:
 
@@ -244,11 +261,10 @@ The `serve`, `record`, and `proxy` commands handle SIGINT and SIGTERM for gracef
 ## Typical workflow
 
 ```bash
-# 1. Record traffic from a real API (with redaction)
+# 1. Record traffic from a real API (safe-by-default sanitization applied automatically)
 httptape record \
   --upstream https://api.example.com \
-  --fixtures ./fixtures \
-  --config redact.json
+  --fixtures ./fixtures
 
 # 2. Export the fixtures
 httptape export --fixtures ./fixtures --output fixtures.tar.gz

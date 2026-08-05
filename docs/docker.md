@@ -24,9 +24,19 @@ The `--fixtures` flag inside the container always points to `/fixtures` (the mou
 
 ## Record mode
 
-Proxy and record traffic from an upstream (with redaction):
+The container records safe-by-default: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning is printed to stderr. Bodies are NOT redacted by the safe default — mount a `--config` to cover secrets in bodies or to customise the pipeline.
 
 ```bash
+# Safe-by-default (no config needed)
+docker run --rm \
+  -v ./fixtures:/fixtures \
+  -p 8081:8081 \
+  ghcr.io/httptape/httptape:latest \
+  record --upstream https://api.example.com \
+         --fixtures /fixtures \
+         --port 8081
+
+# Custom rules (config replaces the safe default)
 docker run --rm \
   -v ./fixtures:/fixtures \
   -v ./redact.json:/config/config.json:ro \
@@ -42,9 +52,20 @@ Note: the fixtures volume is mounted read-write (no `:ro`) so the recorder can w
 
 ## Proxy mode
 
-Forward to upstream with automatic fallback to cached responses:
+The container records safe-by-default: without `--config`, the same built-in safe sanitization pipeline is applied to L2 (disk) writes and a warning is printed to stderr. Supply `--config` to customise the pipeline.
 
 ```bash
+# Safe-by-default (no config needed)
+docker run --rm \
+  -v ./cache:/fixtures \
+  -p 8081:8081 \
+  ghcr.io/httptape/httptape:latest \
+  proxy --upstream https://api.example.com \
+        --fixtures /fixtures \
+        --port 8081 \
+        --cors
+
+# Custom rules (config replaces the safe default)
 docker run --rm \
   -v ./cache:/fixtures \
   -v ./redact.json:/config/config.json:ro \
@@ -57,7 +78,7 @@ docker run --rm \
         --cors
 ```
 
-The `--fixtures` volume stores the L2 (persistent, redacted) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
+The `--fixtures` volume stores the L2 (persistent, sanitized) cache. The L1 (in-memory) cache is managed internally and is lost when the container stops. Add `--fallback-on-5xx` to also fall back on upstream 5xx responses.
 
 See [Proxy Mode](proxy.md) for a full guide.
 
@@ -102,6 +123,8 @@ services:
 
 ### Record mode
 
+Safe sanitization is applied automatically without `--config`; mount a config only when you need custom rules.
+
 ```yaml
 services:
   recorder:
@@ -112,15 +135,12 @@ services:
       - https://api.example.com
       - --fixtures
       - /fixtures
-      - --config
-      - /config/config.json
       - --port
       - "8081"
     ports:
       - "8081:8081"
     volumes:
       - ./fixtures:/fixtures
-      - ./redact.json:/config/config.json:ro
 ```
 
 ### Proxy mode (frontend dev with fallback)

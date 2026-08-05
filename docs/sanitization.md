@@ -482,13 +482,16 @@ sanitizer := httptape.NewPipeline(
 
 ## CLI and Docker
 
-Redaction is available in all httptape modes (record, proxy) via a JSON config file:
+The `record` and `proxy` commands fail closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically and a warning naming what is redacted is printed to stderr. The safe default does **not** redact request or response bodies — use `--config` with `redact_body` or `fake` rules to cover secrets in bodies. Supply `--config` to replace the safe default with a custom pipeline; use `--unsafe-raw` to disable all sanitization (not recommended, prints a loud warning).
 
 ```bash
-# Record with redaction
+# Safe-by-default (no config needed — headers + query params + userinfo are redacted)
+httptape record --upstream https://api.example.com --fixtures ./mocks
+
+# Custom rules (config replaces the safe default)
 httptape record --upstream https://api.example.com --fixtures ./mocks --config redact.json
 
-# Proxy with redaction (applied to L2/disk cache only)
+# Proxy with custom rules (applied to L2/disk cache only)
 httptape proxy --upstream https://api.example.com --fixtures ./cache --config redact.json
 ```
 
