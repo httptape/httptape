@@ -96,7 +96,7 @@ Any value other than `"base64"` (including the legacy `"identity"` from v0.11) i
 httptape migrate-fixtures --recursive ./fixtures
 ```
 
-The migration tool reads each `.json` file, decodes any base64 bodies, removes the legacy `body_encoding` field, and writes the fixture in the new Content-Type-aware format. It is safe to run multiple times (idempotent). Note: the `body_encoding: "base64"` value introduced in v0.13+ is meaningful and is preserved by the migration tool.
+The migration tool reads each `.json` file, decodes any base64 bodies, removes the legacy `body_encoding` field, and writes the fixture in the new Content-Type-aware format. It is safe to run multiple times (idempotent). Note: the `body_encoding: "base64"` value introduced in v0.14.0 is meaningful and is preserved by the migration tool.
 
 ### URL format and matching
 

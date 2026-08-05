@@ -84,12 +84,13 @@
 //
 // # Sanitization
 //
-// Sensitive data is redacted or faked before any tape touches disk —
-// there is no "raw recording" mode. Sanitization is applied via a
-// [Pipeline] of [SanitizeFunc] functions, each of which transforms a
-// [Tape] in place and returns it.
+// Sensitive data is redacted or faked on write, before a tape is persisted
+// to a [Store], so recorded fixtures are safe to commit and share by
+// default. Sanitization is applied via a [Pipeline] of [SanitizeFunc]
+// functions; each receives a [Tape] and returns a (possibly modified) copy
+// -- implementations must not mutate the input Tape.
 //
-// Three surfaces are covered:
+// Four surfaces are covered:
 //   - Request and response headers: [RedactHeaders]
 //   - Request and response bodies (JSON field paths): [RedactBodyPaths],
 //     [FakeFields]
@@ -103,6 +104,8 @@
 //
 // Default sensitive header names are available via [DefaultSensitiveHeaders];
 // default sensitive query parameter names via [DefaultSensitiveQueryParams].
+// Sanitization is opt-in for library embedders (attach via [WithSanitizer]);
+// the CLI applies a safe default pipeline unless --unsafe-raw is passed.
 //
 // # Design principles
 //

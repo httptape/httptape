@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.14.0] - 2026-08-05
 
+### Module path change (breaking -- first release under the new org)
+
+v0.14.0 is the first tagged release published from the `httptape` GitHub
+org. v0.13.1 and earlier were tagged under `VibeWarden`. The Go module
+path, the `testcontainers` submodule path, and the container image
+namespace all changed:
+
+| | Before (≤ v0.13.1) | After (v0.14.0+) |
+|---|---|---|
+| Module path | `github.com/VibeWarden/httptape` | `github.com/httptape/httptape` |
+| `testcontainers` submodule path | `github.com/VibeWarden/httptape/testcontainers` | `github.com/httptape/httptape/testcontainers` |
+| Container image | `ghcr.io/vibewarden/httptape` | `ghcr.io/httptape/httptape` |
+
+**Migration:** update `go.mod` (and the `testcontainers/go.mod` submodule,
+if used) and every import site, then re-tidy:
+
+```bash
+grep -rl 'github.com/VibeWarden/httptape' --include='*.go' . go.mod | \
+  xargs sed -i '' 's#github.com/VibeWarden/httptape#github.com/httptape/httptape#g'
+go mod tidy
+```
+
+(#249, #250)
+
 ### Added
 
 - **Inbound TLS listener**: CLI commands `serve`, `record`, and `proxy`
@@ -91,10 +115,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`RedactQueryParams` / `FakeQueryParams`**: `SanitizeFunc` constructors
   that redact or deterministically fake URL query parameter values. Userinfo
   (`user:password@` in the authority) is always stripped, regardless of
-  which parameter names are configured. Both functions default to
-  `DefaultSensitiveQueryParams()` when called with no names. Fail-closed:
-  malformed percent-encoded query strings are replaced wholesale with
-  `[REDACTED]` rather than passed through as cleartext. (#295)
+  which parameter names are configured. `RedactQueryParams` defaults to
+  `DefaultSensitiveQueryParams()` when called with no names; `FakeQueryParams`
+  has no default -- called with no names, it fakes nothing (callers must pass
+  explicit parameter names). Fail-closed: malformed percent-encoded query
+  strings are replaced wholesale with `[REDACTED]` rather than passed through
+  as cleartext. (#295)
 
 - **`DefaultSensitiveQueryParams`**: returns a copy of the built-in list of
   query parameter names commonly carrying sensitive data (`api_key`,
@@ -111,6 +137,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stored as plain JSON strings are persisted as base64-encoded strings with an
   explicit `"body_encoding": "base64"` marker. Fixtures written before this
   change are unaffected (all-UTF-8 text bodies remain plain strings). (#303)
+
+- **`redact_query` / `fake_query` config actions**: declarative JSON config
+  `rules` now support `"action": "redact_query"` and `"action": "fake_query"`,
+  mapping to `RedactQueryParams` / `FakeQueryParams`. The new `Rule.Params`
+  field lists the URL query parameter names to sanitize. (#310)
 
 ### Security
 
@@ -129,6 +160,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is returned. (`serve` is unaffected — it relies on matcher-only configs
   legitimately.) (#306)
 
+- **Bundle import tar entry validation**: `ImportBundle` now rejects tar
+  entries with absolute paths, backslashes, or `..` path-traversal segments
+  before any entry is deserialized into a `Tape`. Defense in depth at the
+  bundle-parsing trust boundary for untrusted archives. (#218, #228)
+
 ### Fixed
 
 - **Single-flight key correctness**: the deduplication key for concurrent cache
@@ -138,14 +174,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   could incorrectly share one upstream call and receive the same response.
   (ADR-47, #294)
 
-- **SSE streams past upstream timeout**: SSE responses are now kept alive past
-  the `WithCacheUpstreamTimeout` deadline. The timeout previously applied to
-  the entire SSE stream duration; it now bounds only the header phase. (#300)
+- **SSE streams past upstream timeout**: `WithCacheUpstreamTimeout` previously
+  bounded the entire SSE stream duration, killing long-lived streams. It now
+  bounds only the header (time-to-first-byte) phase for SSE responses -- once
+  headers arrive, the timer is disarmed and the stream runs for its natural
+  lifetime. Buffered (non-SSE) responses are unaffected: the timeout still
+  covers the full upstream interaction, headers and body. (#300)
 
-- **Config schema for `redact_query` / `fake_query` actions**: the JSON config
-  schema now accepts `"redact_query"` and `"fake_query"` as sanitizer action
-  types. Legacy config actions that carry unrecognized fields now return an
-  error at load time rather than silently ignoring them. (#310)
+- **Config schema for `redact_query` / `fake_query` actions**: `config.schema.json`
+  now accepts `"redact_query"` and `"fake_query"` as sanitizer action types,
+  matching `Config.Validate`. See also the stray-`params` rejection for
+  legacy actions under Breaking Changes below. (#310)
 
 - **Non-UTF-8 text bodies persisted correctly**: text-typed response bodies
   containing non-UTF-8 byte sequences (e.g. Latin-1 encoded text) now survive
@@ -157,11 +196,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   buffered in the async channel. Previously, tapes in flight at shutdown time
   were silently dropped. (#304)
 
-- **`WithOnError` fires on racing-drop path**: `WithOnError` callbacks are now
-  also invoked when a tape is dropped because `RoundTrip` raced against
-  `Recorder.Close()`. Previously, only background drain-goroutine errors
-  triggered the callback; silent tape drops on the hot path were invisible to
-  callers. (#304)
+- **`WithOnError` fires on racing-drop path**: buffer-full drops and body
+  truncation notices already invoked `WithOnError` from the `RoundTrip`
+  goroutine. The one remaining silent path -- a tape dropped because
+  `RoundTrip` lost a race against `Recorder.Close()` -- now also invokes
+  `WithOnError`, so no tape drop is invisible to callers. (#304)
 
 ### Breaking Changes
 
@@ -180,6 +219,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`SSETimingAccelerated` signature change**: `SSETimingAccelerated(factor float64)`
   now returns `(SSETimingMode, error)` instead of `SSETimingMode`. Returns an
   error when factor is <= 0 instead of panicking. (#215, ADR-46)
+
+- **Legacy config actions now reject a stray `params` field**: `redact_headers`,
+  `redact_body`, and `fake` rules that include a `params` field now fail
+  `Config.Validate` (`"<action>" does not use "params"`) instead of silently
+  accepting and ignoring it. A config file that previously loaded
+  successfully with an errant `params` field on one of these actions will now
+  fail to load; remove the stray field or move it to a `redact_query` /
+  `fake_query` rule. (#310)
 
 - **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
   These now accept `*templateCtx` (unexported) instead of `*http.Request`.
