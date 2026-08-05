@@ -33,6 +33,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/httptape/httptape"
 )
@@ -1103,9 +1104,22 @@ func fixLegacyEndpoint(raw json.RawMessage, encoding string) json.RawMessage {
 			fields["body"] = json.RawMessage(reEncoded)
 		}
 	} else if parseErr == nil && httptape.IsText(mt) {
-		// Text: write as JSON string.
-		encoded, _ := json.Marshal(string(decoded))
-		fields["body"] = json.RawMessage(encoded)
+		if utf8.Valid(decoded) {
+			// Valid UTF-8 text: inline as a plain JSON string (v0.12+ format).
+			encoded, _ := json.Marshal(string(decoded))
+			fields["body"] = json.RawMessage(encoded)
+		} else {
+			// Non-UTF-8 text (Latin-1, Shift-JIS, etc.): encoding/json replaces
+			// invalid UTF-8 with U+FFFD, so we cannot inline these bytes as a plain
+			// JSON string without corruption. Keep the body as the base64 JSON string
+			// (bodyRaw is already the correct value) and re-add the body_encoding
+			// marker so the ADR-50 round-trip stays byte-identical. This also makes
+			// the migration tool idempotent: re-migrating a v0.13 non-UTF-8 fixture
+			// is a no-op.
+			fields["body"] = bodyRaw
+			markerVal, _ := json.Marshal("base64")
+			fields["body_encoding"] = json.RawMessage(markerVal)
+		}
 	} else {
 		// Binary or unknown: keep as base64 string (the new format's convention).
 		// Already a base64 string, so leave bodyRaw as-is.

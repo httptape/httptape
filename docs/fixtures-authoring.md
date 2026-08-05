@@ -59,23 +59,44 @@ Every fixture file is a single JSON object with these fields:
 
 The `body` field's JSON representation depends on the `Content-Type` header:
 
-| Content-Type | Body shape | Example |
-|---|---|---|
-| `application/json`, `+json` suffix | Native JSON object/array | `{"name": "Alice"}` |
-| `text/*`, `application/xml`, `application/javascript` | JSON string | `"Hello, world!"` |
-| Binary (`image/*`, `application/octet-stream`, etc.) | Base64-encoded string | `"aGVsbG8="` |
-| Missing or unknown | Base64-encoded string | `"aGVsbG8="` |
-| Nil or empty body | `null` | `null` |
+| Content-Type | Body bytes | Body shape | `body_encoding` field |
+|---|---|---|---|
+| `application/json`, `+json` suffix | Valid JSON | Native JSON object/array | absent |
+| `application/json`, `+json` suffix | Invalid JSON | Base64-encoded string | absent |
+| `text/*`, `application/xml`, `application/javascript` | Valid UTF-8 | JSON string | absent |
+| `text/*`, `application/xml`, `application/javascript` | Non-UTF-8 (Latin-1, Shift-JIS, …) | Base64-encoded string | `"base64"` |
+| Binary (`image/*`, `application/octet-stream`, etc.) | Any | Base64-encoded string | absent |
+| Missing or unknown | Any | Base64-encoded string | absent |
+| Nil or empty body | — | `null` | absent |
 
-This means JSON fixtures are human-readable: response bodies appear as native JSON objects, not opaque base64 strings.
+This means JSON fixtures are human-readable: response bodies appear as native JSON objects, not opaque base64 strings. UTF-8 text bodies appear as plain JSON strings.
 
-**Migrating from v0.11:** Fixtures created with v0.11 used base64 encoding for all bodies and included a `body_encoding` field. Use the migration tool to convert:
+#### The `body_encoding` field
+
+The `body_encoding` field is present only for non-UTF-8 text bodies (e.g., Latin-1, Shift-JIS, Windows-1252). When the field value is `"base64"`, unmarshal base64-decodes the `body` string regardless of the `Content-Type`. This marker disambiguates the non-UTF-8 text fallback from a legitimate UTF-8 text body that happens to look like a base64 string.
+
+Hand-authored fixtures for UTF-8 text do not need this field. Omit `body_encoding` and write the body as a plain JSON string:
+
+```json
+"body": "Hello, world!"
+```
+
+For non-UTF-8 text that you need to fixture by hand, base64-encode the raw bytes and add the marker:
+
+```json
+"body": "Y2Fm6SBhdSBsYWl0",
+"body_encoding": "base64"
+```
+
+Any value other than `"base64"` (including the legacy `"identity"` from v0.11) is ignored for JSON-string bodies.
+
+**Migrating from v0.11:** Fixtures created with v0.11 used base64 encoding for all bodies and included a `body_encoding: "identity"` field. Use the migration tool to convert:
 
 ```bash
 httptape migrate-fixtures --recursive ./fixtures
 ```
 
-The migration tool reads each `.json` file, decodes any base64 bodies, removes the `body_encoding` field, and writes the fixture in the new Content-Type-aware format. It is safe to run multiple times (idempotent).
+The migration tool reads each `.json` file, decodes any base64 bodies, removes the legacy `body_encoding` field, and writes the fixture in the new Content-Type-aware format. It is safe to run multiple times (idempotent). Note: the `body_encoding: "base64"` value introduced in v0.13+ is meaningful and is preserved by the migration tool.
 
 ### URL format and matching
 
