@@ -145,12 +145,15 @@ httptape proxy --upstream https://api.example.com \
 |------|---------|-------------|
 | `--upstream` | (required) | Upstream URL (e.g., `https://api.example.com`) |
 | `--fixtures` | (required) | Path to fixture directory for L2 cache |
-| `--config` | (none) | Path to redaction config JSON (applied to L2 writes only) |
+| `--config` | (none) | Path to sanitization config JSON (applied to L2 writes only). Replaces the built-in safe sanitization; if the config's `rules` list is empty, the safe default is layered in with a warning. Mutually exclusive with `--unsafe-raw`. |
+| `--unsafe-raw` | `false` | Disable all sanitization and record raw traffic to L2. Mutually exclusive with `--config`. Not recommended outside controlled environments. |
 | `--port` | `8081` | Listen port |
 | `--cors` | `false` | Enable CORS headers |
 | `--fallback-on-5xx` | `false` | Also fall back on 5xx responses from upstream |
 
-The L1 cache is always an in-memory store managed internally. The `--fixtures` directory is the L2 (persistent, redacted) cache.
+`proxy` fails closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically to L2 writes and a warning is printed to stderr. Bodies are NOT redacted by the safe default.
+
+The L1 cache is always an in-memory store managed internally. The `--fixtures` directory is the L2 (persistent, sanitized) cache.
 
 ## Docker
 

@@ -83,13 +83,16 @@ func main() {
 Or using the CLI:
 
 ```bash
-# Record from a real API (with redaction)
+# Record from a real API (safe-by-default sanitization applied automatically)
+httptape record --upstream https://api.github.com --fixtures ./mocks
+
+# Record with custom rules (config replaces the safe default)
 httptape record --upstream https://api.github.com --fixtures ./mocks --config redact.json
 
 # Replay as a mock server
 httptape serve --fixtures ./mocks --port 8081
 
-# Proxy with automatic fallback
+# Proxy with automatic fallback (safe-by-default; add --config for custom rules)
 httptape proxy --upstream https://api.github.com --fixtures ./cache
 ```
 

@@ -57,9 +57,8 @@ ts := httptest.NewServer(srv)
 Use httptape as a mock backend while building your UI -- no real backend needed.
 
 ```bash
-# Hand-write fixtures or record from a staging API
-httptape record --upstream https://staging-api.example.com \
-    --fixtures ./mocks --config redact.json
+# Record from a staging API (safe-by-default: sensitive headers + query params + userinfo redacted)
+httptape record --upstream https://staging-api.example.com --fixtures ./mocks
 
 # Serve as a mock backend for your frontend
 httptape serve --fixtures ./mocks --port 3001
@@ -71,23 +70,22 @@ Your frontend on `localhost:3000` hits httptape on `localhost:3001`. Edit JSON f
 Record a sample of live traffic, safely redacted:
 
 ```bash
-docker run -v ./fixtures:/fixtures -v ./config.json:/config/config.json \
+docker run -v ./fixtures:/fixtures \
     tibtof/httptape record \
     --upstream https://api.internal:8080 \
-    --fixtures /fixtures --config /config/config.json
+    --fixtures /fixtures
 ```
 
-Sensitive data (secrets, PII) is redacted before it touches disk. Export redacted fixtures for dev/CI use.
+`record` fails closed: sensitive headers, query params, and URL userinfo are redacted automatically before anything touches disk. A warning names exactly what is covered; use `--config` to add body-level rules or customise the pipeline.
 
 ### Fallback proxy
 Use proxy mode for frontend development with automatic fallback to cached responses when the backend is unavailable:
 
 ```bash
-httptape proxy --upstream https://api.example.com \
-    --fixtures ./cache --config redact.json
+httptape proxy --upstream https://api.example.com --fixtures ./cache
 ```
 
-When the upstream is reachable, requests are forwarded and responses are cached in two tiers (L1 in-memory, L2 on disk). When the upstream is down, httptape transparently serves cached responses. See [Proxy Mode](https://httptape.dev/docs/proxy/) for details.
+`proxy` fails closed: the same built-in safe sanitization pipeline is applied to L2 (disk) writes automatically. When the upstream is reachable, requests are forwarded and responses are cached in two tiers (L1 in-memory, L2 on disk). When the upstream is down, httptape transparently serves cached responses. Use `--config` to customise the sanitization pipeline. See [Proxy Mode](https://httptape.dev/docs/proxy/) for details.
 
 ### Recording LLM streaming responses
 Record SSE streams from OpenAI, Anthropic, or any SSE-based API. Each event is stored individually with timing metadata, so replay can simulate the original streaming behavior.
@@ -291,11 +289,14 @@ httptape.ImportBundle(ctx, store, r)
 
 ```bash
 httptape serve   --fixtures ./mocks --port 8081
-httptape record  --upstream https://api.example.com --fixtures ./mocks --config redact.json
-httptape proxy   --upstream https://api.example.com --fixtures ./cache --config redact.json
+httptape record  --upstream https://api.example.com --fixtures ./mocks          # safe-by-default
+httptape record  --upstream https://api.example.com --fixtures ./mocks --config redact.json  # custom rules
+httptape proxy   --upstream https://api.example.com --fixtures ./cache          # safe-by-default
 httptape export  --fixtures ./mocks --output bundle.tar.gz
 httptape import  --fixtures ./mocks --input bundle.tar.gz
 ```
+
+`record` and `proxy` fail closed: without `--config`, a built-in safe sanitization pipeline (default sensitive headers, query params, and URL userinfo) is applied automatically. Use `--config` to supply custom rules; use `--unsafe-raw` to disable all sanitization (not recommended).
 
 ## Docker
 
@@ -314,15 +315,18 @@ freely.
 # Replay mode
 docker run -v ./mocks:/fixtures -p 8081:8081 tibtof/httptape serve --fixtures /fixtures
 
-# Record mode (with redaction)
+# Record mode (safe-by-default — no config needed)
+docker run -v ./mocks:/fixtures -p 8081:8081 \
+    tibtof/httptape record --upstream https://api.example.com --fixtures /fixtures
+
+# Record mode (custom rules)
 docker run -v ./mocks:/fixtures -v ./config.json:/config/config.json -p 8081:8081 \
     tibtof/httptape record --upstream https://api.example.com \
     --fixtures /fixtures --config /config/config.json
 
-# Proxy mode (with fallback-to-cache)
-docker run -v ./cache:/fixtures -v ./config.json:/config/config.json -p 8081:8081 \
-    tibtof/httptape proxy --upstream https://api.example.com \
-    --fixtures /fixtures --config /config/config.json
+# Proxy mode (safe-by-default — no config needed)
+docker run -v ./cache:/fixtures -p 8081:8081 \
+    tibtof/httptape proxy --upstream https://api.example.com --fixtures /fixtures
 ```
 
 ## Testcontainers
