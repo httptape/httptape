@@ -448,7 +448,10 @@ func (r *Recorder) persistTape(ctx context.Context, tape Tape) {
 		r.sendMu.Lock()
 		if r.closed.Load() {
 			r.sendMu.Unlock()
-			// recorder closed -- drop tape silently
+			// recorder already closed; notify via onError so data loss is visible
+			if r.onError != nil {
+				r.onError(fmt.Errorf("httptape: recorder closed, tape dropped"))
+			}
 		} else {
 			select {
 			case r.tapeCh <- tape:

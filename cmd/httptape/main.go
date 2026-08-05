@@ -519,6 +519,18 @@ func runRecord(args []string) error {
 	}
 
 	recorder := httptape.NewRecorder(store, recorderOpts...)
+	// Drain async recordings synchronously before runRecord returns so that
+	// buffered tapes are never dropped on SIGINT. Without this defer,
+	// ListenAndServe returns (triggering run() exit) before the signal
+	// goroutine reaches recorder.Close(), losing all queued tapes. Close is
+	// idempotent via sync.Once, so the goroutine's Close (if reached) is safe.
+	defer func() {
+		if err := recorder.Close(); err != nil {
+			logger.Printf("recorder close error: %v", err)
+		} else {
+			logger.Println("recorder flushed")
+		}
+	}()
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -568,11 +580,7 @@ func runRecord(args []string) error {
 			logger.Printf("graceful shutdown failed: %v, forcing close", err)
 			httpServer.Close()
 		}
-		if err := recorder.Close(); err != nil {
-			logger.Printf("recorder close error: %v", err)
-		} else {
-			logger.Println("recorder flushed")
-		}
+		// recorder.Close() is handled by the defer above; no call needed here.
 	}()
 
 	scheme := "http"
