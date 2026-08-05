@@ -26,7 +26,8 @@ if used) and every import site, then re-tidy:
 
 ```bash
 grep -rl 'github.com/VibeWarden/httptape' --include='*.go' . go.mod | \
-  xargs sed -i '' 's#github.com/VibeWarden/httptape#github.com/httptape/httptape#g'
+  xargs sed -i.bak 's#github.com/VibeWarden/httptape#github.com/httptape/httptape#g'
+find . -name '*.bak' -delete
 go mod tidy
 ```
 
@@ -141,7 +142,7 @@ go mod tidy
 - **`redact_query` / `fake_query` config actions**: declarative JSON config
   `rules` now support `"action": "redact_query"` and `"action": "fake_query"`,
   mapping to `RedactQueryParams` / `FakeQueryParams`. The new `Rule.Params`
-  field lists the URL query parameter names to sanitize. (#310)
+  field lists the URL query parameter names to sanitize. (#295)
 
 ### Security
 

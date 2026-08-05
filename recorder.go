@@ -123,7 +123,7 @@ func WithBufferSize(size int) RecorderOption {
 // WithOnError sets a callback invoked when a store write fails or a tape is
 // dropped. The callback may be called from the background drain goroutine
 // (async write errors) or from the RoundTrip goroutine (buffer-full drops,
-// body-truncation notices, and -- since #341 -- the case where RoundTrip
+// body-truncation notices, and -- since v0.14.0 -- the case where RoundTrip
 // loses a race against Close and the tape is dropped post-close). It must
 // be safe for concurrent use. Defaults to a no-op (errors are discarded).
 func WithOnError(fn func(error)) RecorderOption {
