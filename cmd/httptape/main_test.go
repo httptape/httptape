@@ -1603,14 +1603,12 @@ func runLiveCommandAndCapture(
 		t.Fatal("CLI did not exit after SIGINT")
 	}
 
-	// The recorder's Close() (which flushes async writes to disk) runs in the
-	// shutdown goroutine after httpServer.Shutdown returns. Because
-	// ListenAndServe returns as soon as Shutdown signals it, run() exits before
-	// the flush goroutine finishes. Poll until a fixture file appears so we can
-	// be confident the flush — and its final logger write ("recorder flushed")
-	// — has completed before we close the pipe and restore logger. Closing the
-	// pipe while the goroutine still holds a reference to the redirected logger
-	// would be a data race.
+	// After the fix for issue #304, recorder.Close() is called synchronously via
+	// defer in runRecord before run() returns. The fixture is therefore on disk
+	// when <-done unblocks. The short poll below is a safety net for proxy tests
+	// (where tapeProxy.Close is also deferred) and for any edge case where the
+	// OS write buffer is not yet visible. It exits in the first iteration when
+	// the fixture is already present.
 	flushDeadline := time.Now().Add(3 * time.Second)
 	for {
 		entries, _ := os.ReadDir(fixturesDir)
@@ -1625,10 +1623,9 @@ func runLiveCommandAndCapture(
 		time.Sleep(10 * time.Millisecond)
 	}
 flushed:
-	// Add a small settle window for the goroutine's final logger.Println call
-	// (e.g. "recorder flushed") to complete before we restore the logger.
-	// The file poll above confirms the write finished, but the goroutine may
-	// still be executing the logger call itself.
+	// Small settle window so any goroutine still holding a reference to the
+	// redirected logger (e.g. the proxy shutdown goroutine) has time to finish
+	// its final write before we close the pipe and restore the logger.
 	time.Sleep(25 * time.Millisecond)
 
 	w.Close()
@@ -2196,6 +2193,95 @@ func TestRecordUnsafeRawPlusConfigDoesNotTouchDisk(t *testing.T) {
 	}
 	if _, err := os.Stat(nestedFixtures); !os.IsNotExist(err) {
 		t.Errorf("fixtures dir %q was created despite usage error (disk access must not precede the check)", nestedFixtures)
+	}
+}
+
+// TestRecordPersistsBufferedTapesOnInterrupt is a regression test for issue #304.
+//
+// Before the fix, recorder.Close() (which drains the async tape channel to disk)
+// was called only inside the signal-handler goroutine, after httpServer.Shutdown
+// returned. ListenAndServe returns as soon as Shutdown is called, so run() exited
+// and os.Exit terminated the process while the goroutine was still flushing —
+// dropping all buffered tapes.
+//
+// After the fix, recorder.Close() is called via defer in runRecord, which executes
+// synchronously before run() returns. All buffered tapes must be on disk by the
+// time the done channel is unblocked — no additional polling is needed.
+func TestRecordPersistsBufferedTapesOnInterrupt(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	fixturesDir := t.TempDir()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{
+			"record",
+			"--upstream", upstream.URL,
+			"--fixtures", fixturesDir,
+			"--port", itoa(port),
+			"--unsafe-raw",
+		})
+	}()
+
+	// Wait for the listener to be ready.
+	addr := "127.0.0.1:" + itoa(port)
+	listenerDeadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		if time.Now().After(listenerDeadline) {
+			t.Fatalf("listener never came up: %v", dialErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Make a probe request so that a tape is queued in the recorder's async channel.
+	resp, err := http.Get("http://" + addr + "/probe")
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	// Send SIGINT to trigger graceful shutdown.
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Signal(os.Interrupt)
+
+	// Wait for run() to return. With the fix, recorder.Close() completes (draining
+	// the async channel) inside a defer before run() returns, so all buffered tapes
+	// are guaranteed to be on disk by this point — no additional sleep or polling.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("record command did not exit after SIGINT")
+	}
+
+	// The fixture must be present immediately after run() returns.
+	// A missing fixture indicates the async drain raced with process exit.
+	entries, err := os.ReadDir(fixturesDir)
+	if err != nil {
+		t.Fatalf("read fixtures dir: %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".json" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("no fixture found after record exited: buffered tapes were not drained synchronously before exit (issue #304)")
 	}
 }
 
