@@ -247,6 +247,8 @@ func (p *Pipeline) Sanitize(t Tape) Tape // implements Sanitizer
 | RedactBodyPaths | `RedactBodyPaths(paths ...string) SanitizeFunc` |
 | FakeFields | `FakeFields(seed string, paths ...string) SanitizeFunc` |
 | FakeFieldsWith | `FakeFieldsWith(seed string, fields map[string]Faker) SanitizeFunc` |
+| RedactQueryParams | `RedactQueryParams(names ...string) SanitizeFunc` |
+| FakeQueryParams | `FakeQueryParams(seed string, names ...string) SanitizeFunc` |
 
 ### Faker interface
 
@@ -285,6 +287,7 @@ PII-shaped and generic fakers leave non-string inputs unchanged. `RedactedFaker`
 const Redacted = "[REDACTED]"
 
 func DefaultSensitiveHeaders() []string
+func DefaultSensitiveQueryParams() []string
 ```
 
 **Details:** [Redaction](sanitization.md#typed-fakers)
@@ -433,8 +436,9 @@ type MatcherConfig struct {
 }
 
 type CriterionConfig struct {
-    Type  string   `json:"type"`
-    Paths []string `json:"paths,omitempty"`
+    Type    string   `json:"type"`
+    Paths   []string `json:"paths,omitempty"`
+    Pattern string   `json:"pattern,omitempty"`
 }
 
 type Rule struct {
@@ -443,13 +447,14 @@ type Rule struct {
     Paths   []string       `json:"paths,omitempty"`
     Seed    string         `json:"seed,omitempty"`
     Fields  map[string]any `json:"fields,omitempty"`
+    Params  []string       `json:"params,omitempty"`
 }
 
 func LoadConfig(r io.Reader) (*Config, error)
 func LoadConfigFile(path string) (*Config, error)
 func (c *Config) Validate() error
 func (c *Config) BuildPipeline() *Pipeline
-func (c *Config) BuildMatcher() *CompositeMatcher // returns nil when no matcher section
+func (c *Config) BuildMatcher() (Matcher, error)
 ```
 
 For `fake` rules, set either `Paths` (for auto-detect, mapping to `FakeFields`) or `Fields` (for typed fakers, mapping to `FakeFieldsWith`) -- the two are mutually exclusive. Each value in `Fields` is either a string shorthand (for example `"email"`) or an object (for example `{"type": "numeric", "length": 3}`). See [Config -> Typed fake fields](config.md#typed-fake-fields) for the full syntax.
@@ -480,6 +485,8 @@ const (
     ActionRedactHeaders = "redact_headers"
     ActionRedactBody    = "redact_body"
     ActionFake          = "fake"
+    ActionRedactQuery   = "redact_query"
+    ActionFakeQuery     = "fake_query"
 )
 ```
 

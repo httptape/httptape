@@ -68,6 +68,8 @@ sanitizer := httptape.NewPipeline(
 - RedactHeaders: replace header values with "[REDACTED]"
 - RedactBodyPaths: type-aware JSON field redaction
 - FakeFields: deterministic HMAC-SHA256 fakes (emails, UUIDs, numbers, strings)
+- RedactQueryParams: replace URL query-param values with "[REDACTED]"; strips userinfo unconditionally
+- FakeQueryParams: deterministic HMAC-SHA256 fakes for URL query-param values; strips userinfo unconditionally
 - RedactSSEEventData: redact fields within each SSE event's JSON data
 - FakeSSEEventData: deterministic faking within each SSE event's JSON data
 
@@ -191,12 +193,15 @@ docker pull ghcr.io/httptape/httptape:latest
  ]},
  "rules":[
   {"action":"redact_headers","headers":["Authorization"]},
+  {"action":"redact_query","params":["api_key","access_token"]},
   {"action":"redact_body","paths":["$.password"]},
-  {"action":"fake","seed":"s","paths":["$.email"]}
+  {"action":"fake","seed":"s","paths":["$.email"]},
+  {"action":"fake_query","seed":"s","params":["sig"]}
 ]}
 ```
 
-Matcher criterion types: method, path, body_fuzzy (requires paths), content_negotiation.
+Actions: redact_headers, redact_body, fake, redact_query, fake_query.
+Matcher criterion types: method, path, body_fuzzy (requires paths), content_negotiation, path_pattern.
 
 ## How it compares
 

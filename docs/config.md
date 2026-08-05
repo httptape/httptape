@@ -119,6 +119,38 @@ Maps to `RedactBodyPaths()`. Redacts specific fields in JSON bodies.
 
 The `paths` field is required and must be non-empty.
 
+### redact_query
+
+Maps to `RedactQueryParams()`. Replaces URL query-parameter values with `"[REDACTED]"`. Userinfo credentials (`user:pass@host`) are unconditionally stripped as well.
+
+```json
+{ "action": "redact_query" }
+```
+
+Optionally specify which parameters to redact (default: `DefaultSensitiveQueryParams`):
+
+```json
+{ "action": "redact_query", "params": ["api_key", "access_token", "sig"] }
+```
+
+The `params` field is optional. When omitted or empty, the default sensitive parameter list is used: `api_key`, `access_token`, `token`, `secret`, `password`, `sig`, `signature`, `X-Amz-Signature`, `X-Goog-Signature`.
+
+Parameter name matching is **case-sensitive** per RFC 3986 (unlike header matching, which is case-insensitive). `api_key` does not redact `API_KEY`.
+
+If the URL's query string contains malformed percent-encoding (e.g., `?api_key=ab%ZZcd`), the entire query string is replaced with `[REDACTED]` rather than passing through (fail-closed behavior).
+
+### fake_query
+
+Maps to `FakeQueryParams()`. Replaces URL query-parameter values with deterministic HMAC-based fakes. Userinfo credentials (`user:pass@host`) are unconditionally stripped as well.
+
+```json
+{ "action": "fake_query", "seed": "my-project-seed", "params": ["api_key", "access_token"] }
+```
+
+Both `seed` and `params` are required. An empty `params` array is rejected as a likely misconfiguration (use `redact_query` if you want a default list).
+
+The same seed and original value always produce the same fake output (deterministic HMAC-SHA256). Case-sensitive name matching applies.
+
 ### fake
 
 Replaces values with deterministic HMAC-based fakes. The `seed` field is always required. The faking strategy is selected by which other field you set:
@@ -245,7 +277,7 @@ err := cfg.Validate()
 Validation checks:
 - Version must be `"1"`
 - Rules may be empty only when a `matcher` section is present (the config is matcher-only)
-- Each rule must have a known action (`redact_headers`, `redact_body`, `fake`)
+- Each rule must have a known action (`redact_headers`, `redact_body`, `fake`, `redact_query`, `fake_query`)
 - Action-specific required fields must be present
 - All paths must use valid JSONPath-like syntax (`$.field`, `$.nested.field`, `$.array[*].field`)
 - Fields irrelevant to an action are rejected (e.g., `paths` on `redact_headers`)
@@ -258,6 +290,15 @@ Additional rules for `fake`:
 - Each value in `fields` must be either a known string shorthand or an object with a known `type`.
 - Object-form fakers must include their required parameters (`numeric.length`, `pattern.pattern`, `prefix.prefix`, `fixed.value`); `date.format` is optional.
 - Anything else (numbers, arrays, nulls) as a `fields` value is rejected.
+
+Additional rules for `redact_query`:
+- `params` is optional. When omitted, `DefaultSensitiveQueryParams` is used.
+- Fields irrelevant to this action are rejected (`paths`, `seed`, `fields`, `headers`).
+
+Additional rules for `fake_query`:
+- `seed` must be present and non-empty.
+- `params` must be present and non-empty (an empty list is rejected as a likely misconfiguration).
+- Fields irrelevant to this action are rejected (`paths`, `fields`, `headers`).
 
 Additional rules for `matcher`:
 - `criteria` must be a non-empty array.
@@ -289,6 +330,10 @@ Reference it in your config file:
     {
       "action": "redact_headers",
       "headers": ["Authorization", "Cookie", "X-Api-Key"]
+    },
+    {
+      "action": "redact_query",
+      "params": ["api_key", "access_token"]
     },
     {
       "action": "redact_body",

@@ -168,6 +168,9 @@ func (c *Config) Validate() error {
 			if rule.Seed != "" {
 				errs = append(errs, fmt.Sprintf("%s: %q does not use \"seed\"", prefix, rule.Action))
 			}
+			if len(rule.Params) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"params\"", prefix, rule.Action))
+			}
 
 		case ActionRedactBody:
 			if len(rule.Paths) == 0 {
@@ -183,6 +186,9 @@ func (c *Config) Validate() error {
 			}
 			if rule.Seed != "" {
 				errs = append(errs, fmt.Sprintf("%s: %q does not use \"seed\"", prefix, rule.Action))
+			}
+			if len(rule.Params) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"params\"", prefix, rule.Action))
 			}
 
 		case ActionFake:
@@ -212,6 +218,9 @@ func (c *Config) Validate() error {
 			}
 			if len(rule.Headers) > 0 {
 				errs = append(errs, fmt.Sprintf("%s: %q does not use \"headers\"", prefix, rule.Action))
+			}
+			if len(rule.Params) > 0 {
+				errs = append(errs, fmt.Sprintf("%s: %q does not use \"params\"", prefix, rule.Action))
 			}
 
 		case ActionRedactQuery:

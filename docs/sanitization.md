@@ -25,6 +25,7 @@ type Sanitizer interface {
 ```go
 sanitizer := httptape.NewPipeline(
     httptape.RedactHeaders(),
+    httptape.RedactQueryParams(),
     httptape.RedactBodyPaths("$.password", "$.ssn"),
     httptape.FakeFields("my-seed", "$.email", "$.user_id"),
 )
@@ -34,7 +35,7 @@ rec := httptape.NewRecorder(store,
 )
 ```
 
-Functions are applied in order. In this example: headers are redacted first, then body fields are redacted, then remaining fields get deterministic fakes.
+Functions are applied in order. In this example: headers are redacted first, then URL query parameters are redacted, then body fields are redacted, then remaining fields get deterministic fakes.
 
 ## RedactHeaders
 
@@ -401,6 +402,63 @@ sanitizer := httptape.NewPipeline(
 
 Make sure your implementation is deterministic (same seed + original always produces the same output) and does not mutate `original` -- httptape passes the value pulled out of `json.Unmarshal` directly.
 
+## RedactQueryParams
+
+Replaces URL query-parameter values with `"[REDACTED]"` in `t.Request.URL`. Userinfo credentials (`user:pass@host`) are unconditionally stripped as well, regardless of which parameter names are configured.
+
+```go
+// Redact the default sensitive query parameters:
+httptape.RedactQueryParams()
+
+// Redact specific named parameters:
+httptape.RedactQueryParams("api_key", "access_token", "sig")
+```
+
+Default sensitive parameters (used when called with no arguments):
+- `api_key` -- generic API key authentication
+- `access_token` -- OAuth access tokens
+- `token` -- generic tokens
+- `secret` -- generic secrets
+- `password` -- plaintext passwords in URLs
+- `sig` -- presigned URL signatures (short form)
+- `signature` -- presigned URL signatures (long form)
+- `X-Amz-Signature` -- AWS presigned URL signature
+- `X-Goog-Signature` -- Google Cloud presigned URL signature
+
+You can retrieve the default list programmatically:
+
+```go
+defaults := httptape.DefaultSensitiveQueryParams()
+```
+
+Parameter name matching is **case-sensitive** per RFC 3986. `api_key` does not match `API_KEY`. This is intentional: query keys are case-sensitive by specification, and silent case-folding would risk redacting the wrong parameter.
+
+**Fail-closed behavior:** if the URL's query string contains malformed percent-encoding (e.g., `?api_key=ab%ZZcd`), the entire query string is replaced with `[REDACTED]` rather than passed through. This prevents cleartext secrets from reaching disk when a value cannot be safely decoded.
+
+**Fragment handling:** OAuth implicit-flow tokens and some presigned-URL schemes embed credentials in the URL fragment (`#access_token=...`). `RedactQueryParams` applies the same name-based redaction to fragment key=value pairs. On a fragment parse error the entire fragment is replaced with `[REDACTED]`.
+
+**Byte-stable on no-match:** when no configured parameter name matches and no userinfo is present, the URL is returned byte-identical (no re-encoding, no key reordering). When a match occurs or userinfo is stripped, the query string is re-encoded and keys may be re-sorted alphabetically -- this is safe for all built-in matchers, which compare by key/value map, not by string order.
+
+Headers, body, and response are left byte-identical after URL sanitization.
+
+If the URL fails to parse structurally (invalid scheme, etc.), it is returned unchanged (silent skip, consistent with body sanitization behavior).
+
+## FakeQueryParams
+
+Replaces URL query-parameter values with deterministic HMAC-SHA256 fakes. Userinfo credentials (`user:pass@host`) are unconditionally stripped as well.
+
+```go
+httptape.FakeQueryParams("my-project-seed", "api_key", "access_token")
+```
+
+The first argument is the project-level seed (same as `FakeFields`). The same seed and original value always produce the same fake output. Different seeds produce different outputs. Use the same seed as the rest of your sanitization pipeline to maintain cross-fixture consistency.
+
+The fake value is computed as `fakeString(HMAC-SHA256(seed, original_value))`, producing a `"fake_<hex>"` string. This is the same algorithm used by `HMACFaker` for generic string fields.
+
+All the same behavioral guarantees as `RedactQueryParams` apply: case-sensitive name matching, fail-closed on malformed query/fragment, unconditional userinfo stripping, byte-stable on no-match.
+
+The declarative config equivalent is the `fake_query` action. Unlike `redact_query`, the `params` field is required for `fake_query` -- an empty list is rejected as a likely misconfiguration.
+
 ## Combining redaction and faking
 
 Order matters. Typically, redact first (remove things that should be gone entirely), then fake (replace things that need consistent stand-in values):
@@ -445,13 +503,14 @@ Instead of building pipelines in code, you can define redaction rules in a JSON 
   "version": "1",
   "rules": [
     { "action": "redact_headers" },
+    { "action": "redact_query" },
     { "action": "redact_body", "paths": ["$.password"] },
     { "action": "fake", "seed": "my-seed", "paths": ["$.user.email"] }
   ]
 }
 ```
 
-The `fake` action also accepts a `fields` map that selects a typed faker per path -- the JSON-config equivalent of `FakeFieldsWith`. See [Config](config.md#typed-fake-fields) for syntax and the full list of shorthands.
+The `fake` action also accepts a `fields` map that selects a typed faker per path -- the JSON-config equivalent of `FakeFieldsWith`. The `fake_query` action is the config equivalent of `FakeQueryParams`. See [Config](config.md) for the full config syntax and all supported actions.
 
 ## SSE event redaction
 
