@@ -886,6 +886,157 @@ func TestMigrateFixtures_AlreadyMigratedTape(t *testing.T) {
 	}
 }
 
+// TestMigrateFixtures_NonUTF8TextBody covers the three migration scenarios
+// introduced by ADR-50 (body_encoding:"base64" marker for non-UTF-8 text bodies):
+//
+//  1. A v0.11 legacy fixture whose decoded text body is non-UTF-8 (Latin-1, etc.)
+//     must be migrated to the ADR-50 format: base64 body + body_encoding:"base64".
+//  2. A v0.11 legacy fixture whose decoded text body is valid UTF-8 must still be
+//     inlined as a plain JSON string with no marker (existing behavior).
+//  3. A v0.13 fixture that already carries the body_encoding:"base64" marker for a
+//     non-UTF-8 text body must be a byte-identical no-op after migration
+//     (idempotency guarantee).
+func TestMigrateFixtures_NonUTF8TextBody(t *testing.T) {
+	// "café au lait" in ISO-8859-1: 0xe9 is the Latin-1 code point for é.
+	// base64.StdEncoding.EncodeToString([]byte("caf\xe9 au lait")) == "Y2Fm6SBhdSBsYWl0"
+	const latin1B64 = "Y2Fm6SBhdSBsYWl0"
+
+	// "hello" in plain ASCII — valid UTF-8.
+	// base64.StdEncoding.EncodeToString([]byte("hello")) == "aGVsbG8="
+	const asciiB64 = "aGVsbG8="
+
+	tests := []struct {
+		name         string
+		fixture      string
+		wantB64Body  bool   // true → body field must remain a base64 string
+		wantMarker   bool   // true → body_encoding:"base64" must be present
+		wantBodyText string // if non-empty, the body field must contain this substring
+	}{
+		{
+			name: "v0.11 legacy fixture with non-UTF-8 text body keeps base64 and gets ADR-50 marker",
+			fixture: `{
+  "id": "non-utf8-001",
+  "route": "api",
+  "recorded_at": "2026-01-01T00:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "http://example.com/api",
+    "headers": {"Content-Type": ["text/plain; charset=iso-8859-1"]},
+    "body": "` + latin1B64 + `",
+    "body_hash": "",
+    "body_encoding": "base64"
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["application/json"]},
+    "body": {"ok": true}
+  }
+}`,
+			wantB64Body:  true,
+			wantMarker:   true,
+			wantBodyText: latin1B64,
+		},
+		{
+			name: "v0.11 legacy fixture with valid UTF-8 text body is inlined as plain string",
+			fixture: `{
+  "id": "utf8-001",
+  "route": "api",
+  "recorded_at": "2026-01-01T00:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "http://example.com/api",
+    "headers": {"Content-Type": ["text/plain"]},
+    "body": "` + asciiB64 + `",
+    "body_hash": "",
+    "body_encoding": "base64"
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["application/json"]},
+    "body": {"ok": true}
+  }
+}`,
+			wantB64Body:  false,
+			wantMarker:   false,
+			wantBodyText: `"hello"`,
+		},
+		{
+			name: "v0.13 fixture with body_encoding:base64 marker is idempotent no-op",
+			fixture: `{
+  "id": "non-utf8-v13-001",
+  "route": "api",
+  "recorded_at": "2026-01-01T00:00:00Z",
+  "request": {
+    "method": "POST",
+    "url": "http://example.com/api",
+    "headers": {"Content-Type": ["text/plain; charset=iso-8859-1"]},
+    "body": "` + latin1B64 + `",
+    "body_encoding": "base64",
+    "body_hash": ""
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {"Content-Type": ["application/json"]},
+    "body": {"ok": true}
+  }
+}`,
+			wantB64Body:  true,
+			wantMarker:   true,
+			wantBodyText: latin1B64,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "tape.json")
+			if err := os.WriteFile(path, []byte(tt.fixture), 0644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+
+			got := run([]string{"migrate-fixtures", dir})
+			if got != exitOK {
+				t.Fatalf("migrate-fixtures exit = %d, want %d", got, exitOK)
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read migrated fixture: %v", err)
+			}
+			s := string(data)
+
+			hasMarker := strings.Contains(s, `"body_encoding": "base64"`) ||
+				strings.Contains(s, `"body_encoding":"base64"`)
+
+			if tt.wantMarker && !hasMarker {
+				t.Errorf("expected body_encoding:base64 in output, got:\n%s", s)
+			}
+			if !tt.wantMarker && hasMarker {
+				t.Errorf("unexpected body_encoding field in output, got:\n%s", s)
+			}
+
+			if tt.wantBodyText != "" && !strings.Contains(s, tt.wantBodyText) {
+				t.Errorf("expected body to contain %q in output, got:\n%s", tt.wantBodyText, s)
+			}
+
+			// For the idempotency case: migrate again and assert byte-identical output.
+			if tt.wantMarker {
+				got2 := run([]string{"migrate-fixtures", dir})
+				if got2 != exitOK {
+					t.Fatalf("second migrate-fixtures exit = %d, want %d", got2, exitOK)
+				}
+				data2, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read after second migration: %v", err)
+				}
+				if string(data2) != string(data) {
+					t.Errorf("migration is not idempotent:\n  first:  %s\n  second: %s", data, data2)
+				}
+			}
+		})
+	}
+}
+
 func TestServeWithSynthesize(t *testing.T) {
 	// --synthesize flag should be accepted without error.
 	got := run([]string{"serve", "--fixtures", t.TempDir(), "--synthesize", "-h"})
