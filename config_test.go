@@ -118,6 +118,21 @@ func TestLoadConfig_ValidationErrors(t *testing.T) {
 			input:   `{"version": "1", "rules": [{"action": "fake", "seed": "s", "paths": ["$.x"], "headers": ["Auth"]}]}`,
 			wantErr: `does not use "headers"`,
 		},
+		{
+			name:    "redact_headers rejects stray params field",
+			input:   `{"version": "1", "rules": [{"action": "redact_headers", "params": ["api_key"]}]}`,
+			wantErr: `does not use "params"`,
+		},
+		{
+			name:    "redact_body rejects stray params field",
+			input:   `{"version": "1", "rules": [{"action": "redact_body", "paths": ["$.x"], "params": ["api_key"]}]}`,
+			wantErr: `does not use "params"`,
+		},
+		{
+			name:    "fake rejects stray params field",
+			input:   `{"version": "1", "rules": [{"action": "fake", "seed": "s", "paths": ["$.x"], "params": ["api_key"]}]}`,
+			wantErr: `does not use "params"`,
+		},
 	}
 
 	for _, tt := range tests {

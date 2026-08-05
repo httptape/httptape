@@ -217,6 +217,46 @@
               }
             ],
             "additionalProperties": false
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "redact_query"
+              },
+              "params": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "URL query parameter names to redact. Case-sensitive (RFC 3986). If omitted or empty, DefaultSensitiveQueryParams are used (api_key, access_token, token, secret, password, sig, signature, X-Amz-Signature, X-Goog-Signature). Userinfo (user:pass@host) is always stripped regardless of this list."
+              }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "action": {
+                "const": "fake_query"
+              },
+              "seed": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Project-level seed for HMAC-SHA256 deterministic faking. Same seed + same input = same fake output."
+              },
+              "params": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1,
+                "description": "URL query parameter names to fake. Case-sensitive (RFC 3986). Required and must be non-empty; an empty list is rejected as a likely misconfiguration. Userinfo (user:pass@host) is always stripped regardless of this list."
+              }
+            },
+            "required": ["action", "seed", "params"],
+            "additionalProperties": false
           }
         ]
       }
