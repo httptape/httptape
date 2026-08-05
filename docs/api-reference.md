@@ -154,7 +154,7 @@ Panics if `upstream` or `store` is nil.
 ```go
 type Proxy struct { /* unexported */ }
 
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
 ```
 

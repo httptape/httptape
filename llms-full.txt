@@ -78,7 +78,7 @@ sanitizer := httptape.NewPipeline(
 ## Replay
 
 ```go
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+srv, _ := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ts := httptest.NewServer(srv)
 ```
 
@@ -130,7 +130,7 @@ onError callback. Never affect the response returned to the caller.
 ## Proxy (fallback-to-cache)
 
 ```go
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 // L1 = MemoryStore (raw, ephemeral), L2 = FileStore (redacted, persistent)
 // Success: cache to both, return real response
 // Failure: fallback L1 -> L2 -> original error
@@ -234,9 +234,9 @@ Standalone server + CLI, sanitize-on-write by default, SSE event-level replay, p
 
 ```go
 func NewRecorder(store Store, opts ...RecorderOption) *Recorder
-func NewServer(store Store, opts ...ServerOption) *Server
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
 func NewCachingTransport(upstream http.RoundTripper, store Store, opts ...CachingOption) *CachingTransport
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 func NewPipeline(funcs ...SanitizeFunc) *Pipeline
 func NewMemoryStore() *MemoryStore
 func NewFileStore(opts ...FileStoreOption) (*FileStore, error)
@@ -333,7 +333,7 @@ func main() {
     rec.Close()
 
     // Replay
-    srv := httptape.NewServer(store)
+    srv, _ := httptape.NewServer(store)
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -452,7 +452,10 @@ func main() {
         panic(err)
     }
 
-    srv := httptape.NewServer(store)
+    srv, err := httptape.NewServer(store)
+    if err != nil {
+        panic(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -536,7 +539,10 @@ func TestUserAPI(t *testing.T) {
         t.Fatal(err)
     }
 
-    srv := httptape.NewServer(store)
+    srv, err := httptape.NewServer(store)
+    if err != nil {
+        t.Fatal(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -567,7 +573,7 @@ func TestWithMemoryStore(t *testing.T) {
     rec.Close()
 
     // Replay
-    srv := httptape.NewServer(store)
+    srv, _ := httptape.NewServer(store)
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -821,7 +827,7 @@ The `Server` is an `http.Handler` that replays recorded HTTP interactions. It re
 ```go
 store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
 
-srv := httptape.NewServer(store)
+srv, _ := httptape.NewServer(store)
 ts := httptest.NewServer(srv)
 defer ts.Close()
 
@@ -832,7 +838,7 @@ resp, _ := http.Get(ts.URL + "/users/octocat")
 ## Constructor
 
 ```go
-func NewServer(store Store, opts ...ServerOption) *Server
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
 ```
 
 The `store` parameter is required and must not be nil (panics if nil).
@@ -850,7 +856,7 @@ Sets the `Matcher` used to find tapes for incoming requests. If not set, `Defaul
 See [Matching](matching.md) for all available matchers.
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithMatcher(httptape.NewCompositeMatcher(
         httptape.MethodCriterion{},
         httptape.PathCriterion{},
@@ -896,7 +902,7 @@ func WithCORS() ServerOption
 Enables permissive CORS headers (`Access-Control-Allow-Origin: *`) on every replayed response and short-circuits `OPTIONS` preflight requests with 204. Intended for local development where a frontend dev server (e.g., `localhost:3000`) calls the mock backend (e.g., `localhost:3001`). Opt-in only.
 
 ```go
-srv := httptape.NewServer(store, httptape.WithCORS())
+srv, _ := httptape.NewServer(store, httptape.WithCORS())
 ```
 
 ### WithDelay
@@ -908,7 +914,7 @@ func WithDelay(d time.Duration) ServerOption
 Adds a fixed delay before every response. The delay is applied after matching but before writing the response. If the request context is cancelled during the delay (e.g., the client disconnects), `ServeHTTP` returns immediately without writing. A zero or negative duration is a no-op.
 
 ```go
-srv := httptape.NewServer(store, httptape.WithDelay(200*time.Millisecond))
+srv, _ := httptape.NewServer(store, httptape.WithDelay(200*time.Millisecond))
 ```
 
 ### WithErrorRate
@@ -920,7 +926,7 @@ func WithErrorRate(rate float64) ServerOption
 Causes a fraction of requests to return `500 Internal Server Error` with an `X-Httptape-Error: simulated` header instead of the recorded response. `rate` must be between `0.0` and `1.0` inclusive (`0.0` disables error simulation, `1.0` fails every request). Panics if `rate` is outside `[0.0, 1.0]`.
 
 ```go
-srv := httptape.NewServer(store, httptape.WithErrorRate(0.1)) // 10% failure rate
+srv, _ := httptape.NewServer(store, httptape.WithErrorRate(0.1)) // 10% failure rate
 ```
 
 ### WithReplayHeaders
@@ -932,7 +938,7 @@ func WithReplayHeaders(key, value string) ServerOption
 Injects a header into every replayed response, applied after tape matching. Overrides any header with the same key from the recorded tape. May be called multiple times to set multiple headers. Useful for environment-specific tokens, correlation IDs, or cache-control values.
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithReplayHeaders("X-Request-ID", "test-run-1"),
     httptape.WithReplayHeaders("Cache-Control", "no-store"),
 )
@@ -970,15 +976,15 @@ Control inter-event timing with `WithSSETiming`:
 
 ```go
 // Replay with original recorded timing (default).
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingRealtime()))
+srv, _ := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingRealtime()))
 
 // Replay 10x faster -- useful for integration tests that need some timing
 // realism without waiting for the full duration.
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingAccelerated(10)))
+srv, _ = httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingAccelerated(10)))
 
 // Replay instantly -- all events emitted back-to-back with no delay.
 // Best for unit tests where timing is irrelevant.
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+srv, _ = httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ```
 
 | Mode | Behavior | Use case |
@@ -996,9 +1002,12 @@ func TestStreamingChat(t *testing.T) {
     )
 
     // Use instant timing so the test completes immediately.
-    srv := httptape.NewServer(store,
+    srv, err := httptape.NewServer(store,
         httptape.WithSSETiming(httptape.SSETimingInstant()),
     )
+    if err != nil {
+        t.Fatal(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -1044,11 +1053,14 @@ func TestMyAPI(t *testing.T) {
         t.Fatal(err)
     }
 
-    srv := httptape.NewServer(store,
+    srv, err = httptape.NewServer(store,
         httptape.WithOnNoMatch(func(r *http.Request) {
             t.Errorf("unmatched: %s %s", r.Method, r.URL.Path)
         }),
     )
+    if err != nil {
+        t.Fatal(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -1068,7 +1080,7 @@ The `Server` implements `http.Handler`, so it can be used with any HTTP server:
 
 ```go
 store, _ := httptape.NewFileStore(httptape.WithDirectory("./fixtures"))
-srv := httptape.NewServer(store)
+srv, _ := httptape.NewServer(store)
 
 log.Println("Mock server on :8081")
 http.ListenAndServe(":8081", srv)
@@ -1767,7 +1779,7 @@ This makes it easy to see in browser dev tools or logs whether a response is liv
 l1 := httptape.NewMemoryStore()
 l2, _ := httptape.NewFileStore(httptape.WithDirectory("./cache"))
 
-proxy := httptape.NewProxy(l1, l2)
+proxy, _ := httptape.NewProxy(l1, l2)
 
 client := &http.Client{Transport: proxy}
 resp, err := client.Get("https://api.example.com/users")
@@ -1784,7 +1796,7 @@ sanitizer := httptape.NewPipeline(
     httptape.FakeFields("my-seed", "$.user.email"),
 )
 
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxySanitizer(sanitizer),
 )
 ```
@@ -1794,7 +1806,7 @@ The redaction pipeline is applied only to L2 writes. L1 always stores raw respon
 ### Constructor
 
 ```go
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 ```
 
 Both `l1` and `l2` must be non-nil. Panics on nil stores.
@@ -1815,7 +1827,7 @@ Both `l1` and `l2` must be non-nil. Panics on nil stores.
 By default, the proxy only falls back on transport errors (connection refused, DNS failure, timeout). To also fall back on 5xx responses from the upstream:
 
 ```go
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxyFallbackOn(func(err error, resp *http.Response) bool {
         if err != nil {
             return true
@@ -1932,7 +1944,7 @@ When the upstream is unavailable, the proxy falls back to cached SSE tapes. L2 f
 Control the replay timing of cached SSE responses with `WithProxySSETiming`:
 
 ```go
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxySSETiming(httptape.SSETimingInstant()), // default
 )
 ```
@@ -1949,7 +1961,7 @@ sanitizer := httptape.NewPipeline(
     httptape.RedactSSEEventData("$.choices[*].delta.content"),
     httptape.FakeSSEEventData("my-seed", "$.user.email"),
 )
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 ```
 
 ## Thread safety
@@ -3244,7 +3256,7 @@ httptape serve --fixtures ./fixtures --port 3001 --cors
 ### Go API
 
 ```go
-srv := httptape.NewServer(store, httptape.WithCORS())
+srv, _ := httptape.NewServer(store, httptape.WithCORS())
 ```
 
 When CORS is enabled, the server:
@@ -3336,7 +3348,7 @@ The server waits 2 seconds before sending the response. Your frontend loading sp
 Apply a delay to every endpoint via the Go API:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithCORS(),
     httptape.WithDelay(500 * time.Millisecond),
 )
@@ -3396,7 +3408,7 @@ The server returns 422 with the validation error body. The `response` section is
 Simulate flaky APIs where some percentage of requests fail with 500:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithCORS(),
     httptape.WithErrorRate(0.3), // 30% of requests return 500
 )
@@ -3951,7 +3963,7 @@ The `matcher.criteria` array declares which `Criterion` implementations to compo
 ```go
 matcher := cfg.BuildMatcher()
 
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithMatcher(matcher),
 )
 ```
@@ -5080,7 +5092,7 @@ if err != nil {
 
 l1 := httptape.NewMemoryStore()
 l2, _ := httptape.NewFileStore(httptape.WithDirectory("fixtures"))
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxyTLSConfig(tlsCfg))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxyTLSConfig(tlsCfg))
 
 client := &http.Client{Transport: proxy}
 ```
@@ -5280,7 +5292,7 @@ Panics if `upstream` or `store` is nil.
 ```go
 type Proxy struct { /* unexported */ }
 
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) // implements http.RoundTripper
 ```
 
@@ -5307,7 +5319,7 @@ Panics if `l1` or `l2` is nil.
 ```go
 type Server struct { /* unexported */ }
 
-func NewServer(store Store, opts ...ServerOption) *Server
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) // implements http.Handler
 ```
 

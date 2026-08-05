@@ -198,7 +198,7 @@ if err != nil {
 
 l1 := httptape.NewMemoryStore()
 l2, _ := httptape.NewFileStore(httptape.WithDirectory("fixtures"))
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxyTLSConfig(tlsCfg))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxyTLSConfig(tlsCfg))
 
 client := &http.Client{Transport: proxy}
 ```

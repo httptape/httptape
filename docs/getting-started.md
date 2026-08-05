@@ -71,7 +71,10 @@ func main() {
         panic(err)
     }
 
-    srv := httptape.NewServer(store)
+    srv, err := httptape.NewServer(store)
+    if err != nil {
+        panic(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -155,7 +158,10 @@ func TestUserAPI(t *testing.T) {
         t.Fatal(err)
     }
 
-    srv := httptape.NewServer(store)
+    srv, err := httptape.NewServer(store)
+    if err != nil {
+        t.Fatal(err)
+    }
     ts := httptest.NewServer(srv)
     defer ts.Close()
 
@@ -186,7 +192,7 @@ func TestWithMemoryStore(t *testing.T) {
     rec.Close()
 
     // Replay
-    srv := httptape.NewServer(store)
+    srv, _ := httptape.NewServer(store)
     ts := httptest.NewServer(srv)
     defer ts.Close()
 

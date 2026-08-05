@@ -117,7 +117,7 @@ httptape serve --fixtures ./fixtures --port 3001 --cors
 ### Go API
 
 ```go
-srv := httptape.NewServer(store, httptape.WithCORS())
+srv, _ := httptape.NewServer(store, httptape.WithCORS())
 ```
 
 When CORS is enabled, the server:
@@ -209,7 +209,7 @@ The server waits 2 seconds before sending the response. Your frontend loading sp
 Apply a delay to every endpoint via the Go API:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithCORS(),
     httptape.WithDelay(500 * time.Millisecond),
 )
@@ -269,7 +269,7 @@ The server returns 422 with the validation error body. The `response` section is
 Simulate flaky APIs where some percentage of requests fail with 500:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithCORS(),
     httptape.WithErrorRate(0.3), // 30% of requests return 500
 )
