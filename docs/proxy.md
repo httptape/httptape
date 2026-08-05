@@ -74,7 +74,7 @@ This makes it easy to see in browser dev tools or logs whether a response is liv
 l1 := httptape.NewMemoryStore()
 l2, _ := httptape.NewFileStore(httptape.WithDirectory("./cache"))
 
-proxy := httptape.NewProxy(l1, l2)
+proxy, _ := httptape.NewProxy(l1, l2)
 
 client := &http.Client{Transport: proxy}
 resp, err := client.Get("https://api.example.com/users")
@@ -91,7 +91,7 @@ sanitizer := httptape.NewPipeline(
     httptape.FakeFields("my-seed", "$.user.email"),
 )
 
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxySanitizer(sanitizer),
 )
 ```
@@ -101,7 +101,7 @@ The redaction pipeline is applied only to L2 writes. L1 always stores raw respon
 ### Constructor
 
 ```go
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 ```
 
 Both `l1` and `l2` must be non-nil. Panics on nil stores.
@@ -122,7 +122,7 @@ Both `l1` and `l2` must be non-nil. Panics on nil stores.
 By default, the proxy only falls back on transport errors (connection refused, DNS failure, timeout). To also fall back on 5xx responses from the upstream:
 
 ```go
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxyFallbackOn(func(err error, resp *http.Response) bool {
         if err != nil {
             return true
@@ -246,7 +246,7 @@ When the upstream is unavailable, the proxy falls back to cached SSE tapes. L2 f
 Control the replay timing of cached SSE responses with `WithProxySSETiming`:
 
 ```go
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxySSETiming(httptape.SSETimingInstant()), // default
 )
 ```
@@ -263,7 +263,7 @@ sanitizer := httptape.NewPipeline(
     httptape.RedactSSEEventData("$.choices[*].delta.content"),
     httptape.FakeSSEEventData("my-seed", "$.user.email"),
 )
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 ```
 
 ## Thread safety

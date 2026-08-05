@@ -15,7 +15,7 @@
 ```go
 rec := httptape.NewRecorder(store, httptape.WithSanitizer(sanitizer))
 client := &http.Client{Transport: rec}            // record real traffic; secrets redacted on write
-srv := httptape.NewServer(store)                  // replay deterministically — no live API needed
+srv, _ := httptape.NewServer(store)               // replay deterministically — no live API needed
 ```
 
 httptape captures HTTP request/response pairs (including SSE streams), redacts
@@ -48,7 +48,7 @@ defer rec.Close()
 client := &http.Client{Transport: rec}
 // ... hit real APIs, fixtures are recorded and redacted ...
 
-srv := httptape.NewServer(store)
+srv, _ := httptape.NewServer(store)
 ts := httptest.NewServer(srv)
 // ... replay against ts.URL in your tests ...
 ```
@@ -115,7 +115,7 @@ io.Copy(io.Discard, resp.Body)
 resp.Body.Close()
 
 // Replay with instant timing for fast tests.
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+srv, _ := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ts := httptest.NewServer(srv)
 defer ts.Close()
 // Point your code at ts.URL -- streaming responses replay instantly.
@@ -183,7 +183,7 @@ Or declaratively via JSON config:
 ### Replay
 
 ```go
-srv := httptape.NewServer(store)
+srv, _ := httptape.NewServer(store)
 ts := httptest.NewServer(srv)
 defer ts.Close()
 
@@ -195,7 +195,7 @@ resp, err := http.Get(ts.URL + "/users/octocat")
 Composable matching with weighted scoring:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithMatcher(httptape.NewCompositeMatcher(
         httptape.MethodCriterion{},                                        // score: 1
         httptape.PathCriterion{},                                          // score: 2
@@ -213,7 +213,7 @@ srv := httptape.NewServer(store,
 mem := httptape.NewMemoryStore()
 
 // Filesystem (for fixtures)
-fs := httptape.NewFileStore(httptape.WithDirectory("./testdata/fixtures"))
+fs, _ := httptape.NewFileStore(httptape.WithDirectory("./testdata/fixtures"))
 ```
 
 ### Proxy (fallback-to-cache)
@@ -222,7 +222,7 @@ fs := httptape.NewFileStore(httptape.WithDirectory("./testdata/fixtures"))
 l1 := httptape.NewMemoryStore()
 l2, _ := httptape.NewFileStore(httptape.WithDirectory("./cache"))
 
-proxy := httptape.NewProxy(l1, l2,
+proxy, _ := httptape.NewProxy(l1, l2,
     httptape.WithProxySanitizer(sanitizer),
 )
 client := &http.Client{Transport: proxy}
@@ -260,7 +260,7 @@ curl -N http://localhost:8081/__httptape/health/stream
 Replay recorded SSE streams with configurable timing. Use `SSETimingInstant()` for fast tests:
 
 ```go
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithSSETiming(httptape.SSETimingInstant()),
 )
 ts := httptest.NewServer(srv)

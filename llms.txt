@@ -76,7 +76,7 @@ sanitizer := httptape.NewPipeline(
 ## Replay
 
 ```go
-srv := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
+srv, _ := httptape.NewServer(store, httptape.WithSSETiming(httptape.SSETimingInstant()))
 ts := httptest.NewServer(srv)
 ```
 
@@ -112,7 +112,7 @@ and persisted. Partial disconnects are detected and discarded.
 ## Proxy (fallback-to-cache)
 
 ```go
-proxy := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
+proxy, _ := httptape.NewProxy(l1, l2, httptape.WithProxySanitizer(sanitizer))
 // L1 = MemoryStore (raw, ephemeral), L2 = FileStore (redacted, persistent)
 // Success: cache to both, return real response
 // Failure: fallback L1 -> L2 -> original error
@@ -216,9 +216,9 @@ Standalone server + CLI, sanitize-on-write by default, SSE event-level replay, p
 
 ```go
 func NewRecorder(store Store, opts ...RecorderOption) *Recorder
-func NewServer(store Store, opts ...ServerOption) *Server
+func NewServer(store Store, opts ...ServerOption) (*Server, error)
 func NewCachingTransport(upstream http.RoundTripper, store Store, opts ...CachingOption) *CachingTransport
-func NewProxy(l1, l2 Store, opts ...ProxyOption) *Proxy
+func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 func NewPipeline(funcs ...SanitizeFunc) *Pipeline
 func NewMemoryStore() *MemoryStore
 func NewFileStore(opts ...FileStoreOption) (*FileStore, error)

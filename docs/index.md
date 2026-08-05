@@ -71,7 +71,7 @@ func main() {
     rec.Close()
 
     // Replay
-    srv := httptape.NewServer(store)
+    srv, _ := httptape.NewServer(store)
     ts := httptest.NewServer(srv)
     defer ts.Close()
 

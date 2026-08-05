@@ -86,7 +86,7 @@ The `matcher.criteria` array declares which `Criterion` implementations to compo
 ```go
 matcher := cfg.BuildMatcher()
 
-srv := httptape.NewServer(store,
+srv, _ := httptape.NewServer(store,
     httptape.WithMatcher(matcher),
 )
 ```
