@@ -196,9 +196,15 @@ func WithCacheUpstreamDownFallback(enabled bool) CachingOption {
 }
 
 // WithCacheUpstreamTimeout sets a timeout for upstream requests on cache
-// miss. When set, the request context is wrapped with a deadline before
-// forwarding. Default: 0 (no timeout; the caller's http.Client timeout
-// dominates).
+// miss. Default: 0 (no timeout; the caller's http.Client timeout dominates).
+//
+// For buffered responses the timeout covers the entire upstream interaction:
+// headers and body read. A stalled body read is aborted with a deadline error.
+//
+// For SSE responses the timeout bounds only the header (time-to-first-byte)
+// phase. Once SSE headers are received the timer is disarmed and the stream
+// runs for its natural lifetime under the caller's own context. Closing the
+// SSE response body releases the upstream context created for this timeout.
 func WithCacheUpstreamTimeout(d time.Duration) CachingOption {
 	return func(ct *CachingTransport) {
 		ct.upstreamTimeout = d
@@ -527,11 +533,37 @@ func (ct *CachingTransport) roundTripWithSingleFlight(req *http.Request, reqBody
 // roundTripUpstream handles the actual upstream call and optional recording.
 func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte, bodyHash string) (*http.Response, error) {
 	// Apply upstream timeout if configured.
+	// We use context.WithCancelCause + time.AfterFunc rather than
+	// context.WithTimeout so that the timer can be stopped (disarmed) for the
+	// SSE path. A WithTimeout deadline cannot be disarmed after creation, which
+	// would cancel a live SSE body when roundTripUpstream returns.
+	var (
+		cancel context.CancelCauseFunc
+		timer  *time.Timer
+	)
 	if ct.upstreamTimeout > 0 {
-		ctx, cancel := context.WithTimeout(req.Context(), ct.upstreamTimeout)
-		defer cancel()
+		var ctx context.Context
+		ctx, cancel = context.WithCancelCause(req.Context())
+		timer = time.AfterFunc(ct.upstreamTimeout, func() {
+			cancel(context.DeadlineExceeded)
+		})
 		req = req.WithContext(ctx)
 	}
+
+	// transferred is set to true when the SSE path takes ownership of cancel.
+	// The deferred cleanup must not fire cancel in that case.
+	transferred := false
+	defer func() {
+		if transferred {
+			return
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if cancel != nil {
+			cancel(nil)
+		}
+	}()
 
 	startTime := ct.nowFunc()
 	resp, transportErr := ct.upstream.RoundTrip(req)
@@ -554,7 +586,13 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 
 	// SSE detection on miss path.
 	if ct.sseRecording && isSSEContentType(resp.Header.Get("Content-Type")) {
-		return ct.roundTripSSE(req, resp, reqBody, startTime)
+		// Stop the timer: the SSE stream must not be bounded by upstreamTimeout.
+		// The stream now owns the cancel function and will call it on body Close.
+		if timer != nil {
+			timer.Stop()
+		}
+		transferred = true
+		return ct.roundTripSSE(req, resp, reqBody, startTime, cancel)
 	}
 
 	// Read response body into buffer.
@@ -608,7 +646,13 @@ func (ct *CachingTransport) roundTripUpstream(req *http.Request, reqBody []byte,
 // while a background goroutine parses SSE events. When the stream
 // completes cleanly, the tape is persisted. If the stream is truncated
 // (client disconnect), the partial tape is discarded.
-func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte, startTime time.Time) (*http.Response, error) {
+//
+// cancel is the context.CancelCauseFunc from roundTripUpstream's disarmable
+// timer. When non-nil, cancel ownership transfers to this function: it will be
+// called exactly once when the caller closes the response body, releasing the
+// upstream context. When nil (upstreamTimeout == 0), no cancellation wrapper
+// is added and the stream runs purely under the caller's context.
+func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response, reqBody []byte, startTime time.Time, cancel context.CancelCauseFunc) (*http.Response, error) {
 	nowFunc := ct.nowFunc // capture for closure
 	respHeaders := resp.Header.Clone()
 
@@ -679,8 +723,31 @@ func (ct *CachingTransport) roundTripSSE(req *http.Request, resp *http.Response,
 
 	wrapper := newSSERecordingReader(trackedBody, startTime, onEvent, onDone)
 	resp.Body = wrapper
+	if cancel != nil {
+		// Wrap with cancelOnCloseReadCloser so the upstream context is released
+		// when the caller closes the body, not when roundTripUpstream returns.
+		resp.Body = &cancelOnCloseReadCloser{inner: wrapper, cancel: cancel}
+	}
 
 	return resp, nil
+}
+
+// cancelOnCloseReadCloser transfers upstream-timeout cancellation to the SSE
+// stream lifecycle: it invokes cancel exactly once after the wrapped body is
+// closed, so the deadline context is released when the caller is done reading
+// rather than when roundTripUpstream returns.
+type cancelOnCloseReadCloser struct {
+	inner  io.ReadCloser
+	cancel context.CancelCauseFunc
+	once   sync.Once
+}
+
+func (c *cancelOnCloseReadCloser) Read(p []byte) (int, error) { return c.inner.Read(p) }
+
+func (c *cancelOnCloseReadCloser) Close() error {
+	err := c.inner.Close()
+	c.once.Do(func() { c.cancel(nil) })
+	return err
 }
 
 // eofTrackingReadCloser wraps an io.ReadCloser and tracks whether the
