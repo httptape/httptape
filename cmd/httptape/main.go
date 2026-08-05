@@ -52,14 +52,28 @@ const (
 
 var logger = log.New(os.Stderr, "httptape: ", 0)
 
+// safeDefaultCoverage enumerates exactly what the safe default sanitizer
+// redacts — and, critically, what it does NOT (bodies). Shared by both
+// safe-default warnings so the disclosure cannot drift between them.
+const safeDefaultCoverage = "Redacted headers: Authorization, Cookie, Set-Cookie, X-Api-Key, Proxy-Authorization, X-Forwarded-For. " +
+	"Redacted query params: api_key, access_token, token, secret, password, sig, signature, X-Amz-Signature, X-Goog-Signature. " +
+	"URL userinfo (user:password@) always stripped. " +
+	"Request/response BODIES are NOT redacted by default -- use --config with redact_body/fake rules for secrets in bodies."
+
 // safeDefaultWarning is printed to stderr when neither --config nor --unsafe-raw
 // is supplied. It names every header and query param category from the library's
 // default sensitive lists so users know exactly what is being redacted.
 const safeDefaultWarning = "WARNING: no --config supplied; applying safe default sanitization. " +
-	"Redacted headers: Authorization, Cookie, Set-Cookie, X-Api-Key, Proxy-Authorization, X-Forwarded-For. " +
-	"Redacted query params: api_key, access_token, token, secret, password, sig, signature, X-Amz-Signature, X-Goog-Signature. " +
-	"URL userinfo (user:password@) always stripped. " +
-	"To customize, use --config. To disable all sanitization (not recommended), use --unsafe-raw."
+	safeDefaultCoverage +
+	" To customize, use --config. To disable all sanitization (not recommended), use --unsafe-raw."
+
+// emptyRulesConfigWarning is printed when a --config is supplied but contains
+// no sanitization rules (matcher-only or empty "rules"). record/proxy ignore the
+// matcher block, so with zero rules the pipeline would be a no-op; instead we fail
+// closed by applying the safe default, matching the no-config posture.
+const emptyRulesConfigWarning = "WARNING: --config supplied but it contains no sanitization rules (matcher-only or empty \"rules\"); applying safe default sanitization. " +
+	safeDefaultCoverage +
+	" To sanitize with custom rules, add a non-empty \"rules\" array. To disable all sanitization (not recommended), drop --config and use --unsafe-raw."
 
 // unsafeRawWarning is printed to stderr when --unsafe-raw is supplied. It is
 // intentionally loud to make clear that the fail-closed default has been
@@ -453,6 +467,11 @@ func runRecord(args []string) error {
 		return fmt.Errorf("upstream URL must include scheme and host, got %q", *upstream)
 	}
 
+	// Validate mutual exclusion before any disk access (store MkdirAll, TLS PEM reads).
+	if *configPath != "" && *unsafeRaw {
+		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
+	}
+
 	store, err := httptape.NewFileStore(httptape.WithDirectory(*fixtures))
 	if err != nil {
 		return fmt.Errorf("create store: %w", err)
@@ -477,19 +496,20 @@ func runRecord(args []string) error {
 		recorderOpts = append(recorderOpts, httptape.WithRecorderTLSConfig(tlsCfg))
 	}
 
-	// Validate mutual exclusion after flag parse, before any file read.
-	if *configPath != "" && *unsafeRaw {
-		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
-	}
-
 	switch {
 	case *configPath != "":
 		cfg, err := httptape.LoadConfigFile(*configPath)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		pipeline := cfg.BuildPipeline()
-		recorderOpts = append(recorderOpts, httptape.WithSanitizer(pipeline))
+		if len(cfg.Rules) == 0 {
+			// Matcher-only or empty config: no sanitization rules. Fail closed
+			// by applying the safe default (record/proxy ignore the matcher block).
+			recorderOpts = append(recorderOpts, httptape.WithSanitizer(defaultCLISanitizer()))
+			logger.Println(emptyRulesConfigWarning)
+		} else {
+			recorderOpts = append(recorderOpts, httptape.WithSanitizer(cfg.BuildPipeline()))
+		}
 	case *unsafeRaw:
 		logger.Println(unsafeRawWarning)
 	default:
@@ -615,6 +635,11 @@ func runProxy(args []string) error {
 		return fmt.Errorf("upstream URL must include scheme and host, got %q", *upstream)
 	}
 
+	// Validate mutual exclusion before any disk access (store MkdirAll, TLS PEM reads).
+	if *configPath != "" && *unsafeRaw {
+		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
+	}
+
 	l1 := httptape.NewMemoryStore()
 	l2, err := httptape.NewFileStore(httptape.WithDirectory(*fixtures))
 	if err != nil {
@@ -639,19 +664,20 @@ func runProxy(args []string) error {
 		proxyOpts = append(proxyOpts, httptape.WithProxyTLSConfig(tlsCfg))
 	}
 
-	// Validate mutual exclusion after flag parse, before any file read.
-	if *configPath != "" && *unsafeRaw {
-		return &usageError{fmt.Errorf("--config and --unsafe-raw are mutually exclusive")}
-	}
-
 	switch {
 	case *configPath != "":
 		cfg, err := httptape.LoadConfigFile(*configPath)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		pipeline := cfg.BuildPipeline()
-		proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(pipeline))
+		if len(cfg.Rules) == 0 {
+			// Matcher-only or empty config: no sanitization rules. Fail closed
+			// by applying the safe default (record/proxy ignore the matcher block).
+			proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(defaultCLISanitizer()))
+			logger.Println(emptyRulesConfigWarning)
+		} else {
+			proxyOpts = append(proxyOpts, httptape.WithProxySanitizer(cfg.BuildPipeline()))
+		}
 	case *unsafeRaw:
 		logger.Println(unsafeRawWarning)
 	default:
