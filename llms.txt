@@ -220,7 +220,7 @@ func NewServer(store Store, opts ...ServerOption) (*Server, error)
 func NewCachingTransport(upstream http.RoundTripper, store Store, opts ...CachingOption) *CachingTransport
 func NewProxy(l1, l2 Store, opts ...ProxyOption) (*Proxy, error)
 func NewPipeline(funcs ...SanitizeFunc) *Pipeline
-func NewMemoryStore() *MemoryStore
+func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore
 func NewFileStore(opts ...FileStoreOption) (*FileStore, error)
 func LoadFixtures(dir string) (*FileStore, error)
 func LoadFixturesFS(fsys fs.FS, dir string) (*MemoryStore, error)

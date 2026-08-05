@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-05
+
+### Module path change (breaking -- first release under the new org)
+
+v0.14.0 is the first tagged release published from the `httptape` GitHub
+org. v0.13.1 and earlier were tagged under `VibeWarden`. The Go module
+path, the `testcontainers` submodule path, and the container image
+namespace all changed:
+
+| | Before (≤ v0.13.1) | After (v0.14.0+) |
+|---|---|---|
+| Module path | `github.com/VibeWarden/httptape` | `github.com/httptape/httptape` |
+| `testcontainers` submodule path | `github.com/VibeWarden/httptape/testcontainers` | `github.com/httptape/httptape/testcontainers` |
+| Container image | `ghcr.io/vibewarden/httptape` | `ghcr.io/httptape/httptape` |
+
+**Migration:** update `go.mod` (and the `testcontainers/go.mod` submodule,
+if used) and every import site, then re-tidy:
+
+```bash
+grep -rl 'github.com/VibeWarden/httptape' --include='*.go' . go.mod | \
+  xargs sed -i.bak 's#github.com/VibeWarden/httptape#github.com/httptape/httptape#g'
+find . -name '*.bak' -delete
+go mod tidy
+```
+
+(#249, #250)
+
 ### Added
 
 - **Inbound TLS listener**: CLI commands `serve`, `record`, and `proxy`
@@ -86,19 +113,97 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Config support for `path_pattern`**: declarative `"type": "path_pattern"`
   criterion with `"pattern"` field. (#196)
 
+- **`RedactQueryParams` / `FakeQueryParams`**: `SanitizeFunc` constructors
+  that redact or deterministically fake URL query parameter values. Userinfo
+  (`user:password@` in the authority) is always stripped, regardless of
+  which parameter names are configured. `RedactQueryParams` defaults to
+  `DefaultSensitiveQueryParams()` when called with no names; `FakeQueryParams`
+  has no default -- called with no names, it fakes nothing (callers must pass
+  explicit parameter names). Fail-closed: malformed percent-encoded query
+  strings are replaced wholesale with `[REDACTED]` rather than passed through
+  as cleartext. (#295)
+
+- **`DefaultSensitiveQueryParams`**: returns a copy of the built-in list of
+  query parameter names commonly carrying sensitive data (`api_key`,
+  `access_token`, `token`, `secret`, `password`, `sig`, `signature`,
+  `X-Amz-Signature`, `X-Goog-Signature`). (#295)
+
+- **`--unsafe-raw` CLI flag**: `record` and `proxy` commands now apply safe
+  default sanitization (redact default sensitive headers + query params) unless
+  `--unsafe-raw` is passed. This flag disables all sanitization for callers who
+  explicitly opt out. The previous behavior (no sanitization by default) is
+  now opt-in. (#297)
+
+- **`body_encoding: "base64"` field**: non-UTF-8 text bodies that cannot be
+  stored as plain JSON strings are persisted as base64-encoded strings with an
+  explicit `"body_encoding": "base64"` marker. Fixtures written before this
+  change are unaffected (all-UTF-8 text bodies remain plain strings). (#303)
+
+- **`redact_query` / `fake_query` config actions**: declarative JSON config
+  `rules` now support `"action": "redact_query"` and `"action": "fake_query"`,
+  mapping to `RedactQueryParams` / `FakeQueryParams`. The new `Rule.Params`
+  field lists the URL query parameter names to sanitize. (#295)
+
+### Security
+
+- **CLI fail-closed sanitization**: `httptape record` and `httptape proxy` now
+  default to redacting `DefaultSensitiveHeaders()` and `DefaultSensitiveQueryParams()`
+  from every recorded tape. Raw recording requires an explicit `--unsafe-raw` flag.
+  This eliminates the risk of committing API keys or session tokens to version
+  control when using the CLI without a config file. (#297)
+
+- **Matcher-only / empty-rules config fail-closed**: when `--config` is
+  supplied but its `rules` array is empty or absent (e.g. a matcher-only
+  config), `record` and `proxy` now layer in the safe default sanitization
+  instead of proceeding with a no-op pipeline. A warning is printed to stderr
+  naming the redacted headers and query params and disclosing that
+  request/response bodies are not covered. The invocation proceeds; no error
+  is returned. (`serve` is unaffected — it relies on matcher-only configs
+  legitimately.) (#306)
+
+- **Bundle import tar entry validation**: `ImportBundle` now rejects tar
+  entries with absolute paths, backslashes, or `..` path-traversal segments
+  before any entry is deserialized into a `Tape`. Defense in depth at the
+  bundle-parsing trust boundary for untrusted archives. (#218, #228)
+
+### Fixed
+
+- **Single-flight key correctness**: the deduplication key for concurrent cache
+  misses now includes the raw query string and a canonical SHA-256 hash of all
+  request headers outside the hop-by-hop denylist. Previously, two requests
+  with the same method, path, and body but different query parameters or headers
+  could incorrectly share one upstream call and receive the same response.
+  (ADR-47, #294)
+
+- **SSE streams past upstream timeout**: `WithCacheUpstreamTimeout` previously
+  bounded the entire SSE stream duration, killing long-lived streams. It now
+  bounds only the header (time-to-first-byte) phase for SSE responses -- once
+  headers arrive, the timer is disarmed and the stream runs for its natural
+  lifetime. Buffered (non-SSE) responses are unaffected: the timeout still
+  covers the full upstream interaction, headers and body. (#300)
+
+- **Config schema for `redact_query` / `fake_query` actions**: `config.schema.json`
+  now accepts `"redact_query"` and `"fake_query"` as sanitizer action types,
+  matching `Config.Validate`. See also the stray-`params` rejection for
+  legacy actions under Breaking Changes below. (#310)
+
+- **Non-UTF-8 text bodies persisted correctly**: text-typed response bodies
+  containing non-UTF-8 byte sequences (e.g. Latin-1 encoded text) now survive
+  the record → persist → replay round-trip byte-identically. Previously they
+  were silently corrupted by JSON encoding. (#303)
+
+- **SIGINT drains pending recordings**: `httptape record` and `httptape proxy`
+  now call `Recorder.Close()` before exiting on SIGINT, flushing any tapes
+  buffered in the async channel. Previously, tapes in flight at shutdown time
+  were silently dropped. (#304)
+
+- **`WithOnError` fires on racing-drop path**: buffer-full drops and body
+  truncation notices already invoked `WithOnError` from the `RoundTrip`
+  goroutine. The one remaining silent path -- a tape dropped because
+  `RoundTrip` lost a race against `Recorder.Close()` -- now also invokes
+  `WithOnError`, so no tape drop is invisible to callers. (#304)
+
 ### Breaking Changes
-
-- **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
-  These now accept `*templateCtx` (unexported) instead of `*http.Request`.
-  External callers should use `ResolveTemplateBodySimple` instead. Pre-1.0,
-  acceptable. (#196)
-
-- **Unknown template namespaces**: expressions like `{{state.counter}}` that
-  were previously left as literal text are now replaced with empty string in
-  lenient mode (error in strict mode). All supported expressions are now
-  explicitly dispatched. (#196)
-
-### Breaking Changes (prior)
 
 - **`NewServer` signature change**: `NewServer(store Store, opts ...ServerOption)`
   now returns `(*Server, error)` instead of `*Server`. The constructor validates
@@ -116,10 +221,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now returns `(SSETimingMode, error)` instead of `SSETimingMode`. Returns an
   error when factor is <= 0 instead of panicking. (#215, ADR-46)
 
+- **Legacy config actions now reject a stray `params` field**: `redact_headers`,
+  `redact_body`, and `fake` rules that include a `params` field now fail
+  `Config.Validate` (`"<action>" does not use "params"`) instead of silently
+  accepting and ignoring it. A config file that previously loaded
+  successfully with an errant `params` field on one of these actions will now
+  fail to load; remove the stray field or move it to a `redact_query` /
+  `fake_query` rule. (#310)
+
+- **`ResolveTemplateBody` and `ResolveTemplateHeaders` signatures changed**:
+  These now accept `*templateCtx` (unexported) instead of `*http.Request`.
+  External callers should use `ResolveTemplateBodySimple` instead. Pre-1.0,
+  acceptable. (#196)
+
+- **Unknown template namespaces**: expressions like `{{state.counter}}` that
+  were previously left as literal text are now replaced with empty string in
+  lenient mode (error in strict mode). All supported expressions are now
+  explicitly dispatched. (#196)
+
 ### Migration
 
-All three changes are caught by the Go compiler -- no silent breakage. Update
-call sites as follows:
+All `NewServer` / `NewProxy` / `SSETimingAccelerated` changes are caught by
+the Go compiler — no silent breakage. Update call sites as follows:
 
 ```go
 // Before

@@ -82,6 +82,31 @@
 // With these options absent, [Proxy.HealthHandler] returns nil, no
 // goroutines are started, and proxy behavior is byte-for-byte unchanged.
 //
+// # Sanitization
+//
+// Sensitive data is redacted or faked on write, before a tape is persisted
+// to a [Store], so recorded fixtures are safe to commit and share by
+// default. Sanitization is applied via a [Pipeline] of [SanitizeFunc]
+// functions; each receives a [Tape] and returns a (possibly modified) copy
+// -- implementations must not mutate the input Tape.
+//
+// Four surfaces are covered:
+//   - Request and response headers: [RedactHeaders]
+//   - Request and response bodies (JSON field paths): [RedactBodyPaths],
+//     [FakeFields]
+//   - Request URL query parameters and userinfo: [RedactQueryParams],
+//     [FakeQueryParams] (userinfo is always stripped)
+//   - SSE event data: [RedactSSEEventData], [FakeSSEEventData]
+//
+// All faking functions use HMAC-SHA256 with a caller-supplied seed, so
+// the same input value always produces the same fake output across
+// recording sessions. The seed should be unique per project.
+//
+// Default sensitive header names are available via [DefaultSensitiveHeaders];
+// default sensitive query parameter names via [DefaultSensitiveQueryParams].
+// Sanitization is opt-in for library embedders (attach via [WithSanitizer]);
+// the CLI applies a safe default pipeline unless --unsafe-raw is passed.
+//
 // # Design principles
 //
 // httptape follows hexagonal architecture: core types have zero I/O, all
