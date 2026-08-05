@@ -1857,19 +1857,215 @@ func TestProxyHelpListsUnsafeRaw(t *testing.T) {
 	}
 }
 
-// TestSafeDefaultWarningDriftGuard asserts that safeDefaultWarning contains
-// every element from DefaultSensitiveHeaders() and DefaultSensitiveQueryParams().
-// This prevents silent drift between the hard-coded warning text and the
-// canonical default lists in the library.
+// TestSafeDefaultWarningDriftGuard asserts that both safe-default warning strings
+// contain every element from DefaultSensitiveHeaders() and DefaultSensitiveQueryParams().
+// This prevents silent drift between the hard-coded warning text and the canonical
+// default lists in the library. Both warnings share safeDefaultCoverage, so this
+// also guards that the shared coverage string never loses a token.
 func TestSafeDefaultWarningDriftGuard(t *testing.T) {
-	for _, h := range httptape.DefaultSensitiveHeaders() {
-		if !strings.Contains(safeDefaultWarning, h) {
-			t.Errorf("safeDefaultWarning does not contain default sensitive header %q", h)
+	warnings := []struct {
+		name    string
+		warning string
+	}{
+		{"safeDefaultWarning", safeDefaultWarning},
+		{"emptyRulesConfigWarning", emptyRulesConfigWarning},
+	}
+	for _, w := range warnings {
+		for _, h := range httptape.DefaultSensitiveHeaders() {
+			if !strings.Contains(w.warning, h) {
+				t.Errorf("%s does not contain default sensitive header %q", w.name, h)
+			}
+		}
+		for _, p := range httptape.DefaultSensitiveQueryParams() {
+			if !strings.Contains(w.warning, p) {
+				t.Errorf("%s does not contain default sensitive query param %q", w.name, p)
+			}
 		}
 	}
-	for _, p := range httptape.DefaultSensitiveQueryParams() {
-		if !strings.Contains(safeDefaultWarning, p) {
-			t.Errorf("safeDefaultWarning does not contain default sensitive query param %q", p)
+}
+
+// matcherOnlyConfigPath writes a matcher-only config JSON (no sanitization rules)
+// to a temp file and returns its path. This is a valid config for serve (matcher
+// block is used) but produces an empty rules pipeline for record/proxy.
+func matcherOnlyConfigPath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "matcher-only.json")
+	content := `{"version":"1","matcher":{"criteria":[{"type":"method"},{"type":"path"}]}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write matcher-only config: %v", err)
+	}
+	return path
+}
+
+// TestRecordFailClosed_MatcherOnlyConfigRedactsAuthAndToken verifies that record,
+// when given a --config with no sanitization rules (matcher-only), still applies
+// the safe default sanitizer so Authorization headers and token query params are
+// redacted before reaching disk.
+func TestRecordFailClosed_MatcherOnlyConfigRedactsAuthAndToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, _ := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL, "--config", matcherOnlyConfigPath(t)},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] != "[REDACTED]" {
+		t.Errorf("Authorization header = %q, want %q (matcher-only config must fail closed)", authVals[0], "[REDACTED]")
+	}
+
+	parsedURL, err := url.Parse(tape.Request.URL)
+	if err != nil {
+		t.Fatalf("parse fixture URL: %v", err)
+	}
+	if parsedURL.Query().Get("token") != "[REDACTED]" {
+		t.Errorf("token query param = %q, want %q (matcher-only config must fail closed)", parsedURL.Query().Get("token"), "[REDACTED]")
+	}
+}
+
+// TestProxyFailClosed_MatcherOnlyConfigRedactsAuthAndToken verifies that proxy,
+// when given a --config with no sanitization rules (matcher-only), still applies
+// the safe default sanitizer before persisting to L2.
+func TestProxyFailClosed_MatcherOnlyConfigRedactsAuthAndToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	fixturesDir, _ := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL, "--config", matcherOnlyConfigPath(t)},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	tape := loadFirstTapeFromDir(t, fixturesDir)
+
+	authVals := tape.Request.Headers.Values("Authorization")
+	if len(authVals) == 0 {
+		t.Fatal("fixture missing Authorization header entirely")
+	}
+	if authVals[0] != "[REDACTED]" {
+		t.Errorf("Authorization header = %q, want %q (matcher-only config must fail closed)", authVals[0], "[REDACTED]")
+	}
+
+	parsedURL, err := url.Parse(tape.Request.URL)
+	if err != nil {
+		t.Fatalf("parse fixture URL: %v", err)
+	}
+	if parsedURL.Query().Get("token") != "[REDACTED]" {
+		t.Errorf("token query param = %q, want %q (matcher-only config must fail closed)", parsedURL.Query().Get("token"), "[REDACTED]")
+	}
+}
+
+// TestRecordFailClosed_MatcherOnlyConfigWarnsSafeDefault verifies that record
+// prints the emptyRulesConfigWarning (naming Authorization) when a matcher-only
+// --config is supplied, so operators are not silently surprised by the fallback.
+func TestRecordFailClosed_MatcherOnlyConfigWarnsSafeDefault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"record", "--upstream", upstream.URL, "--config", matcherOnlyConfigPath(t)},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if !strings.Contains(stderr, "contains no sanitization rules") {
+		t.Errorf("stderr does not contain matcher-only config warning\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "Authorization") {
+		t.Errorf("stderr does not name Authorization in empty-rules warning\ngot: %s", stderr)
+	}
+}
+
+// TestProxyFailClosed_MatcherOnlyConfigWarnsSafeDefault verifies that proxy
+// prints the emptyRulesConfigWarning when a matcher-only --config is supplied.
+func TestProxyFailClosed_MatcherOnlyConfigWarnsSafeDefault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	_, stderr := runLiveCommandAndCapture(t,
+		[]string{"proxy", "--upstream", upstream.URL, "--config", matcherOnlyConfigPath(t)},
+		makeProbeWithAuthAndToken(upstream),
+	)
+
+	if !strings.Contains(stderr, "contains no sanitization rules") {
+		t.Errorf("stderr does not contain matcher-only config warning\ngot: %s", stderr)
+	}
+	if !strings.Contains(stderr, "Authorization") {
+		t.Errorf("stderr does not name Authorization in empty-rules warning\ngot: %s", stderr)
+	}
+}
+
+// TestSafeDefaultWarningsDiscloseBodiesNotRedacted asserts that both warning
+// strings explicitly tell users that request/response bodies are NOT covered by
+// the safe default sanitizer, closing the false-assurance gap.
+func TestSafeDefaultWarningsDiscloseBodiesNotRedacted(t *testing.T) {
+	const bodyDisclosure = "BODIES are NOT redacted"
+	warnings := []struct {
+		name    string
+		warning string
+	}{
+		{"safeDefaultWarning", safeDefaultWarning},
+		{"emptyRulesConfigWarning", emptyRulesConfigWarning},
+	}
+	for _, w := range warnings {
+		if !strings.Contains(w.warning, bodyDisclosure) {
+			t.Errorf("%s does not disclose body non-coverage; want substring %q\ngot: %s",
+				w.name, bodyDisclosure, w.warning)
 		}
+	}
+}
+
+// TestRecordUnsafeRawPlusConfigDoesNotTouchDisk verifies that the
+// --unsafe-raw + --config mutual-exclusion check fires before NewFileStore's
+// MkdirAll, so the error path leaves the fixtures directory uncreated.
+func TestRecordUnsafeRawPlusConfigDoesNotTouchDisk(t *testing.T) {
+	nestedFixtures := filepath.Join(t.TempDir(), "sub", "fx")
+
+	got := run([]string{
+		"record",
+		"--upstream", "http://example.com",
+		"--fixtures", nestedFixtures,
+		"--unsafe-raw",
+		"--config", "/nonexistent.json",
+	})
+	if got != exitUsage {
+		t.Errorf("got exit %d, want %d (usage error for --unsafe-raw + --config)", got, exitUsage)
+	}
+	if _, err := os.Stat(nestedFixtures); !os.IsNotExist(err) {
+		t.Errorf("fixtures dir %q was created despite usage error (disk access must not precede the check)", nestedFixtures)
+	}
+}
+
+// TestProxyUnsafeRawPlusConfigDoesNotTouchDisk verifies that the
+// --unsafe-raw + --config mutual-exclusion check fires before NewFileStore's
+// MkdirAll in the proxy subcommand, so the error path leaves the fixtures
+// directory uncreated.
+func TestProxyUnsafeRawPlusConfigDoesNotTouchDisk(t *testing.T) {
+	nestedFixtures := filepath.Join(t.TempDir(), "sub", "fx")
+
+	got := run([]string{
+		"proxy",
+		"--upstream", "http://example.com",
+		"--fixtures", nestedFixtures,
+		"--unsafe-raw",
+		"--config", "/nonexistent.json",
+	})
+	if got != exitUsage {
+		t.Errorf("got exit %d, want %d (usage error for --unsafe-raw + --config)", got, exitUsage)
+	}
+	if _, err := os.Stat(nestedFixtures); !os.IsNotExist(err) {
+		t.Errorf("fixtures dir %q was created despite usage error (disk access must not precede the check)", nestedFixtures)
 	}
 }

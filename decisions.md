@@ -7782,6 +7782,24 @@ fixtures + captured stderr keeps the two subcommands' tests DRY.
   the drift-guard test prevents silent divergence from the canonical default
   slices without coupling the user-facing copy to runtime list ordering.
 
+##### Amendment 2026-08-05 (#306): empty-rules configs fail closed; body non-coverage disclosed
+
+ADR-49 clause 1 ("--config → load the config-derived pipeline exactly ... No default
+prepended/appended") is refined: it applies only when the config has a non-empty
+"rules" array. A --config whose "rules" is empty (matcher-only or absent) is a no-op
+sanitizer — record/proxy ignore the matcher block — so it now fails closed exactly like
+the no-config default: defaultCLISanitizer() is applied and emptyRulesConfigWarning is
+printed. Non-empty rules are still used verbatim with no default layered in. Config.Validate
+is unchanged: matcher-only configs remain valid because serve relies on them.
+
+The safe-default warnings now disclose that request/response BODIES are NOT redacted by
+the header+query default (shared safeDefaultCoverage string), closing the false-assurance
+gap.
+
+The --config/--unsafe-raw mutual-exclusion check is moved before NewFileStore (MkdirAll)
+and BuildTLSConfig (PEM reads) in both runRecord and runProxy, honoring this ADR's
+"error path must not touch disk" statement literally (previously it ran after those).
+
 ---
 
 ## PM Log
