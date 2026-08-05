@@ -1053,7 +1053,7 @@ func TestMyAPI(t *testing.T) {
         t.Fatal(err)
     }
 
-    srv, err = httptape.NewServer(store,
+    srv, err := httptape.NewServer(store,
         httptape.WithOnNoMatch(func(r *http.Request) {
             t.Errorf("unmatched: %s %s", r.Method, r.URL.Path)
         }),
