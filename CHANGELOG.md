@@ -120,10 +120,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   This eliminates the risk of committing API keys or session tokens to version
   control when using the CLI without a config file. (#297)
 
-- **Matcher-only config fail-closed**: when a config file supplies a `matcher`
-  block but no `sanitizer` block, the CLI now rejects the invocation with an
-  error rather than silently recording without sanitization. A sanitizer is
-  required whenever a custom matcher is provided. (#306)
+- **Matcher-only / empty-rules config fail-closed**: when `--config` is
+  supplied but its `rules` array is empty or absent (e.g. a matcher-only
+  config), `record` and `proxy` now layer in the safe default sanitization
+  instead of proceeding with a no-op pipeline. A warning is printed to stderr
+  naming the redacted headers and query params and disclosing that
+  request/response bodies are not covered. The invocation proceeds; no error
+  is returned. (`serve` is unaffected — it relies on matcher-only configs
+  legitimately.) (#306)
 
 ### Fixed
 
@@ -137,10 +141,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SSE streams past upstream timeout**: SSE responses are now kept alive past
   the `WithCacheUpstreamTimeout` deadline. The timeout previously applied to
   the entire SSE stream duration; it now bounds only the header phase. (#300)
-
-- **Fail-closed on matcher-only configs**: the CLI now rejects a config file
-  that provides a `matcher` block without a `sanitizer` block rather than
-  recording without sanitization. (#306)
 
 - **Config schema for `redact_query` / `fake_query` actions**: the JSON config
   schema now accepts `"redact_query"` and `"fake_query"` as sanitizer action
