@@ -3,7 +3,7 @@ module github.com/httptape/httptape/testcontainers
 go 1.26.1
 
 require (
-	github.com/docker/go-connections v0.8.0
+	github.com/docker/go-connections v0.8.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 )
 
