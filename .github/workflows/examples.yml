@@ -79,7 +79,7 @@ jobs:
       # --- Node.js toolchain (ts-frontend-first and future JS examples) ---
       - name: Set up Node.js
         if: matrix.example.node-version
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.example.node-version }}
           cache: npm
