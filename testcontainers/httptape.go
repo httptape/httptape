@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -79,7 +78,7 @@ func RunContainer(ctx context.Context, opts ...Option) (*Container, error) {
 		Cmd:          cmd,
 		ExposedPorts: []string{o.port},
 		Mounts:       mounts,
-		WaitingFor:   wait.ForListeningPort(nat.Port(o.port)),
+		WaitingFor:   wait.ForListeningPort(o.port),
 	}
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
