@@ -2199,9 +2199,11 @@ func TestCachingTransport_UpstreamTimeoutSSEvsBuffered(t *testing.T) {
 				t.Parallel()
 				store := NewMemoryStore()
 
-				const timeout = 60 * time.Millisecond
-				const eventInterval = 40 * time.Millisecond
-				const numEvents = 4 // span = 4 * 40ms = 160ms >> timeout
+				// The timeout must leave headroom for dial + headers under
+				// -race on loaded CI runners; 60ms flaked there.
+				const timeout = 250 * time.Millisecond
+				const eventInterval = 150 * time.Millisecond
+				const numEvents = 4 // span = 3 * 150ms = 450ms >> timeout
 
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "text/event-stream")
