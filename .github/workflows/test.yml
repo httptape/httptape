@@ -29,3 +29,10 @@ jobs:
 
       - name: Run tests
         run: go test ./... -race -count=1
+
+      # testcontainers/ is a nested module, so the root `./...` skips it.
+      # Vet compiles it (and its tests) so dependency bumps that break the
+      # testcontainers-go API fail here instead of on main.
+      - name: Vet testcontainers module
+        working-directory: testcontainers
+        run: go vet ./...
