@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Docker image built with Go 1.27**: the builder stage moves from
+  `golang:1.26-alpine` to `golang:1.27-alpine`. The final image is still
+  `scratch` running as UID 65534, so the base image's default user and
+  entrypoint do not reach it. The `go` directive stays at 1.26 so
+  embedders on the still-supported Go 1.26 are not forced to upgrade.
+
+- **`testcontainers` submodule on testcontainers-go v0.44.0**: v0.44.0
+  changed `wait.ForListeningPort` to take the port spec as a `string`.
+  The submodule now passes it directly; `github.com/docker/go-connections`
+  drops to an indirect dependency. The submodule's exported API is
+  unchanged. Dependabot's CI did not catch the break because the root
+  `go test ./...` skips the nested module; the Tests workflow now runs
+  `go vet` there too.
+
+- Dependency batch 2026-10-23 (examples and CI only, no change to the
+  stdlib-only root module): ossf/scorecard-action 2.5.0,
+  actions/upload-artifact 7.0.2, github/codeql-action/upload-sarif 4.39.0;
+  Kotlin 2.4.20, Ktor 3.5.2, logback 1.6.3, Kotest 6.2.5, Gradle 9.7.1;
+  Spring Boot 4.1.1, Spring AI 2.0.1, maven-compiler-plugin 3.16.0,
+  Maven 3.9.16 (the regenerated `mvnw.cmd` diff is only LF to CRLF);
+  Vite 8.2.1, React 19.2.8, ESLint 10.8.1 and related types in
+  `ts-frontend-first`. The actions/setup-go, setup-node and setup-python
+  v7 majors ship separately.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
