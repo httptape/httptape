@@ -32,6 +32,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ts-frontend-first`. The actions/setup-go, setup-node and setup-python
   v7 majors ship separately.
 
+- **CI on actions/setup-go, setup-node and setup-python v7** (CI only):
+  all three migrate to ESM and @actions/cache 6.x. Removed in v7:
+  setup-python's `pip-install` input and setup-node's dummy
+  `NODE_AUTH_TOKEN` export; neither is used here, and the inputs we pass
+  (`go-version-file`, `node-version`, `cache`, `cache-dependency-path`,
+  `python-version`) are unchanged. PR CI exercises setup-go and
+  setup-node; setup-python (docs.yml) first runs on the merge to main and
+  setup-go in release.yml on the next tag.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
