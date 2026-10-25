@@ -95,14 +95,14 @@ jobs:
       # so JDK 25 goes last.
       - name: Set up JDK 21 (SDK toolchain)
         if: matrix.example.java-version
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up JDK ${{ matrix.example.java-version }}
         if: matrix.example.java-version
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ matrix.example.java-version }}
