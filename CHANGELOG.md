@@ -41,6 +41,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   setup-node; setup-python (docs.yml) first runs on the merge to main and
   setup-go in release.yml on the next tag.
 
+- **CI on actions/setup-java v6** (Examples workflow only): v6 migrates
+  to ESM (documented as not user-facing), rejects invalid boolean input
+  values, renames `jdkFile` to `jdk-file`, and caches Maven and Gradle
+  wrapper distributions separately from the dependency cache. We pass
+  only `distribution`, `java-version` and `cache`, all unchanged.
+  Dependabot never opened this major; it was found by comparing `uses:`
+  tags against the latest releases.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
