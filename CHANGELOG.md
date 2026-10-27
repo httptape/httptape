@@ -49,6 +49,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Dependabot never opened this major; it was found by comparing `uses:`
   tags against the latest releases.
 
+- Dependency batch 2026-10-27 (examples and CI only, no change to the
+  stdlib-only root module): github/codeql-action/upload-sarif 4.39.1
+  (pinned SHA checked against the tag); Kotlin 2.4.21, Ktor 3.6.0,
+  kotlinx-serialization 1.12.0, logback 1.6.5, Kotest 6.2.6, Gradle 9.8.2
+  (wrapper jar matches Gradle's published SHA-256; `gradlew.bat` is the
+  upstream 9.8 template with its new safety-net preamble); Spring Boot
+  4.1.2, Spring AI 2.0.2, Maven 3.10.0 (stricter model validation, the
+  example builds clean); React 19.3.1, Vite 8.3.5, ESLint 10.13.0,
+  typescript-eslint 8.72.0 and related types in `ts-frontend-first`.
+  Rejected: TypeScript 7.0.2 (#367). typescript-eslint still declares peer
+  `typescript <6.1.0` and TS 7 has no stable compiler API, so `npm ci`
+  fails; Dependabot now ignores `typescript >=7` for that example.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)

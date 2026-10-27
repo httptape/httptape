@@ -116,6 +116,13 @@ updates:
       prefix: "chore"
       prefix-development: "chore"
       include: "scope"
+    ignore:
+      # TypeScript 7 (the native Go port) ships no classic compiler API,
+      # and typescript-eslint 8.72.1 still declares peer typescript
+      # ">=4.8.4 <6.1.0", so `npm ci` fails with ERESOLVE (#367). Drop
+      # this once typescript-eslint supports TypeScript 7.
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
     groups:
       minor-and-patch:
         applies-to: version-updates
