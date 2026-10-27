@@ -1,6 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.4.20"
-    kotlin("plugin.serialization") version "2.4.20"
+    kotlin("jvm") version "2.4.21"
+    kotlin("plugin.serialization") version "2.4.21"
     application
 }
 
@@ -22,34 +22,34 @@ repositories {
 
 dependencies {
     // Ktor server
-    implementation("io.ktor:ktor-server-netty:3.5.2")
-    implementation("io.ktor:ktor-server-sse:3.5.2")
-    implementation("io.ktor:ktor-server-content-negotiation:3.5.2")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:3.5.2")
+    implementation("io.ktor:ktor-server-netty:3.6.0")
+    implementation("io.ktor:ktor-server-sse:3.6.0")
+    implementation("io.ktor:ktor-server-content-negotiation:3.6.0")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.6.0")
 
     // Ktor client (for the weather tool's REST call)
-    implementation("io.ktor:ktor-client-cio:3.5.2")
-    implementation("io.ktor:ktor-client-content-negotiation:3.5.2")
+    implementation("io.ktor:ktor-client-cio:3.6.0")
+    implementation("io.ktor:ktor-client-content-negotiation:3.6.0")
 
     // Koog — AI agent framework (Ktor plugin + agents)
     implementation("ai.koog:koog-ktor:0.8.0")
 
     // kotlinx-serialization (Koog transitive, but explicit for clarity)
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
 
     // Logging
-    implementation("ch.qos.logback:logback-classic:1.6.3")
+    implementation("ch.qos.logback:logback-classic:1.6.5")
 
     // Test — Kotest
-    testImplementation("io.kotest:kotest-runner-junit5:6.2.5")
-    testImplementation("io.kotest:kotest-assertions-core:6.2.5")
+    testImplementation("io.kotest:kotest-runner-junit5:6.2.6")
+    testImplementation("io.kotest:kotest-assertions-core:6.2.6")
 
     // Test — httptape SDK (brings Testcontainers transitively)
     testImplementation("dev.httptape:httptape-testcontainers-kotest:0.1.0-SNAPSHOT")
 
     // Test — Ktor server test host and client
-    testImplementation("io.ktor:ktor-server-test-host:3.5.2")
-    testImplementation("io.ktor:ktor-client-content-negotiation:3.5.2")
+    testImplementation("io.ktor:ktor-server-test-host:3.6.0")
+    testImplementation("io.ktor:ktor-client-content-negotiation:3.6.0")
 }
 
 tasks.withType<Test>().configureEach {
