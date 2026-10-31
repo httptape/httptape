@@ -130,7 +130,7 @@ updates:
           - "minor"
           - "patch"
 
-  # ----- Example: ts-frontend-first (Dockerfile, node:20-alpine) -----
+  # ----- Example: ts-frontend-first (Dockerfile, node:26-alpine) -----
   - package-ecosystem: "docker"
     directory: "/examples/ts-frontend-first"
     schedule:

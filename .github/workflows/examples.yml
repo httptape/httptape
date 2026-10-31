@@ -55,7 +55,7 @@ jobs:
         example:
           - name: ts-frontend-first
             path: examples/ts-frontend-first
-            node-version: "20"
+            node-version: "26"
             lockfile: examples/ts-frontend-first/package-lock.json
             build-command: npm run build
 

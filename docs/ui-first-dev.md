@@ -331,7 +331,7 @@ services:
       - ./fixtures:/fixtures:ro
 
   frontend:
-    image: node:20-alpine
+    image: node:26-alpine
     working_dir: /app
     command: ["npm", "run", "dev"]
     ports:

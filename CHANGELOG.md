@@ -58,6 +58,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   4.1.2, Spring AI 2.0.2, Maven 3.10.0 (stricter model validation, the
   example builds clean); React 19.3.1, Vite 8.3.5, ESLint 10.13.0,
   typescript-eslint 8.72.0 and related types in `ts-frontend-first`.
+
+- **Examples CI on Node 26** (CI and docs only): the Examples workflow
+  still installed Node 20, which reached end of life on 2026-04-30, while
+  the `ts-frontend-first` Dockerfile already runs `node:26-alpine` and the
+  example depends on `@types/node` 26. CI now matches the image. The
+  example's Vite 8 and ESLint 10 engine ranges accept Node 26;
+  `npm ci && npm run build` passes locally on Node 26.8.2. The CI snippet
+  in `examples/README.md` and the Compose sample in `docs/ui-first-dev.md`
+  move from 20 to 26 as well. Dependabot did not flag this because
+  `node-version` in a workflow matrix is not a tracked dependency.
   Rejected: TypeScript 7.0.2 (#367). typescript-eslint still declares peer
   `typescript <6.1.0` and TS 7 has no stable compiler API, so `npm ci`
   fails; Dependabot now ignores `typescript >=7` for that example.
