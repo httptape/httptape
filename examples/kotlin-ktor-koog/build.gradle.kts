@@ -38,7 +38,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
 
     // Logging
-    implementation("ch.qos.logback:logback-classic:1.6.5")
+    implementation("ch.qos.logback:logback-classic:1.6.6")
 
     // Test — Kotest
     testImplementation("io.kotest:kotest-runner-junit5:6.2.6")
