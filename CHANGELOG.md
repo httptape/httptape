@@ -68,6 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in `examples/README.md` and the Compose sample in `docs/ui-first-dev.md`
   move from 20 to 26 as well. Dependabot did not flag this because
   `node-version` in a workflow matrix is not a tracked dependency.
+
+- Dependency batch 2026-10-31 (examples only): logback 1.6.6 in
+  `kotlin-ktor-koog` (an unmatched `}` in a config value is now an error;
+  the example's single pattern is balanced) and typescript-eslint 8.72.1
+  in `ts-frontend-first` (rule fixes only; its TypeScript peer range is
+  still `<6.1.0`, so the TypeScript 7 ignore rule stays).
   Rejected: TypeScript 7.0.2 (#367). typescript-eslint still declares peer
   `typescript <6.1.0` and TS 7 has no stable compiler API, so `npm ci`
   fails; Dependabot now ignores `typescript >=7` for that example.
