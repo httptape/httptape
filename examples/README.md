@@ -30,7 +30,7 @@ Note: this is a separate workflow from the library's `Tests` workflow on purpose
    ```yaml
    - name: <example-name>
      path: examples/<example-name>
-     node-version: "20"
+     node-version: "26"
      lockfile: examples/<example-name>/package-lock.json
      build-command: npm run build
    ```
