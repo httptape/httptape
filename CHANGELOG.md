@@ -78,6 +78,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `typescript <6.1.0` and TS 7 has no stable compiler API, so `npm ci`
   fails; Dependabot now ignores `typescript >=7` for that example.
 
+- Dependency batch 2026-11-01 (CI only): actions/checkout 7.0.1 in the
+  SHA-pinned Scorecard workflow (pinned SHA checked against the tag).
+  Fixes only: values passed to `git config --unset` are escaped and branch
+  names trim only ASCII whitespace; `action.yml` and its inputs are
+  unchanged. Dependabot never proposed it, though v7.0.1 shipped on
+  2026-07-20; it was found by comparing the pinned SHA with the latest
+  release. The other workflows use the floating `v7` tag and already run
+  7.0.1.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
