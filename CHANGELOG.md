@@ -87,6 +87,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   release. The other workflows use the floating `v7` tag and already run
   7.0.1.
 
+- Dependency batch 2026-11-02 (examples only): Ktor 3.6.1 in
+  `kotlin-ktor-koog` (bug fixes, including KTOR-10023 restoring
+  `BadRequestException` for malformed paths that 3.6.0 dropped; the
+  example uses none of the touched APIs directly) and `@types/node`
+  26.6.6 in `ts-frontend-first`. Every floating action tag, the pinned
+  action SHAs (codeql-action 4.39.1 checked against its tag), Gradle
+  9.8.2, Maven 3.10.0 and the testcontainers-go direct dependency are
+  already at their latest release.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
