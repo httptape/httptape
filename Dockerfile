@@ -37,7 +37,7 @@ EXPOSE 8081
 USER 65534
 
 # OCI image labels. See https://github.com/opencontainers/image-spec/blob/main/annotations.md
-# Note: docker/metadata-action@v5 in CI also emits labels; for overlapping
+# Note: docker/metadata-action in CI also emits labels; for overlapping
 # keys, the metadata-action value overrides on the published image. These
 # Dockerfile labels are the floor that guarantees metadata exists on local
 # `docker build .` and on downstream re-builds.
