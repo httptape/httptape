@@ -96,6 +96,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   9.8.2, Maven 3.10.0 and the testcontainers-go direct dependency are
   already at their latest release.
 
+- Dependency batch 2026-11-04 (examples and CI only, no change to the
+  stdlib-only root module): github/codeql-action/upload-sarif 4.39.3
+  (pinned SHA checked against the tag; `upload-sarif/action.yml` differs
+  only in quoting, and the 2.27.4 bundle default does not apply since
+  Scorecard produces the SARIF);
+  ESLint 10.14.0 (rule fixes, requires minimatch 10.2.6),
+  `@vitejs/plugin-react` 6.2.1 (new `refreshInclude`/`refreshExclude`
+  options and wider peer ranges; the example calls `react()` with no
+  options) and globals 17.14.0 in `ts-frontend-first`. `npm audit fix`
+  also moves dev-only transitives (zod 4.6.7, browserslist 4.29.5,
+  `@babel/core` 7.29.13, baseline-browser-mapping 2.11.35), clearing the
+  two high findings. Rejected: `npm audit fix --force`, which would
+  downgrade ESLint to 9 to silence the minimatch advisory
+  (GHSA-g3hv-75wg-m249, moderate, lint tooling only). TypeScript stays
+  on 6.0: typescript-eslint 8.72.1 still declares peer `<6.1.0`. Koog
+  1.x, Spring Boot 4.2 and Spring AI 2.1 have only beta or RC releases.
+  Stale version references in comments (`pom.xml` Spring Boot 4.0.5,
+  `Dockerfile` metadata-action v5) no longer name a version.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
