@@ -1330,6 +1330,11 @@ func TestExportBundle_EmptyRouteExcluded(t *testing.T) {
 // writeBundle error paths
 // ---------------------------------------------------------------------------
 
+// writerFunc adapts a function to io.Writer.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 // writeCapWriter counts bytes written and fails after a limit.
 type writeCapWriter struct {
 	remaining int
@@ -1497,7 +1502,6 @@ func TestWriteBundle_ContextCancelledBeforeManifestHeader(t *testing.T) {
 }
 
 func TestWriteBundle_ContextCancelledDuringFixtureLoop(t *testing.T) {
-	// Create many tapes and cancel context after a short time.
 	tapes := make([]Tape, 50)
 	for i := range tapes {
 		tapes[i] = makeBundleTape(
@@ -1507,22 +1511,18 @@ func TestWriteBundle_ContextCancelledDuringFixtureLoop(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Use a slow writer that gives us time to cancel mid-loop.
-	pr, pw := io.Pipe()
-	go func() {
-		// Read slowly, cancel after a bit.
-		buf := make([]byte, 512)
-		pr.Read(buf)
+	// The gzip header reaches the writer while the manifest is written, so
+	// cancelling synchronously there guarantees the fixture loop sees it.
+	w := writerFunc(func(p []byte) (int, error) {
 		cancel()
-		// Drain the rest to unblock the writer.
-		io.Copy(io.Discard, pr)
-	}()
+		return len(p), nil
+	})
 
-	err := writeBundle(ctx, pw, tapes, exportConfig{})
-	// Either context canceled or a write error is acceptable.
-	if err == nil {
-		t.Fatal("expected error from writeBundle")
+	err := writeBundle(ctx, w, tapes, exportConfig{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
 	}
 }
 
