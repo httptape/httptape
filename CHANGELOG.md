@@ -115,6 +115,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Stale version references in comments (`pom.xml` Spring Boot 4.0.5,
   `Dockerfile` metadata-action v5) no longer name a version.
 
+- Dependency batch 2026-11-09 (examples and `testcontainers` submodule,
+  no change to the stdlib-only root module): testcontainers-go 0.45.0 in
+  `testcontainers`. Its breaking changes move client adapters out of the
+  CockroachDB, Dex and Cosmos DB modules; the submodule uses only the
+  core `GenericContainer`, bind mounts and `wait.ForListeningPort`, which
+  are unchanged. Transitives follow upstream (moby client 0.6.2,
+  x/crypto 0.58.0, `go.yaml.in/yaml/v3` replacing `gopkg.in/yaml.v3`);
+  the `go` directive stays at 1.26.1. The `dockertest` integration tests
+  need Docker and were not run locally; `go vet` and the unit tests pass.
+  Vite 8.3.6 in `ts-frontend-first` (bug fixes only), resolving rolldown
+  1.2.18. Every action tag and pinned action SHA is already at its latest
+  release.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
