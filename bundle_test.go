@@ -1496,8 +1496,18 @@ func TestWriteBundle_ContextCancelledBeforeManifestHeader(t *testing.T) {
 	}
 }
 
+// cancelOnWriteWriter cancels a context synchronously on its first Write,
+// so a test can cancel at a known point without racing a goroutine.
+type cancelOnWriteWriter struct {
+	cancel context.CancelFunc
+}
+
+func (w *cancelOnWriteWriter) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
 func TestWriteBundle_ContextCancelledDuringFixtureLoop(t *testing.T) {
-	// Create many tapes and cancel context after a short time.
 	tapes := make([]Tape, 50)
 	for i := range tapes {
 		tapes[i] = makeBundleTape(
@@ -1507,22 +1517,14 @@ func TestWriteBundle_ContextCancelledDuringFixtureLoop(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Use a slow writer that gives us time to cancel mid-loop.
-	pr, pw := io.Pipe()
-	go func() {
-		// Read slowly, cancel after a bit.
-		buf := make([]byte, 512)
-		pr.Read(buf)
-		cancel()
-		// Drain the rest to unblock the writer.
-		io.Copy(io.Discard, pr)
-	}()
-
-	err := writeBundle(ctx, pw, tapes, exportConfig{})
-	// Either context canceled or a write error is acceptable.
-	if err == nil {
-		t.Fatal("expected error from writeBundle")
+	// The gzip writer emits its header on the first write, which happens
+	// while the manifest is written (after the pre-manifest ctx check), so
+	// the cancellation is observed by the fixture loop's first ctx check.
+	err := writeBundle(ctx, &cancelOnWriteWriter{cancel: cancel}, tapes, exportConfig{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("writeBundle error = %v, want context.Canceled", err)
 	}
 }
 
