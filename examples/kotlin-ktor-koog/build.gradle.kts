@@ -35,14 +35,14 @@ dependencies {
     implementation("ai.koog:koog-ktor:0.8.0")
 
     // kotlinx-serialization (Koog transitive, but explicit for clarity)
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.13.0")
 
     // Logging
     implementation("ch.qos.logback:logback-classic:1.6.6")
 
     // Test — Kotest
-    testImplementation("io.kotest:kotest-runner-junit5:6.2.6")
-    testImplementation("io.kotest:kotest-assertions-core:6.2.6")
+    testImplementation("io.kotest:kotest-runner-junit5:6.2.7")
+    testImplementation("io.kotest:kotest-assertions-core:6.2.7")
 
     // Test — httptape SDK (brings Testcontainers transitively)
     testImplementation("dev.httptape:httptape-testcontainers-kotest:0.1.0-SNAPSHOT")

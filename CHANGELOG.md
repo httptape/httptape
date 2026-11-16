@@ -128,6 +128,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   1.2.18. Every action tag and pinned action SHA is already at its latest
   release.
 
+- Dependency batch 2026-11-16 (examples only, no change to the
+  stdlib-only root module): Gradle 9.9.1 (wrapper jar matches Gradle's
+  published SHA-256; the CI build logs no deprecation warnings),
+  kotlinx-serialization 1.13.0 (reverts the 1.12.0 `JsonException`
+  wrapping; the example never catches serializer exceptions) and
+  Kotest 6.2.7 in `kotlin-ktor-koog`; Maven 3.10.1 in
+  `java-spring-boot`; Vite 8.3.8, `@vitejs/plugin-react` 6.3.0
+  (`reactCompilerPreset` worker fix, unused here) and typescript-eslint
+  8.72.2 in `ts-frontend-first`. typescript-eslint 8.72.2 still declares
+  peer TypeScript `<6.1.0`, so the TypeScript 7 ignore rule stays.
+  Every action tag and pinned action SHA is already at its latest
+  release.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
