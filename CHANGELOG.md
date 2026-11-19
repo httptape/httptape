@@ -141,6 +141,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Every action tag and pinned action SHA is already at its latest
   release.
 
+- Dependency batch 2026-11-19 (CI only): ossf/scorecard-action 2.6.0
+  (Scorecard 5.7.0; pinned SHA checked against the tag and matches
+  upstream's own example). Released today, so Dependabot had not
+  proposed it yet. The Scorecard workflow now sets the new
+  `fail_on_publish_error: true`, so a rejected publish to
+  api.scorecard.dev fails the run instead of leaving the README badge
+  silently stale; network errors, 408, 429 and 5xx stay warnings. The
+  SARIF upload steps run on `always()` so results are still kept when
+  that happens. Upstream's new `cache-mode: none` workflow key is not
+  adopted here: it is unrelated to this bump. Indirect `testcontainers`
+  dependencies with newer versions are left to testcontainers-go. Every
+  other action tag, Docker base image and direct Go dependency is
+  already at its latest release.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
