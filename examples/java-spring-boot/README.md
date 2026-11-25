@@ -22,8 +22,6 @@ The service also calls a regular REST endpoint via Spring's modern `RestClient`.
 - **JDK 25**
 - **httptape-jvm SDK** published to local Maven (see below)
 
-> **Spring AI version note**: the demo uses Spring AI 2.0.0-M4 (milestone) because Spring AI 1.x targets Spring Boot 3.x. Bump to 2.0.0 GA when it ships.
-
 ## SDK setup (local development)
 
 This demo uses the `httptape-testcontainers` SDK (`dev.httptape:httptape-testcontainers`) which is not yet published to Maven Central. For local development, clone the SDK repo as a sibling and publish to local Maven:
@@ -100,8 +98,8 @@ IDE users: open [`api.http`](./api.http) — IntelliJ's HTTP Client (and VS Code
 | | |
 |---|---|
 | Java | 25 (LTS), virtual threads enabled |
-| Spring Boot | 4.0.5, BOM-based dependency management (no `spring-boot-starter-parent`) |
-| Spring AI | 2.0.0-M4 (OpenAI client, milestone) |
+| Spring Boot | 4.2.0, BOM-based dependency management (no `spring-boot-starter-parent`) |
+| Spring AI | 2.1.0 (OpenAI client) |
 | HTTP client | Spring's modern blocking `RestClient` |
 | httptape-jvm SDK | 0.1.0-SNAPSHOT (httptape-testcontainers) |
 | Tests | JUnit 5 + Testcontainers (single shared container) |

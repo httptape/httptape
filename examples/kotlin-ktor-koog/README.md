@@ -126,14 +126,14 @@ IDE users: open [`api.http`](./api.http) -- IntelliJ's HTTP Client and VS Code's
 
 | | |
 |---|---|
-| Kotlin | 2.3.20 |
+| Kotlin | 2.4.21 |
 | JDK | 25 |
-| Ktor | 3.4.2 (Netty server + CIO client) |
+| Ktor | 3.6.1 (Netty server + CIO client) |
 | Koog | 0.8.0 (AI agent framework, Apache 2.0) |
-| Kotest | 6.1.11 (FreeSpec) |
+| Kotest | 6.2.7 (FreeSpec) |
 | httptape-jvm SDK | 0.1.0-SNAPSHOT (Testcontainers + Kotest extension) |
 | Testcontainers | 2.0.4 (via SDK transitive dependency) |
-| Gradle | 9.4.1 (wrapper committed) |
+| Gradle | 9.9.2 (wrapper committed) |
 | httptape | v0.13.1 (ghcr.io/httptape/httptape:0.13.1, SDK default) |
 
 ## Why not...?
