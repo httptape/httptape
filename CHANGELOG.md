@@ -155,6 +155,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   other action tag, Docker base image and direct Go dependency is
   already at its latest release.
 
+- Dependency batch 2026-11-25 (examples and CI only, no change to the
+  stdlib-only root module): Gradle 9.9.2 (security fixes; wrapper jar
+  matches Gradle's published SHA-256, `gradlew` scripts not regenerated)
+  and logback 1.6.8 (the changed `JsonEncoder` output is not used here)
+  in `kotlin-ktor-koog`; Spring Boot 4.2.0, Spring AI 2.1.0 and Maven
+  3.10.2 in `java-spring-boot`. Boot 4.2 deprecates `RestTemplate` and
+  changes forwarded-header handling; the example builds its own
+  `RestClient` and sets no forwarding properties. Spring AI 2.1 keeps
+  `.stream().content()` and the `spring.ai.openai` properties as they
+  were. ESLint 10.15.0 (minimatch 11 for CVE-2026-118764),
+  typescript-eslint 8.73.0 (still peers TypeScript `<6.1.0`, so the
+  TypeScript 7 ignore rule stays) and eslint-plugin-react-refresh 0.5.8
+  in `ts-frontend-first`; github/codeql-action/upload-sarif 4.39.5
+  (pinned SHA checked against the tag; only the default CodeQL bundle
+  changes, which Scorecard does not use). The JVM example tests need
+  Docker and ran in CI only. The example READMEs' stack tables, stale
+  since Spring Boot 4.0.5 and Kotlin 2.3.20, match the builds again.
+
 ## [0.14.0] - 2026-08-05
 
 ### Module path change (breaking -- first release under the new org)
